@@ -212,3 +212,31 @@ func TestTemplateWildcardsWhenAllowed(t *testing.T) {
 		t.Error("issued a wildcard above the permitted domain")
 	}
 }
+
+func TestTemplateCommonNameLimit(t *testing.T) {
+	key := rsaKey(t, 2048)
+	long := strings.Repeat("a", 60) + ".example.internal"
+	req := &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{Subject: pkix.Name{CommonName: long}, DNSNames: []string{long}}), DefaultDuration: time.Hour}
+	if _, _, err := Template(req, issuer, parent, serial, now); !errors.Is(err, ErrDenied) {
+		t.Errorf("a %d-character common name: err = %v, want refused", len(long), err)
+	}
+	req = &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{long}}), DefaultDuration: time.Hour}
+	if _, _, err := Template(req, issuer, parent, serial, now); err != nil {
+		t.Errorf("the same name without a common name: %v", err)
+	}
+}
+
+// Near the intermediate's expiry, certificates are cut short; below an hour, the
+// request waits (not refused) for a renewed intermediate.
+func TestTemplateIntermediateTooCloseToExpiry(t *testing.T) {
+	key := rsaKey(t, 2048)
+	soon := &x509.Certificate{IsCA: true, NotAfter: now.Add(30 * time.Minute)}
+	req := &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{"a.example.internal"}}), DefaultDuration: 24 * time.Hour}
+	_, _, err := Template(req, issuer, soon, serial, now)
+	if err == nil {
+		t.Fatal("issued a 30-minute certificate")
+	}
+	if errors.Is(err, ErrDenied) {
+		t.Errorf("refused for good (%v); it should wait for a renewed intermediate", err)
+	}
+}

@@ -33,6 +33,8 @@ const (
 	minRSABits = 2048
 	maxRSABits = 8192
 	maxDNSName = 253
+	// maxCommonName is RFC 5280's upper bound for a common name.
+	maxCommonName = 64
 )
 
 // Usage names, as cert-manager spells them.
@@ -97,6 +99,9 @@ func Template(req *Request, iss *Issuer, parent *x509.Certificate, serial *big.I
 	if commonName != "" && !contains(names, commonName) {
 		return nil, nil, deny("the common name %q is not one of the requested DNS names", csr.Subject.CommonName)
 	}
+	if len(commonName) > maxCommonName {
+		return nil, nil, deny("the common name is %d characters; at most %d are allowed (leave it empty for longer names)", len(commonName), maxCommonName)
+	}
 	keyUsage, err := checkPublicKey(csr.PublicKey)
 	if err != nil {
 		return nil, nil, err
@@ -119,11 +124,14 @@ func Template(req *Request, iss *Issuer, parent *x509.Certificate, serial *big.I
 	// exceeds what the issuer allows.
 	notBefore := now.Add(-clockSkew).UTC().Truncate(time.Second)
 	notAfter := notBefore.Add(duration)
+	// Cut short to end with the intermediate, a certificate must still be worth
+	// issuing; below the minimum, the intermediate needs renewing first. Not a
+	// denial: the request is retried and succeeds once it is renewed.
 	if notAfter.After(parent.NotAfter) {
 		notAfter = parent.NotAfter
-	}
-	if !notAfter.After(now) {
-		return nil, nil, fmt.Errorf("the CA certificate expires at %s; nothing can be issued under it", parent.NotAfter)
+		if notAfter.Sub(now) < minDuration {
+			return nil, nil, fmt.Errorf("the CA certificate expires at %s, too soon to issue under it: renew the intermediate", parent.NotAfter.Format(time.RFC3339))
+		}
 	}
 
 	cert := &x509.Certificate{

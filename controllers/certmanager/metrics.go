@@ -1,6 +1,9 @@
 package certmanager
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -22,18 +25,27 @@ var (
 		Name: "kms_issuer_requests_refused_total",
 		Help: "CertificateRequests refused by the issuance policy, by issuer.",
 	}, []string{"namespace", "name"})
-	// rootNotAfter is the pinned root's expiry.
-	rootNotAfter = prometheus.NewGauge(prometheus.GaugeOpts{
+	// leavesTruncated is 1 while new certificates are being cut short to end with
+	// the intermediate: the intermediate is overdue for renewal.
+	leavesTruncated = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kms_issuer_leaves_truncated",
+		Help: "1 while the KMSIssuer's intermediate expires sooner than its longest certificate: new certificates are cut short.",
+	}, []string{"namespace", "name"})
+	// rootNotAfter is each pinned root's expiry.
+	rootNotAfter = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "kms_issuer_root_not_after_timestamp_seconds",
-		Help: "When the pinned root CA certificate expires (Unix seconds).",
-	})
+		Help: "When each pinned root CA certificate expires (Unix seconds).",
+	}, []string{"subject", "sha256"})
 )
 
 func init() {
-	metrics.Registry.MustRegister(caNotAfter, certificatesIssued, requestsRefused, rootNotAfter)
+	metrics.Registry.MustRegister(caNotAfter, certificatesIssued, requestsRefused, leavesTruncated, rootNotAfter)
 }
 
-// RecordRoot exports the pinned root's expiry.
-func RecordRoot(a *Access) {
-	rootNotAfter.Set(float64(a.Root().NotAfter.Unix()))
+// RecordRoots exports each pinned root's expiry.
+func RecordRoots(a *Access) {
+	for _, root := range a.Roots() {
+		sum := sha256.Sum256(root.Raw)
+		rootNotAfter.WithLabelValues(root.Subject.String(), hex.EncodeToString(sum[:])).Set(float64(root.NotAfter.Unix()))
+	}
 }

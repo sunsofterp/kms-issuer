@@ -16,7 +16,8 @@ A Helm chart to install kms-issuer
 | args.healthProbeBindAddress | string | `":8081"` | The address the probe endpoint binds to |
 | args.leaderElect | bool | `true` | Enable leader election for controller manager. |
 | args.localAwsEndpoint | string | `""` | Test only: a local KMS endpoint, used with static test credentials. |
-| args.maxCertificateDuration | string | `"2160h"` | The longest issued validity any KMSIssuer may allow. |
+| args.maxCertificateDuration | string | `"720h"` | The longest issued validity any KMSIssuer may allow. Short: cert-manager renews automatically. |
+| args.maxIntermediateDuration | string | `"4392h"` | The longest an intermediate may be valid (at most 4392h, 183 days, which kms-ca also enforces). Renewing one is a manual step with the root key. |
 | args.metricsBindAddress | string | `":8443"` | The address the metrics endpoint binds to ("0" disables it). |
 | args.metricsSecure | bool | `true` | Serve metrics over HTTPS to authenticated, authorized callers only. |
 | args.permittedDNSDomains | list | `[]` | Required. The DNS domains (two labels or more) no KMSIssuer may go beyond: every issuer's permittedDNSDomains must be inside them. |
@@ -46,7 +47,7 @@ A Helm chart to install kms-issuer
 | resources.limits.memory | string | `"128Mi"` |  |
 | resources.requests.cpu | string | `"10m"` |  |
 | resources.requests.memory | string | `"64Mi"` |  |
-| rootCertificate | string | `""` | Required. The root CA certificate (PEM), made with `kms-ca root` on a KMS key the controller cannot use. Every KMSIssuer's intermediate must chain to it, and it is the `ca.crt` handed out with each certificate: what clients trust. |
+| rootCertificate | string | `""` | Required. The root CA certificate (PEM), made with `kms-ca root` on a KMS key the controller cannot use. Every KMSIssuer's intermediate must chain to it, and it is the `ca.crt` handed out with each certificate: what clients trust. While replacing a root, list both (old and new, concatenated); intermediates may chain to either, and each certificate's `ca.crt` is the root its intermediate chains to. |
 | securityContext.allowPrivilegeEscalation | bool | `false` |  |
 | securityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | securityContext.readOnlyRootFilesystem | bool | `true` |  |

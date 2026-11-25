@@ -85,6 +85,13 @@ var _ = Context("CertificateRequestReconciler", func() {
 		}, time.Second*5, time.Millisecond*100).Should(BeTrue(), "request should be failed")
 		Expect(get(key).Status.Certificate).To(BeEmpty())
 	}
+	expectNeverIssued := func(key client.ObjectKey) {
+		Consistently(func() int { return len(get(key).Status.Certificate) }, time.Second*3, time.Millisecond*200).
+			Should(BeZero(), "no certificate may be issued")
+		Expect(apiutil.CertificateRequestHasCondition(get(key), cmapi.CertificateRequestCondition{
+			Type: cmapi.CertificateRequestConditionReady, Status: cmmeta.ConditionTrue,
+		})).To(BeFalse())
+	}
 	expectUntouched := func(key client.ObjectKey) {
 		Consistently(func() int {
 			cr := get(key)
@@ -165,10 +172,10 @@ var _ = Context("CertificateRequestReconciler", func() {
 		expectFailed(create("cr-kind", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Kind = "KMSClusterIssuer" }, sans("svc.example.internal"), true))
 	})
 
-	It("refuses an issuer whose key is not allowed", func() {
+	It("never signs for an issuer whose key is not allowed (it waits, pending)", func() {
 		otherIssuer := client.ObjectKey{Name: "cr-issuer-other-key", Namespace: "default"}
 		Expect(k8sClient.Create(context.Background(), newIssuer(otherIssuer.Namespace, otherIssuer.Name, otherKeyID))).Should(Succeed())
-		expectFailed(create("cr-other-key", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Name = otherIssuer.Name }, sans("svc.example.internal"), true))
+		expectNeverIssued(create("cr-other-key", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Name = otherIssuer.Name }, sans("svc.example.internal"), true))
 	})
 })
 

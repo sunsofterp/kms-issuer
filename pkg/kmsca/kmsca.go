@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -224,16 +225,43 @@ func RandomSerial() (*big.Int, error) {
 	return n.Add(n, big.NewInt(1)), nil
 }
 
+// MaxIntermediateDuration is the longest an intermediate may be valid. Whoever can
+// sign with an issuing key can, within its name constraints, mint certificates that
+// last as long as its intermediate (including a self-issued sub-CA, which path
+// length 0 does not stop): this bounds that exposure, at the cost of renewing the
+// intermediate by hand twice a year.
+const MaxIntermediateDuration = 183 * 24 * time.Hour
+
+// CAKind selects a root or an intermediate template.
+type CAKind int
+
+const (
+	// Root: path length 1, no extended key usage.
+	Root CAKind = iota
+	// Intermediate: path length 0, server auth only.
+	Intermediate
+)
+
 // CATemplate returns a CA certificate template: critical name constraints limiting
 // every name under it to input.PermittedDNSDomains (DNS names, URI hosts and email
-// domains; no IP address at all), cert-sign and CRL-sign only, no extended key
-// usages, and the given path length (1 for a root, 0 for an intermediate).
-func CATemplate(input *CAInput, maxPathLen int) (*x509.Certificate, error) {
+// domains; no IP address at all) and cert-sign and CRL-sign key usage. A root has
+// path length 1 and no extended key usage; an intermediate has path length 0 and the
+// server-auth extended key usage, so even a certificate it should never have signed
+// is good for TLS servers only.
+func CATemplate(input *CAInput, kind CAKind) (*x509.Certificate, error) {
 	if len(input.PermittedDNSDomains) == 0 {
 		return nil, errors.New("a CA certificate needs at least one permitted DNS domain")
 	}
+	for _, d := range input.PermittedDNSDomains {
+		if err := ValidConstraintDomain(d); err != nil {
+			return nil, err
+		}
+	}
 	if input.Duration%time.Second != 0 || input.Duration < 24*time.Hour {
 		return nil, fmt.Errorf("duration %s must be whole seconds and at least 24h", input.Duration)
+	}
+	if kind == Intermediate && input.Duration > MaxIntermediateDuration {
+		return nil, fmt.Errorf("duration %s is longer than an intermediate may be valid (%s)", input.Duration, MaxIntermediateDuration)
 	}
 	if input.Subject.CommonName == "" {
 		return nil, errors.New("a common name is required")
@@ -243,28 +271,57 @@ func CATemplate(input *CAInput, maxPathLen int) (*x509.Certificate, error) {
 		return nil, err
 	}
 	notBefore := input.Now.Add(-clockSkew).UTC().Truncate(time.Second)
-	return &x509.Certificate{
+	cert := &x509.Certificate{
 		SerialNumber:                serial,
 		Subject:                     input.Subject,
 		NotBefore:                   notBefore,
 		NotAfter:                    notBefore.Add(input.Duration),
 		IsCA:                        true,
 		BasicConstraintsValid:       true,
-		MaxPathLen:                  maxPathLen,
-		MaxPathLenZero:              maxPathLen == 0,
+		MaxPathLen:                  1,
 		KeyUsage:                    x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		PermittedDNSDomainsCritical: true,
 		PermittedDNSDomains:         input.PermittedDNSDomains,
 		PermittedURIDomains:         input.PermittedDNSDomains,
 		PermittedEmailAddresses:     input.PermittedDNSDomains,
 		ExcludedIPRanges:            allIPRanges(),
-	}, nil
+	}
+	if kind == Intermediate {
+		cert.MaxPathLen = 0
+		cert.MaxPathLenZero = true
+		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+	return cert, nil
+}
+
+// ValidConstraintDomain refuses anything but a lower-case DNS domain of two labels or
+// more: no wildcard, no leading or trailing dot, no single label (a top-level domain
+// such as "com" or "internal").
+func ValidConstraintDomain(d string) error {
+	if d != strings.ToLower(d) || strings.HasPrefix(d, ".") || strings.HasSuffix(d, ".") || strings.Contains(d, "*") {
+		return fmt.Errorf("%q is not a lower-case domain without wildcards or leading/trailing dots", d)
+	}
+	labels := strings.Split(d, ".")
+	if len(labels) < 2 || len(d) > 253 {
+		return fmt.Errorf("%q must have at least two labels", d)
+	}
+	for _, l := range labels {
+		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+			return fmt.Errorf("%q has an invalid label %q", d, l)
+		}
+		for _, c := range l {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return fmt.Errorf("%q has an invalid label %q", d, l)
+			}
+		}
+	}
+	return nil
 }
 
 // MakeRoot self-signs the root CA certificate with the root KMS key: path length 1
 // (it signs intermediates, which sign leaves).
 func (ca *KMSCA) MakeRoot(ctx context.Context, rootKeyID string, input *CAInput) (*x509.Certificate, error) {
-	cert, err := CATemplate(input, 1)
+	cert, err := CATemplate(input, Root)
 	if err != nil {
 		return nil, err
 	}
@@ -280,14 +337,19 @@ func (ca *KMSCA) MakeRoot(ctx context.Context, rootKeyID string, input *CAInput)
 }
 
 // MakeIntermediate has the root KMS key sign an intermediate CA certificate for the
-// issuing KMS key: path length 0, never outliving the root, with name constraints
-// inside the root's. The root certificate must be for the root key.
+// issuing KMS key: path length 0, server auth only, at most MaxIntermediateDuration,
+// with name constraints inside the root's and a name different from the root's. It
+// refuses (rather than shortens) an intermediate that would outlive the root. The
+// root certificate must be for the root key.
 func (ca *KMSCA) MakeIntermediate(ctx context.Context, rootKeyID string, root *x509.Certificate, keyID string, input *CAInput) (*x509.Certificate, error) {
 	if rootKeyID == keyID {
 		return nil, errors.New("the root and issuing keys must differ")
 	}
 	if err := ValidateRoot(root, input.Now); err != nil {
 		return nil, fmt.Errorf("root: %w", err)
+	}
+	if input.Subject.CommonName == root.Subject.CommonName {
+		return nil, errors.New("the intermediate's common name must differ from the root's")
 	}
 	for _, d := range input.PermittedDNSDomains {
 		if !WithinDomains(d, root.PermittedDNSDomains) {
@@ -308,12 +370,13 @@ func (ca *KMSCA) MakeIntermediate(ctx context.Context, rootKeyID string, root *x
 	if publicKeysEqual(pub, root.PublicKey) {
 		return nil, errors.New("the issuing key is the root key")
 	}
-	cert, err := CATemplate(input, 0)
+	cert, err := CATemplate(input, Intermediate)
 	if err != nil {
 		return nil, err
 	}
 	if cert.NotAfter.After(root.NotAfter) {
-		cert.NotAfter = root.NotAfter
+		return nil, fmt.Errorf("the intermediate would outlive the root (which expires %s); shorten the duration or replace the root",
+			root.NotAfter.Format(time.RFC3339))
 	}
 	der, err := x509.CreateCertificate(rand.Reader, cert, root, pub, rootSigner)
 	if err != nil {

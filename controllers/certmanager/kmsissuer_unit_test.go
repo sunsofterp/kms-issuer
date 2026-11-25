@@ -58,7 +58,7 @@ func newUnitCA(t *testing.T, domains ...string) *unitCA {
 	if u.root, err = u.ca.MakeRoot(context.TODO(), u.rootKey, in("Root", 20*365*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if u.intermediate, err = u.ca.MakeIntermediate(context.TODO(), u.rootKey, u.root, u.issuingKey, in("Issuing", 365*24*time.Hour)); err != nil {
+	if u.intermediate, err = u.ca.MakeIntermediate(context.TODO(), u.rootKey, u.root, u.issuingKey, in("Issuing", 90*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	return u
@@ -83,7 +83,7 @@ func TestCheckIssuerCeilings(t *testing.T) {
 	u := newUnitCA(t, "fleet.internal")
 	access, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
 		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: 90 * 24 * time.Hour,
-	}, u.root, unitNow)
+	}, []*x509.Certificate{u.root}, unitNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,19 +124,64 @@ func TestCheckIssuerCeilings(t *testing.T) {
 	}
 	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
 		PermittedDNSDomains: []string{"internal"}, MaxCertificateDuration: time.Hour,
-	}, u.root, unitNow); err == nil {
+	}, []*x509.Certificate{u.root}, unitNow); err == nil {
 		t.Error("a single-label ceiling was accepted")
 	}
 	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
 		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: time.Hour,
-	}, u.intermediate, unitNow); err == nil {
+	}, []*x509.Certificate{u.intermediate}, unitNow); err == nil {
 		t.Error("an intermediate was accepted as the root")
+	}
+	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
+		PermittedDNSDomains: []string{"sso.fleet.internal"}, MaxCertificateDuration: time.Hour,
+	}, []*x509.Certificate{u.root}, unitNow); err == nil {
+		t.Error("a root wider than the operator's domains was accepted")
+	}
+}
+
+// Two pinned roots (a root replacement): an intermediate from either verifies, and
+// the root handed out is the one it chains to.
+func TestTwoRoots(t *testing.T) {
+	u := newUnitCA(t)
+	newRootKey, err := u.ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/new-root", OwnerUID: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRoot, err := u.ca.MakeRoot(context.TODO(), newRootKey, &kmsca.CAInput{
+		Subject: pkix.Name{CommonName: "New Root"}, PermittedDNSDomains: []string{"example.internal"}, Duration: 20 * 365 * 24 * time.Hour, Now: unitNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newIntermediate, err := u.ca.MakeIntermediate(context.TODO(), newRootKey, newRoot, u.issuingKey, &kmsca.CAInput{
+		Subject: pkix.Name{CommonName: "New Issuing"}, PermittedDNSDomains: []string{"example.internal"}, Duration: 90 * 24 * time.Hour, Now: unitNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, err := NewAccess([]string{"default"}, []string{u.issuingKey}, testCeilings, []*x509.Certificate{u.root, newRoot}, unitNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for want, inter := range map[*x509.Certificate]*x509.Certificate{u.root: u.intermediate, newRoot: newIntermediate} {
+		issuer := &kmsiapi.KMSIssuer{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "i"},
+			Spec: kmsiapi.KMSIssuerSpec{KeyID: u.issuingKey, IntermediateCertificate: string(encodeForTest(inter.Raw)),
+				PermittedDNSDomains: []string{"example.internal"}},
+		}
+		v, err := verifyIssuer(context.TODO(), u.ca, access, issuer, unitNow.Add(time.Hour))
+		if err != nil {
+			t.Fatalf("%s: %v", inter.Subject, err)
+		}
+		if !v.root.Equal(want) {
+			t.Errorf("%s: chains to %s, want %s", inter.Subject, v.root.Subject, want.Subject)
+		}
 	}
 }
 
 func TestVerifyIssuer(t *testing.T) {
 	u := newUnitCA(t)
-	access, err := NewAccess([]string{"default"}, []string{u.issuingKey, u.rootKey}, testCeilings, u.root, unitNow)
+	access, err := NewAccess([]string{"default"}, []string{u.issuingKey, u.rootKey}, testCeilings, []*x509.Certificate{u.root}, unitNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +244,7 @@ func TestKMSErrorKeepsTheIssuerReady(t *testing.T) {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = kmsiapi.AddToScheme(scheme)
 	fc := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(issuer).WithStatusSubresource(issuer).Build()
-	access, err := NewAccess([]string{"default"}, []string{u.issuingKey}, testCeilings, u.root, unitNow)
+	access, err := NewAccess([]string{"default"}, []string{u.issuingKey}, testCeilings, []*x509.Certificate{u.root}, unitNow)
 	if err != nil {
 		t.Fatal(err)
 	}

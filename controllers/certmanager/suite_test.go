@@ -91,7 +91,7 @@ func makeTwoTier(ca *kmsca.KMSCA) {
 	testRoot, err = ca.MakeRoot(context.TODO(), rootKeyID, input("Test Root", 20*365*24*time.Hour))
 	Expect(err).NotTo(HaveOccurred())
 	for keyID, out := range map[string]*string{allowedKeyID: &allowedIntermediate, otherKeyID: &otherIntermediate} {
-		cert, err := ca.MakeIntermediate(context.TODO(), rootKeyID, testRoot, keyID, input("Test Issuing", 365*24*time.Hour))
+		cert, err := ca.MakeIntermediate(context.TODO(), rootKeyID, testRoot, keyID, input("Test Issuing", 90*24*time.Hour))
 		Expect(err).NotTo(HaveOccurred())
 		*out = string(kmsca.EncodeCertificatePEM(cert))
 	}
@@ -142,7 +142,7 @@ var _ = BeforeSuite(func() {
 	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other", OwnerUID: "suite"})
 	Expect(err).NotTo(HaveOccurred())
 	makeTwoTier(&ca)
-	access, err := NewAccess([]string{"default"}, []string{allowedKeyID}, testCeilings, testRoot, time.Now())
+	access, err := NewAccess([]string{"default"}, []string{allowedKeyID}, testCeilings, []*x509.Certificate{testRoot}, time.Now())
 	Expect(err).NotTo(HaveOccurred())
 
 	err = (&CertificateRequestReconciler{

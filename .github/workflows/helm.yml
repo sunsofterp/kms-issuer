@@ -18,6 +18,8 @@ jobs:
       # Keep in sync with image.repository and image.tag in charts/kms-issuer/ci/*.yaml
       IMG: kms-issuer:ci
       CERT_MANAGER_VERSION: v1.21.3
+      # sha256 of that release's cert-manager.yaml; change with the version.
+      CERT_MANAGER_SHA256: c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
 
     steps:
       - name: Checkout
@@ -60,8 +62,11 @@ jobs:
           cluster_name: kind
         if: steps.list-changed.outputs.changed == 'true'
 
-      - name: Install cert-manager
-        run: kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+      - name: Install cert-manager (checksum-verified manifest)
+        run: |
+          curl -sSLo cert-manager.yaml "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+          echo "${CERT_MANAGER_SHA256}  cert-manager.yaml" | sha256sum -c -
+          kubectl apply -f cert-manager.yaml
         if: steps.list-changed.outputs.changed == 'true'
 
       - name: Build the testing kms-issuer docker image

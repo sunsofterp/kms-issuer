@@ -39,13 +39,18 @@ import (
 )
 
 const (
-	// defaultMaxCertificateDuration is the default longest issued validity.
-	defaultMaxCertificateDuration = time.Hour * 24 * 90
+	// defaultMaxCertificateDuration is the default longest issued validity. Leaves
+	// renew automatically, so they are kept short.
+	defaultMaxCertificateDuration = time.Hour * 24 * 30
 	// maxRequeue bounds how long the issuer goes unchecked.
 	maxRequeue = 12 * time.Hour
-	// expiryWarning is how long before the intermediate expires the issuer starts
-	// warning that a new one is needed.
-	expiryWarning = 90 * 24 * time.Hour
+	// refusedRequeue is how soon a refused issuer is checked again: a refusal can be
+	// time-dependent (an intermediate not valid yet) or fixed outside the spec.
+	refusedRequeue = 10 * time.Minute
+	// minExpiryWarning is the least warning before the intermediate expires. The
+	// warning starts at twice the issuer's longest leaf (leaves are cut short in
+	// the intermediate's last maxCertificateDuration), and never later than this.
+	minExpiryWarning = 30 * 24 * time.Hour
 
 	eventIntermediateAccepted = "IntermediateAccepted"
 	eventIntermediateExpiring = "IntermediateExpiringSoon"
@@ -110,38 +115,57 @@ type errKMS struct{ error }
 
 func (e errKMS) Unwrap() error { return e.error }
 
-// verifyIssuer returns the issuer's intermediate when the issuer may sign: allowed
-// namespace and key, settings within the ceilings, and an intermediate that is for
-// the issuer's KMS key, signed by the pinned root, constrained within the ceilings
-// and covering the issuer's domains, and valid now. Errors wrapping errKMS are
-// KMS failures (retry); others are the issuer's configuration.
-func verifyIssuer(ctx context.Context, ca *kmsca.KMSCA, access *Access, issuer *kmsiapi.KMSIssuer, now time.Time) (*x509.Certificate, error) {
+// verifiedIssuer is an issuer that may sign: its intermediate, and the pinned root
+// that intermediate chains to.
+type verifiedIssuer struct {
+	intermediate *x509.Certificate
+	root         *x509.Certificate
+}
+
+// verifyIssuer returns the issuer's intermediate and root when the issuer may sign:
+// allowed namespace and key, settings within the ceilings, and an intermediate that
+// is for the issuer's KMS key, signed by a pinned root, constrained within the
+// ceilings and the root and covering the issuer's domains, valid now and no
+// longer-lived than allowed. Errors wrapping errKMS are KMS failures (retry); others
+// are the issuer's configuration. On a KMS failure the parsed intermediate (not yet
+// verified) is returned, for the caller to judge whether to keep serving.
+func verifyIssuer(ctx context.Context, ca *kmsca.KMSCA, access *Access, issuer *kmsiapi.KMSIssuer, now time.Time) (verifiedIssuer, error) {
 	s := issuerSettings(issuer)
 	if err := s.validate(); err != nil {
-		return nil, fmt.Errorf("invalid issuer settings: %w", err)
+		return verifiedIssuer{}, fmt.Errorf("invalid issuer settings: %w", err)
 	}
 	if err := access.CheckIssuer(issuer, s); err != nil {
-		return nil, err
+		return verifiedIssuer{}, err
 	}
 	intermediate, err := kmsca.ParseCertificatePEM([]byte(issuer.Spec.IntermediateCertificate))
 	if err != nil {
-		return nil, fmt.Errorf("intermediateCertificate: %w", err)
+		return verifiedIssuer{}, fmt.Errorf("intermediateCertificate: %w", err)
 	}
 	pub, err := ca.PublicKey(ctx, issuer.Spec.KeyID)
 	if err != nil {
-		return intermediate, errKMS{fmt.Errorf("reading the KMS key's public key: %w", err)}
+		return verifiedIssuer{intermediate: intermediate}, errKMS{fmt.Errorf("reading the KMS key's public key: %w", err)}
 	}
-	if err := kmsca.ValidateIntermediate(intermediate, kmsca.ExpectedIntermediate{
-		Root: access.Root(), PublicKey: pub, AllowedDomains: access.AllowedDomains(), Now: now,
-	}); err != nil {
-		return nil, fmt.Errorf("intermediateCertificate: %w", err)
+	root, err := kmsca.ValidateIntermediate(intermediate, kmsca.ExpectedIntermediate{
+		Roots: access.Roots(), PublicKey: pub, AllowedDomains: access.AllowedDomains(),
+		MaxDuration: access.MaxIntermediateDuration(), Now: now,
+	})
+	if err != nil {
+		return verifiedIssuer{}, fmt.Errorf("intermediateCertificate: %w", err)
 	}
 	for _, d := range issuer.Spec.PermittedDNSDomains {
 		if !kmsca.WithinDomains(d, intermediate.PermittedDNSDomains) {
-			return nil, fmt.Errorf("permitted DNS domain %q is outside the intermediate's name constraints %v", d, intermediate.PermittedDNSDomains)
+			return verifiedIssuer{}, fmt.Errorf("permitted DNS domain %q is outside the intermediate's name constraints %v", d, intermediate.PermittedDNSDomains)
 		}
 	}
-	return intermediate, nil
+	return verifiedIssuer{intermediate: intermediate, root: root}, nil
+}
+
+// expiryWarning is how long before the intermediate expires the issuer warns.
+func expiryWarning(s settings) time.Duration {
+	if w := 2 * s.maxCertificateDuration; w > minExpiryWarning {
+		return w
+	}
+	return minExpiryWarning
 }
 
 // Reconcile KMSIssuer resources.
@@ -158,6 +182,7 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.Get(ctx, req.NamespacedName, issuer); err != nil {
 		if apierrors.IsNotFound(err) {
 			caNotAfter.DeleteLabelValues(req.Namespace, req.Name)
+			leavesTruncated.DeleteLabelValues(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "failed to retrieve KMSIssuer resource")
@@ -165,7 +190,8 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	now := r.Clock.Now()
-	intermediate, err := verifyIssuer(ctx, r.KMSCA, r.Access, issuer, now)
+	verified, err := verifyIssuer(ctx, r.KMSCA, r.Access, issuer, now)
+	intermediate := verified.intermediate
 	var kmsErr errKMS
 	switch {
 	case errors.As(err, &kmsErr):
@@ -176,9 +202,12 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		return ctrl.Result{}, errors.Join(err, r.setNotReady(ctx, issuer, "KMS error", err))
 	case err != nil:
-		return ctrl.Result{}, r.setNotReady(ctx, issuer, "This KMSIssuer may not issue", err)
+		// Checked again soon: a refusal can be time-dependent (an intermediate not
+		// valid yet) or fixed outside the spec (the operator's flags, a new root).
+		return ctrl.Result{RequeueAfter: refusedRequeue}, r.setNotReady(ctx, issuer, "This KMSIssuer may not issue", err)
 	}
 
+	s := issuerSettings(issuer)
 	encoded := kmsca.EncodeCertificatePEM(intermediate)
 	if !bytes.Equal(issuer.Status.Certificate, encoded) {
 		issuer.Status.Certificate = encoded
@@ -190,10 +219,16 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		log.Info("intermediate accepted", "serial", intermediate.SerialNumber.Text(16), "notAfter", intermediate.NotAfter)
 	}
 	caNotAfter.WithLabelValues(issuer.Namespace, issuer.Name).Set(float64(intermediate.NotAfter.Unix()))
-	if left := intermediate.NotAfter.Sub(now); left < expiryWarning {
+	left := intermediate.NotAfter.Sub(now)
+	truncating := 0.0
+	if left < s.maxCertificateDuration {
+		truncating = 1
+	}
+	leavesTruncated.WithLabelValues(issuer.Namespace, issuer.Name).Set(truncating)
+	if left < expiryWarning(s) {
 		r.Recorder.Event(issuer, core.EventTypeWarning, eventIntermediateExpiring, fmt.Sprintf(
-			"The intermediate expires %s (in %s): make a new one with `kms-ca intermediate` and update intermediateCertificate",
-			intermediate.NotAfter.Format(time.RFC3339), left.Round(time.Hour)))
+			"The intermediate expires %s (in %s; certificates are cut short from %s before): make a new one with `kms-ca intermediate` and update intermediateCertificate",
+			intermediate.NotAfter.Format(time.RFC3339), left.Round(time.Hour), s.maxCertificateDuration))
 	}
 
 	requeue := intermediate.NotAfter.Sub(now)

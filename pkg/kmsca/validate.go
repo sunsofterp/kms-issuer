@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 )
@@ -16,24 +17,44 @@ import (
 // Anything before or after it (another certificate, junk) is refused, so what is
 // stored can never smuggle extra trust material into what is handed out.
 func ParseCertificatePEM(data []byte) (*x509.Certificate, error) {
-	start := bytes.Index(data, []byte("-----BEGIN"))
-	if start < 0 {
+	certs, err := ParseCertificatesPEM(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(certs) != 1 {
+		return nil, fmt.Errorf("%d certificates where exactly one is expected", len(certs))
+	}
+	return certs[0], nil
+}
+
+// ParseCertificatesPEM parses one or more PEM CERTIFICATE blocks and nothing else:
+// no other block type, no headers, no data before, between or after them.
+func ParseCertificatesPEM(data []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+	rest := bytes.TrimSpace(data)
+	for len(rest) > 0 {
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN ")) {
+			return nil, errors.New("data outside the CERTIFICATE blocks")
+		}
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, errors.New("not a PEM CERTIFICATE")
+		}
+		if len(block.Headers) > 0 {
+			return nil, errors.New("PEM headers are not allowed")
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+		rest = bytes.TrimSpace(rest)
+	}
+	if len(certs) == 0 {
 		return nil, errors.New("not a PEM CERTIFICATE")
 	}
-	if len(bytes.TrimSpace(data[:start])) > 0 {
-		return nil, errors.New("data before the CERTIFICATE block")
-	}
-	block, rest := pem.Decode(data[start:])
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, errors.New("not a PEM CERTIFICATE")
-	}
-	if len(block.Headers) > 0 {
-		return nil, errors.New("PEM headers are not allowed")
-	}
-	if len(bytes.TrimSpace(rest)) > 0 {
-		return nil, errors.New("data after the CERTIFICATE block")
-	}
-	return x509.ParseCertificate(block.Bytes)
+	return certs, nil
 }
 
 // EncodeCertificatePEM re-encodes a parsed certificate.
@@ -43,8 +64,8 @@ func EncodeCertificatePEM(cert *x509.Certificate) []byte {
 
 // ValidateRoot returns an error unless root is a usable root for this CA: a
 // self-signed CA certificate allowed to sign intermediates (path length 1),
-// cert-sign key usage, critical name constraints with at least one DNS domain and
-// no IP address, and valid at now.
+// cert-sign key usage, critical name constraints of valid domains with no IP
+// address, and valid at now.
 func ValidateRoot(root *x509.Certificate, now time.Time) error {
 	switch {
 	case root == nil:
@@ -61,73 +82,108 @@ func ValidateRoot(root *x509.Certificate, now time.Time) error {
 	if err := checkConstraints(root); err != nil {
 		return err
 	}
+	for _, d := range root.PermittedDNSDomains {
+		if err := ValidConstraintDomain(d); err != nil {
+			return err
+		}
+	}
 	return checkValidity(root, now)
 }
 
 // ExpectedIntermediate is what an issuer's intermediate must match.
 type ExpectedIntermediate struct {
-	// Root is the operator's pinned root.
-	Root *x509.Certificate
+	// Roots are the operator's pinned roots: the intermediate must chain to one.
+	Roots []*x509.Certificate
 	// PublicKey is the issuer's KMS key.
 	PublicKey crypto.PublicKey
 	// AllowedDomains bound the intermediate's name constraints (the operator's
 	// ceilings).
 	AllowedDomains []string
-	Now            time.Time
+	// MaxDuration bounds the intermediate's validity (0: MaxIntermediateDuration).
+	MaxDuration time.Duration
+	Now         time.Time
 }
 
-// ValidateIntermediate returns an error unless cert is an intermediate this
-// controller may sign under: for the issuer's KMS key, issued and signed by the
-// pinned root (and verifying as a chain to it), a CA with path length 0, cert-sign
-// key usage, no extended key usages, critical name constraints with every DNS, URI
-// and email domain inside the allowed domains and every IP address excluded, and
-// valid now.
-func ValidateIntermediate(cert *x509.Certificate, expected ExpectedIntermediate) error {
+// ValidateIntermediate returns the pinned root cert chains to, or an error unless
+// cert is an intermediate this controller may sign under: for the issuer's KMS key
+// and no root's, issued and signed by a pinned root (and verifying as a chain to it),
+// a CA with path length 0, cert-sign key usage, the server-auth extended key usage
+// and no other, critical name constraints with every DNS, URI and email domain
+// inside both the allowed domains and the root's, every IP address excluded, a name
+// different from the root's, valid now, and no longer-lived than the maximum.
+func ValidateIntermediate(cert *x509.Certificate, expected ExpectedIntermediate) (*x509.Certificate, error) {
+	if cert == nil {
+		return nil, errors.New("no intermediate certificate")
+	}
+	if len(expected.Roots) == 0 {
+		return nil, errors.New("no root certificate")
+	}
+	if !publicKeysEqual(cert.PublicKey, expected.PublicKey) {
+		return nil, errors.New("not for the issuer's KMS key")
+	}
+	var root *x509.Certificate
+	for _, r := range expected.Roots {
+		if publicKeysEqual(cert.PublicKey, r.PublicKey) {
+			return nil, errors.New("the issuing key is a root key")
+		}
+		if bytes.Equal(cert.RawIssuer, r.RawSubject) && cert.CheckSignatureFrom(r) == nil {
+			root = r
+		}
+	}
+	maxDuration := expected.MaxDuration
+	if maxDuration <= 0 || maxDuration > MaxIntermediateDuration {
+		maxDuration = MaxIntermediateDuration
+	}
 	switch {
-	case cert == nil:
-		return errors.New("no intermediate certificate")
-	case expected.Root == nil:
-		return errors.New("no root certificate")
-	case !publicKeysEqual(cert.PublicKey, expected.PublicKey):
-		return errors.New("not for the issuer's KMS key")
-	case publicKeysEqual(cert.PublicKey, expected.Root.PublicKey):
-		return errors.New("the issuing key is the root key")
-	case !bytes.Equal(cert.RawIssuer, expected.Root.RawSubject) || cert.CheckSignatureFrom(expected.Root) != nil:
-		return errors.New("not issued by the pinned root")
+	case root == nil:
+		return nil, errors.New("not issued by a pinned root")
+	case bytes.Equal(cert.RawSubject, root.RawSubject) || cert.Subject.CommonName == root.Subject.CommonName:
+		return nil, errors.New("the intermediate's name is the root's")
 	case !cert.BasicConstraintsValid || !cert.IsCA:
-		return errors.New("not a CA certificate")
+		return nil, errors.New("not a CA certificate")
 	case !cert.MaxPathLenZero || cert.MaxPathLen != 0:
-		return errors.New("path length is not 0")
+		return nil, errors.New("path length is not 0")
 	case cert.KeyUsage&x509.KeyUsageCertSign == 0:
-		return errors.New("no cert-sign key usage")
+		return nil, errors.New("no cert-sign key usage")
 	case cert.KeyUsage&^(x509.KeyUsageCertSign|x509.KeyUsageCRLSign|x509.KeyUsageDigitalSignature) != 0:
-		return errors.New("unexpected key usages")
-	case len(cert.ExtKeyUsage) > 0 || len(cert.UnknownExtKeyUsage) > 0:
-		return errors.New("extended key usages present")
+		return nil, errors.New("unexpected key usages")
+	case !slices.Equal(cert.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}) || len(cert.UnknownExtKeyUsage) > 0:
+		return nil, errors.New("extended key usage is not exactly server auth")
+	case cert.NotAfter.Sub(cert.NotBefore) > maxDuration:
+		return nil, fmt.Errorf("valid for %s, longer than the %s an intermediate may be", cert.NotAfter.Sub(cert.NotBefore), maxDuration)
 	}
 	if err := checkConstraints(cert); err != nil {
-		return err
+		return nil, err
 	}
 	for _, list := range [][]string{cert.PermittedDNSDomains, cert.PermittedURIDomains, cert.PermittedEmailAddresses} {
 		for _, d := range list {
 			if !WithinDomains(d, expected.AllowedDomains) {
-				return fmt.Errorf("name constraint %q is outside the allowed domains %v", d, expected.AllowedDomains)
+				return nil, fmt.Errorf("name constraint %q is outside the allowed domains %v", d, expected.AllowedDomains)
+			}
+			if !WithinDomains(d, root.PermittedDNSDomains) {
+				return nil, fmt.Errorf("name constraint %q is outside the root's %v", d, root.PermittedDNSDomains)
 			}
 		}
 	}
 	if err := checkValidity(cert, expected.Now); err != nil {
-		return err
+		return nil, err
 	}
 	// Full path validation as clients do it, root constraints included.
 	roots := x509.NewCertPool()
-	roots.AddCert(expected.Root)
+	roots.AddCert(root)
 	if _, err := cert.Verify(x509.VerifyOptions{
-		Roots: roots, CurrentTime: expected.Now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		Roots: roots, CurrentTime: expected.Now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}); err != nil {
-		return fmt.Errorf("does not verify to the pinned root: %w", err)
+		return nil, fmt.Errorf("does not verify to the pinned root: %w", err)
 	}
-	return nil
+	return root, nil
 }
+
+// errNotYetValid marks a certificate whose validity hasn't started.
+var errNotYetValid = errors.New("not valid yet")
+
+// IsNotYetValid reports whether err is a certificate not yet valid.
+func IsNotYetValid(err error) bool { return errors.Is(err, errNotYetValid) }
 
 // checkConstraints requires critical name constraints: at least one permitted DNS
 // domain, URI and email limited, no permitted IP range and every IP excluded.
@@ -146,8 +202,11 @@ func checkConstraints(cert *x509.Certificate) error {
 }
 
 func checkValidity(cert *x509.Certificate, now time.Time) error {
-	if now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
-		return fmt.Errorf("not valid now (%s to %s)", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339))
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("%w (from %s)", errNotYetValid, cert.NotBefore.Format(time.RFC3339))
+	}
+	if !now.Before(cert.NotAfter) {
+		return fmt.Errorf("expired at %s", cert.NotAfter.Format(time.RFC3339))
 	}
 	return nil
 }

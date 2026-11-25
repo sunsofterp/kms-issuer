@@ -67,12 +67,18 @@ func newTwoTier() *twoTier {
 	var err error
 	t.root, err = t.client.MakeRoot(context.TODO(), t.rootKeyID, caInput("Test Root", 20*365*24*time.Hour, t.now))
 	Expect(err).To(BeNil())
-	t.intermediate, err = t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.issuingKeyID, caInput("Test Issuing", 2*365*24*time.Hour, t.now))
+	t.intermediate, err = t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.issuingKeyID, caInput("Test Issuing", 90*24*time.Hour, t.now))
 	Expect(err).To(BeNil())
 	pub, err := t.client.PublicKey(context.TODO(), t.issuingKeyID)
 	Expect(err).To(BeNil())
-	t.expectedForIntermediate = kmsca.ExpectedIntermediate{Root: t.root, PublicKey: pub, AllowedDomains: []string{"example.internal"}, Now: t.now}
+	t.expectedForIntermediate = kmsca.ExpectedIntermediate{Roots: []*x509.Certificate{t.root}, PublicKey: pub, AllowedDomains: []string{"example.internal"}, Now: t.now}
 	return t
+}
+
+// validateErr is ValidateIntermediate's error alone.
+func validateErr(cert *x509.Certificate, expected kmsca.ExpectedIntermediate) error {
+	_, err := kmsca.ValidateIntermediate(cert, expected)
+	return err
 }
 
 var _ = Context("KMSCA", func() {
@@ -176,23 +182,37 @@ var _ = Context("KMSCA", func() {
 			Expect(t.intermediate.IsCA).To(BeTrue())
 			Expect(t.intermediate.MaxPathLenZero).To(BeTrue())
 			Expect(t.intermediate.PermittedDNSDomains).To(Equal([]string{"example.internal"}))
-			Expect(t.intermediate.ExtKeyUsage).To(BeEmpty())
+			Expect(t.intermediate.ExtKeyUsage).To(Equal([]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
+			Expect(t.root.ExtKeyUsage).To(BeEmpty())
 			Expect(t.intermediate.KeyUsage).To(Equal(x509.KeyUsageCertSign | x509.KeyUsageCRLSign))
 			Expect(t.intermediate.Issuer.CommonName).To(Equal("Test Root"))
 			Expect(t.intermediate.PublicKey).NotTo(Equal(t.root.PublicKey))
-			Expect(kmsca.ValidateIntermediate(t.intermediate, t.expectedForIntermediate)).To(Succeed())
+			Expect(validateErr(t.intermediate, t.expectedForIntermediate)).To(Succeed())
 			Expect(len(t.intermediate.SerialNumber.Bytes())).To(BeNumerically("<=", 16))
 		})
 
-		It("never lets the intermediate outlive the root", func() {
+		It("refuses an intermediate that would outlive the root, or last over 183 days", func() {
 			client := mockKMSCA()
 			rootKey, issuingKey := newKey(client, "alias/r"), newKey(client, "alias/i")
 			now := time.Now()
 			root, err := client.MakeRoot(context.TODO(), rootKey, caInput("Root", 48*time.Hour, now))
 			Expect(err).To(BeNil())
-			inter, err := client.MakeIntermediate(context.TODO(), rootKey, root, issuingKey, caInput("Issuing", 365*24*time.Hour, now))
-			Expect(err).To(BeNil())
-			Expect(inter.NotAfter).To(Equal(root.NotAfter))
+			_, err = client.MakeIntermediate(context.TODO(), rootKey, root, issuingKey, caInput("Issuing", 72*time.Hour, now))
+			Expect(err).NotTo(BeNil())
+
+			t := newTwoTier()
+			_, err = t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.issuingKeyID, caInput("Long", kmsca.MaxIntermediateDuration+24*time.Hour, t.now))
+			Expect(err).NotTo(BeNil())
+		})
+
+		It("refuses an intermediate named like the root, and invalid constraint domains", func() {
+			t := newTwoTier()
+			_, err := t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.issuingKeyID, caInput("Test Root", 48*time.Hour, t.now))
+			Expect(err).NotTo(BeNil())
+			for _, d := range []string{"com", "internal", "*.example.internal", "Example.internal", ".example.internal", "example.internal."} {
+				_, err := kmsca.CATemplate(caInput("X", 48*time.Hour, t.now, d), kmsca.Root)
+				Expect(err).NotTo(BeNil(), d)
+			}
 		})
 
 		It("refuses an intermediate wider than the root, on the root key, or with the wrong root key", func() {
@@ -250,35 +270,35 @@ var _ = Context("KMSCA", func() {
 			Expect(err).To(BeNil())
 			forged, err := t.client.MakeIntermediate(context.TODO(), otherRootKey, otherRoot, t.issuingKeyID, caInput("Test Issuing", 48*time.Hour, t.now))
 			Expect(err).To(BeNil())
-			Expect(kmsca.ValidateIntermediate(forged, t.expectedForIntermediate)).NotTo(Succeed())
+			Expect(validateErr(forged, t.expectedForIntermediate)).NotTo(Succeed())
 		})
 
 		It("refuses constraints outside the allowed domains, another key, or an expired intermediate", func() {
 			t := newTwoTier()
 			other := t.expectedForIntermediate
 			other.AllowedDomains = []string{"other.internal"}
-			Expect(kmsca.ValidateIntermediate(t.intermediate, other)).NotTo(Succeed())
+			Expect(validateErr(t.intermediate, other)).NotTo(Succeed())
 
 			other = t.expectedForIntermediate
 			other.Now = t.intermediate.NotAfter.Add(time.Second)
-			Expect(kmsca.ValidateIntermediate(t.intermediate, other)).NotTo(Succeed())
+			Expect(validateErr(t.intermediate, other)).NotTo(Succeed())
 
 			otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 			other = t.expectedForIntermediate
 			other.PublicKey = otherKey.Public()
-			Expect(kmsca.ValidateIntermediate(t.intermediate, other)).NotTo(Succeed())
+			Expect(validateErr(t.intermediate, other)).NotTo(Succeed())
 
 			By("refusing the root itself as an intermediate")
 			rootPub, _ := t.client.PublicKey(context.TODO(), t.rootKeyID)
 			other = t.expectedForIntermediate
 			other.PublicKey = rootPub
-			Expect(kmsca.ValidateIntermediate(t.root, other)).NotTo(Succeed())
+			Expect(validateErr(t.root, other)).NotTo(Succeed())
 		})
 
 		It("refuses an unconstrained intermediate signed by the root key", func() {
 			t := newTwoTier()
 			rootSignerCA := t.client
-			tmpl, err := kmsca.CATemplate(caInput("Unconstrained", 48*time.Hour, t.now), 0)
+			tmpl, err := kmsca.CATemplate(caInput("Unconstrained", 48*time.Hour, t.now), kmsca.Intermediate)
 			Expect(err).To(BeNil())
 			tmpl.PermittedDNSDomains = nil
 			tmpl.PermittedURIDomains = nil
@@ -290,7 +310,7 @@ var _ = Context("KMSCA", func() {
 				KeyID: t.rootKeyID, Cert: tmpl, Parent: t.root, PublicKey: pub,
 			})
 			Expect(err).To(BeNil())
-			Expect(kmsca.ValidateIntermediate(unconstrained, t.expectedForIntermediate)).NotTo(Succeed())
+			Expect(validateErr(unconstrained, t.expectedForIntermediate)).NotTo(Succeed())
 		})
 	})
 

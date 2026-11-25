@@ -20,7 +20,7 @@ type Access struct {
 	namespaces map[string]bool
 	keyIDs     map[string]bool
 	ceilings   Ceilings
-	root       *x509.Certificate
+	roots      []*x509.Certificate
 }
 
 // Ceilings are the operator's upper bounds on every KMSIssuer.
@@ -32,13 +32,17 @@ type Ceilings struct {
 	AllowWildcards bool
 	// MaxCertificateDuration: the longest issued validity any issuer may allow.
 	MaxCertificateDuration time.Duration
+	// MaxIntermediateDuration: the longest an issuer's intermediate may be valid
+	// (0: kmsca.MaxIntermediateDuration, which is also the most it may be).
+	MaxIntermediateDuration time.Duration
 }
 
-// NewAccess builds an Access. Namespaces, key IDs, permitted domains and the root
-// are all required. Aliases are refused as keys: they can be re-pointed at another
-// key. The root must be a valid root for this CA (self-signed, path length 1, name
-// constrained).
-func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, root *x509.Certificate, now time.Time) (*Access, error) {
+// NewAccess builds an Access. Namespaces, key IDs, permitted domains and at least
+// one root are all required. Aliases are refused as keys: they can be re-pointed at
+// another key. Each root must be a valid root for this CA (self-signed, path length
+// 1, name constrained) with every permitted domain inside the operator's. More than
+// one root is pinned only while replacing one: intermediates may chain to either.
+func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Certificate, now time.Time) (*Access, error) {
 	a := &Access{namespaces: map[string]bool{}, keyIDs: map[string]bool{}}
 	for _, ns := range namespaces {
 		if ns = strings.TrimSpace(ns); ns != "" {
@@ -74,18 +78,37 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, root *x509.Certif
 	if ceilings.MaxCertificateDuration < time.Hour || ceilings.MaxCertificateDuration%time.Second != 0 {
 		return nil, fmt.Errorf("the maximum certificate duration must be whole seconds and at least 1h")
 	}
-	if err := kmsca.ValidateRoot(root, now); err != nil {
-		return nil, fmt.Errorf("root certificate: %w", err)
+	if ceilings.MaxIntermediateDuration > kmsca.MaxIntermediateDuration {
+		return nil, fmt.Errorf("the maximum intermediate duration is at most %s", kmsca.MaxIntermediateDuration)
+	}
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("at least one root certificate is required")
+	}
+	for i, root := range roots {
+		if err := kmsca.ValidateRoot(root, now); err != nil {
+			return nil, fmt.Errorf("root certificate %d: %w", i+1, err)
+		}
+		for _, d := range root.PermittedDNSDomains {
+			if !withinDomains(d, a.ceilings.PermittedDNSDomains) {
+				return nil, fmt.Errorf("root certificate %d permits %q, outside the permitted DNS domains %v", i+1, d, a.ceilings.PermittedDNSDomains)
+			}
+		}
 	}
 	a.ceilings.AllowWildcards = ceilings.AllowWildcards
 	a.ceilings.MaxCertificateDuration = ceilings.MaxCertificateDuration
-	a.root = root
+	a.ceilings.MaxIntermediateDuration = ceilings.MaxIntermediateDuration
+	a.roots = roots
 	return a, nil
 }
 
-// Root is the pinned root certificate.
-func (a *Access) Root() *x509.Certificate {
-	return a.root
+// Roots are the pinned root certificates.
+func (a *Access) Roots() []*x509.Certificate {
+	return a.roots
+}
+
+// MaxIntermediateDuration is the longest an intermediate may be valid.
+func (a *Access) MaxIntermediateDuration() time.Duration {
+	return a.ceilings.MaxIntermediateDuration
 }
 
 // AllowedDomains are the operator's permitted DNS domains.

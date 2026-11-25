@@ -68,8 +68,10 @@ type KMSIssuerSpec struct {
 
 	// MaxCertificateDuration is the longest validity a request may ask for, in whole
 	// seconds. Requests asking for longer are refused, not shortened. Issued
-	// certificates also never outlive the intermediate. Defaults to 2160h (90 days,
-	// cert-manager's default); at most the operator's --max-certificate-duration.
+	// certificates also never outlive the intermediate. Defaults to 720h (30 days;
+	// cert-manager renews them automatically); at most the operator's
+	// --max-certificate-duration. A request without a duration gets this maximum or
+	// cert-manager's default (90 days), whichever is shorter.
 	// +optional
 	MaxCertificateDuration *metav1.Duration `json:"maxCertificateDuration,omitempty"`
 }

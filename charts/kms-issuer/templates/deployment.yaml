@@ -3,15 +3,19 @@
 {{- $domains := required "args.permittedDNSDomains is required" .Values.args.permittedDNSDomains }}
 {{- $region := required "awsRegion is required" .Values.awsRegion }}
 {{- $root := required "rootCertificate is required" .Values.rootCertificate }}
+{{- $rootConfigMap := printf "%s-root-%s" (include "kms-issuer.fullname" .) ($root | sha256sum | trunc 10) }}
 ---
-# The pinned root: every KMSIssuer's intermediate must chain to it.
+# The pinned root(s): every KMSIssuer's intermediate must chain to one. Immutable,
+# named by content: a new root is a new ConfigMap and a rollout, never an edit picked
+# up silently at some later restart.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-root
+  name: {{ $rootConfigMap }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kms-issuer.labels" . | nindent 4 }}
+immutable: true
 data:
   root.pem: |
     {{- $root | trim | nindent 4 }}
@@ -52,6 +56,7 @@ spec:
         - --permitted-dns-domains={{ join "," $domains }}
         - --allow-wildcards={{ .Values.args.allowWildcards }}
         - --max-certificate-duration={{ .Values.args.maxCertificateDuration }}
+        - --max-intermediate-duration={{ .Values.args.maxIntermediateDuration }}
         - --root-certificate=/etc/kms-issuer/root.pem
         - --enable-kmskey-controller={{ .Values.args.enableKMSKeyController }}
         - --health-probe-bind-address={{ .Values.args.healthProbeBindAddress }}
@@ -114,7 +119,7 @@ spec:
           sizeLimit: 16Mi
       - name: root
         configMap:
-          name: {{ include "kms-issuer.fullname" . }}-root
+          name: {{ $rootConfigMap }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

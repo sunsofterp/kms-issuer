@@ -2,16 +2,19 @@
 // administrator credentials. Both private keys stay in KMS: the tool only asks KMS
 // to sign.
 //
-//	kms-ca root --key-id <root key> --common-name <name> --domains <d1,d2> --out root.pem
-//	kms-ca intermediate --root-key-id <root key> --root-certificate root.pem \
-//	    --key-id <issuing key> --common-name <name> --domains <d1,d2> --out intermediate.pem
+//	kms-ca root --key-id <root key ARN> --common-name <name> --domains <d1,d2> --out root.pem
+//	kms-ca intermediate --root-key-id <root key ARN> --root-certificate root.pem \
+//	    --key-id <issuing key ARN> --common-name <name> --domains <d1,d2> --out intermediate.pem
 //	kms-ca show <file.pem>
 //
 // The root (path length 1, name-constrained, default 20 years) is what devices
 // trust; give it to the controller as --root-certificate. The intermediate (path
-// length 0, name-constrained inside the root's, default 2 years) is for the
-// issuer's KMS key; put it in the KMSIssuer's intermediateCertificate. Neither
-// command overwrites an existing file.
+// length 0, server auth only, name-constrained inside the root's, at most and by
+// default 183 days) is for the issuer's KMS key; put it in the KMSIssuer's
+// intermediateCertificate. Keys are named by key ID or ARN, never alias. Neither
+// command overwrites an existing file, and the output file is created before KMS is
+// asked to sign anything. What was made, with which keys and by which AWS identity,
+// is printed for the record.
 package main
 
 import (
@@ -28,15 +31,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 )
 
 const usage = `usage:
   kms-ca root --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 175200h]
-  kms-ca intermediate --root-key-id ID --root-certificate FILE --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 17520h]
+  kms-ca intermediate --root-key-id ID --root-certificate FILE --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 4392h]
   kms-ca show FILE
 `
 
@@ -77,9 +82,9 @@ type common struct {
 }
 
 func (c *common) register(fs *flag.FlagSet, defaultDuration time.Duration) {
-	fs.StringVar(&c.keyID, "key-id", "", "Required. The KMS key the certificate is for (key ID or ARN).")
+	fs.StringVar(&c.keyID, "key-id", "", "Required. The KMS key the certificate is for (key ID or ARN, not an alias).")
 	fs.StringVar(&c.commonName, "common-name", "", "Required. The certificate's common name.")
-	fs.StringVar(&c.domains, "domains", "", "Required. Comma-separated DNS domains: the name constraints.")
+	fs.StringVar(&c.domains, "domains", "", "Required. Comma-separated DNS domains (two labels or more): the name constraints.")
 	fs.StringVar(&c.outFile, "out", "", "Required. Where to write the PEM certificate (must not exist).")
 	fs.DurationVar(&c.duration, "duration", defaultDuration, "Validity.")
 	fs.StringVar(&c.region, "region", "", "AWS region (default: the AWS configuration's).")
@@ -90,8 +95,13 @@ func (c *common) check() error {
 	if c.keyID == "" || c.commonName == "" || c.domains == "" || c.outFile == "" {
 		return errors.New("--key-id, --common-name, --domains and --out are required\n" + usage)
 	}
-	if _, err := os.Stat(c.outFile); err == nil {
-		return fmt.Errorf("%s exists; not overwriting it", c.outFile)
+	if isAlias(c.keyID) {
+		return fmt.Errorf("--key-id %q is an alias: name the key by key ID or ARN (an alias can be re-pointed)", c.keyID)
+	}
+	for _, d := range splitList(c.domains) {
+		if err := kmsca.ValidConstraintDomain(d); err != nil {
+			return fmt.Errorf("--domains: %w", err)
+		}
 	}
 	return nil
 }
@@ -105,14 +115,10 @@ func (c *common) input() *kmsca.CAInput {
 	}
 }
 
-// newCA connects to KMS; tests replace it with a mock.
-var newCA = func(ctx context.Context, c *common) (*kmsca.KMSCA, error) { return c.connect(ctx) }
+// newCA connects to KMS and names the AWS identity in use; tests replace it.
+var newCA = func(ctx context.Context, c *common) (*kmsca.KMSCA, string, error) { return c.connect(ctx) }
 
-func (c *common) ca(ctx context.Context) (*kmsca.KMSCA, error) {
-	return newCA(ctx, c)
-}
-
-func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, error) {
+func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, string, error) {
 	var opts []func(*awsconfig.LoadOptions) error
 	if c.region != "" {
 		opts = append(opts, awsconfig.WithRegion(c.region))
@@ -127,12 +133,20 @@ func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, error) {
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if cfg.Region == "" {
-		return nil, errors.New("no AWS region: set --region or AWS_REGION")
+		return nil, "", errors.New("no AWS region: set --region or AWS_REGION")
 	}
-	return kmsca.NewKMSCA(&cfg), nil
+	identity := "(test endpoint)"
+	if c.endpoint == "" {
+		who, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+		if err != nil {
+			return nil, "", fmt.Errorf("checking the AWS identity: %w", err)
+		}
+		identity = aws.ToString(who.Arn)
+	}
+	return kmsca.NewKMSCA(&cfg), identity, nil
 }
 
 func root(args []string, out io.Writer) error {
@@ -145,25 +159,34 @@ func root(args []string, out io.Writer) error {
 	if err := c.check(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	ca, err := c.ca(ctx)
+	f, err := create(c.outFile)
 	if err != nil {
 		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ca, identity, err := newCA(ctx, &c)
+	if err != nil {
+		return discard(f, err)
 	}
 	cert, err := ca.MakeRoot(ctx, c.keyID, c.input())
 	if err != nil {
+		return discard(f, err)
+	}
+	if err := finish(f, cert); err != nil {
 		return err
 	}
-	return write(out, c.outFile, cert)
+	fmt.Fprintf(out, "wrote %s\n  signed by:    %s (root key)\n  as:           %s\n", c.outFile, c.keyID, identity)
+	describe(out, cert)
+	return nil
 }
 
 func intermediate(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("intermediate", flag.ContinueOnError)
 	var c common
 	var rootKeyID, rootFile string
-	c.register(fs, 2*365*24*time.Hour)
-	fs.StringVar(&rootKeyID, "root-key-id", "", "Required. The root's KMS key (key ID or ARN).")
+	c.register(fs, kmsca.MaxIntermediateDuration)
+	fs.StringVar(&rootKeyID, "root-key-id", "", "Required. The root's KMS key (key ID or ARN, not an alias).")
 	fs.StringVar(&rootFile, "root-certificate", "", "Required. The root certificate (PEM) made with `kms-ca root`.")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -174,31 +197,63 @@ func intermediate(args []string, out io.Writer) error {
 	if rootKeyID == "" || rootFile == "" {
 		return errors.New("--root-key-id and --root-certificate are required\n" + usage)
 	}
+	if isAlias(rootKeyID) {
+		return fmt.Errorf("--root-key-id %q is an alias: name the key by key ID or ARN", rootKeyID)
+	}
 	rootCert, err := readCertificate(rootFile)
+	if err != nil {
+		return err
+	}
+	f, err := create(c.outFile)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	ca, err := c.ca(ctx)
+	ca, identity, err := newCA(ctx, &c)
 	if err != nil {
-		return err
+		return discard(f, err)
 	}
 	cert, err := ca.MakeIntermediate(ctx, rootKeyID, rootCert, c.keyID, c.input())
 	if err != nil {
-		return err
+		return discard(f, err)
 	}
 	pub, err := ca.PublicKey(ctx, c.keyID)
 	if err != nil {
-		return err
+		return discard(f, err)
 	}
 	// Check it exactly as the controller will before handing it over.
-	if err := kmsca.ValidateIntermediate(cert, kmsca.ExpectedIntermediate{
-		Root: rootCert, PublicKey: pub, AllowedDomains: rootCert.PermittedDNSDomains, Now: time.Now(),
+	if _, err := kmsca.ValidateIntermediate(cert, kmsca.ExpectedIntermediate{
+		Roots: []*x509.Certificate{rootCert}, PublicKey: pub, AllowedDomains: rootCert.PermittedDNSDomains, Now: time.Now(),
 	}); err != nil {
-		return fmt.Errorf("the new intermediate does not validate: %w", err)
+		return discard(f, fmt.Errorf("the new intermediate does not validate: %w", err))
 	}
-	return write(out, c.outFile, cert)
+	if err := finish(f, cert); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "wrote %s\n  for key:      %s (issuing key)\n  signed by:    %s (root key)\n  as:           %s\n",
+		c.outFile, c.keyID, rootKeyID, identity)
+	describe(out, cert)
+	return nil
+}
+
+// create makes the output file, failing if it exists, before anything is signed.
+func create(file string) (*os.File, error) {
+	return os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+}
+
+// discard removes an output file left empty by a failure.
+func discard(f *os.File, err error) error {
+	f.Close()
+	os.Remove(f.Name())
+	return err
+}
+
+func finish(f *os.File, cert *x509.Certificate) error {
+	if _, err := f.Write(kmsca.EncodeCertificatePEM(cert)); err != nil {
+		return discard(f, err)
+	}
+	return f.Close()
 }
 
 func readCertificate(file string) (*x509.Certificate, error) {
@@ -213,36 +268,50 @@ func readCertificate(file string) (*x509.Certificate, error) {
 	return cert, nil
 }
 
-func write(out io.Writer, file string, cert *x509.Certificate) error {
-	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(kmsca.EncodeCertificatePEM(cert)); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "wrote %s\n", file)
-	describe(out, cert)
-	return nil
-}
-
 func describe(out io.Writer, cert *x509.Certificate) {
 	sum := sha256.Sum256(cert.Raw)
+	spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 	pathLen := "unlimited"
 	if cert.MaxPathLen > 0 || cert.MaxPathLenZero {
 		pathLen = fmt.Sprint(cert.MaxPathLen)
 	}
-	fmt.Fprintf(out, "  subject:      %s\n", cert.Subject)
-	fmt.Fprintf(out, "  issuer:       %s\n", cert.Issuer)
-	fmt.Fprintf(out, "  serial:       %s\n", cert.SerialNumber.Text(16))
-	fmt.Fprintf(out, "  valid:        %s to %s\n", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339))
-	fmt.Fprintf(out, "  CA:           %t, path length %s\n", cert.IsCA, pathLen)
-	fmt.Fprintf(out, "  constraints:  %s (critical: %t)\n", strings.Join(cert.PermittedDNSDomains, ", "), cert.PermittedDNSDomainsCritical)
-	fmt.Fprintf(out, "  sha256:       %s\n", hex.EncodeToString(sum[:]))
+	var ekus []string
+	for _, e := range cert.ExtKeyUsage {
+		switch e {
+		case x509.ExtKeyUsageServerAuth:
+			ekus = append(ekus, "server auth")
+		default:
+			ekus = append(ekus, fmt.Sprint(e))
+		}
+	}
+	var excludedIPs []string
+	for _, r := range cert.ExcludedIPRanges {
+		excludedIPs = append(excludedIPs, r.String())
+	}
+	fmt.Fprintf(out, "  subject:          %s\n", cert.Subject)
+	fmt.Fprintf(out, "  issuer:           %s\n", cert.Issuer)
+	fmt.Fprintf(out, "  serial:           %s\n", cert.SerialNumber.Text(16))
+	fmt.Fprintf(out, "  valid:            %s to %s (%s)\n", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339), cert.NotAfter.Sub(cert.NotBefore))
+	fmt.Fprintf(out, "  CA:               %t, path length %s\n", cert.IsCA, pathLen)
+	fmt.Fprintf(out, "  key usage:        cert sign %t, CRL sign %t\n", cert.KeyUsage&x509.KeyUsageCertSign != 0, cert.KeyUsage&x509.KeyUsageCRLSign != 0)
+	fmt.Fprintf(out, "  extended usage:   %s\n", orNone(ekus))
+	fmt.Fprintf(out, "  DNS constraints:  %s (critical: %t)\n", orNone(cert.PermittedDNSDomains), cert.PermittedDNSDomainsCritical)
+	fmt.Fprintf(out, "  URI constraints:  %s\n", orNone(cert.PermittedURIDomains))
+	fmt.Fprintf(out, "  email constraints: %s\n", orNone(cert.PermittedEmailAddresses))
+	fmt.Fprintf(out, "  excluded IPs:     %s\n", orNone(excludedIPs))
+	fmt.Fprintf(out, "  public key sha256: %s\n", hex.EncodeToString(spki[:]))
+	fmt.Fprintf(out, "  certificate sha256: %s\n", hex.EncodeToString(sum[:]))
+}
+
+func orNone(list []string) string {
+	if len(list) == 0 {
+		return "none"
+	}
+	return strings.Join(list, ", ")
+}
+
+func isAlias(id string) bool {
+	return strings.HasPrefix(id, "alias/") || strings.Contains(id, ":alias/")
 }
 
 func splitList(s string) []string {

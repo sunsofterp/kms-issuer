@@ -16,13 +16,16 @@ private CA that devices trust.
   `kms-ca root`: path length 1, critically name-constrained to your domains, 20 years by default. This is the
   certificate devices trust. The controller pins it (`--root-certificate`).
 - **Intermediate** — signed by the root key, by hand, with `kms-ca intermediate`, for the issuing KMS key:
-  path length 0, critically name-constrained inside the root's, 2 years by default. A KMSIssuer names it.
-- **Leaves** — signed by the controller with the issuing key, under the intermediate.
+  path length 0, server auth only, critically name-constrained inside the root's, at most (and by default)
+  183 days. A KMSIssuer names it.
+- **Leaves** — signed by the controller with the issuing key, under the intermediate: 30 days by default,
+  renewed automatically by cert-manager.
 
 Every client enforces name constraints on an intermediate, so nothing the issuing key signs is trusted for a
 name outside the intermediate's domains, whatever the client does with constraints on roots. Whoever can use
-the issuing key (the controller, or its IAM role) can sign only what the intermediate allows; making another
-intermediate takes the root key, which only administrators hold.
+the issuing key (the controller, or its IAM role) can sign only what the intermediate allows (TLS server
+certificates, inside its domains), and only until it expires; making another intermediate takes the root
+key, which only administrators hold.
 
 ## What it will sign
 
@@ -34,8 +37,8 @@ extensions:
   encipherment only for RSA keys.
 - **DNS names inside the issuer's `permittedDNSDomains` only.** IP addresses, URIs, email addresses and
   other name types are refused, as are wildcards unless `allowWildcards` is set. A common name must be one
-  of the DNS names; the subject is the common name alone.
-- **Bounded lifetime.** A request longer than `maxCertificateDuration` (default 90 days) is refused, and
+  of the DNS names and at most 64 characters; the subject is the common name alone.
+- **Bounded lifetime.** A request longer than `maxCertificateDuration` (default 30 days) is refused, and
   no certificate outlives the intermediate. Validity is exactly the requested duration.
 - **Approved requests only.** A CertificateRequest must be approved; denied requests are failed. Approval
   should come from a policy approver such as cert-manager
@@ -60,15 +63,25 @@ issuance is logged with its serial, names, validity, issuer, key and requester.
 Create two asymmetric `SIGN_VERIFY` KMS keys (RSA 3072 or 4096) outside the cluster: the root key, which no
 workload may use, and the issuing key. Then:
 
+Use the `kms-ca` binary attached to the release you deploy, after verifying it:
+
 ```console
-go build -o kms-ca ./cmd/kms-ca
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/sunsofterp/kms-issuer/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
 kms-ca root --key-id <root key ARN> --common-name "Example Root" --domains example.internal --out root.pem
 kms-ca intermediate --root-key-id <root key ARN> --root-certificate root.pem \
   --key-id <issuing key ARN> --common-name "Example Issuing" --domains example.internal --out intermediate.pem
 ```
 
-`kms-ca` never overwrites a file, checks the new intermediate exactly as the controller will, and prints
-each certificate's details and SHA-256 fingerprint. `kms-ca show <file>` prints them again.
+`kms-ca` refuses aliases (keys are named by ID or ARN), domains that aren't lower-case names of two labels or
+more, an intermediate longer than 183 days, longer-lived than the root, wider than the root, named like the
+root, or on the root key. It creates the output file before asking KMS to sign anything and never
+overwrites one, checks a new intermediate exactly as the controller will, and prints what it made: subject,
+validity, path length, usages, every constraint, the public key and certificate SHA-256 fingerprints, which
+keys signed, and the AWS identity it ran as. Keep that output as the ceremony record. `kms-ca show <file>`
+prints a certificate's details again.
 
 ## Install
 
@@ -97,7 +110,7 @@ issuer's domains.
 
 Metrics (authenticated; bind the `<release>-metrics-reader` ClusterRole to your scraper):
 `kms_issuer_intermediate_not_after_timestamp_seconds` and `kms_issuer_root_not_after_timestamp_seconds`
-(alert well before either expires), `kms_issuer_certificates_issued_total`,
+(alert well before either expires), `kms_issuer_leaves_truncated`, `kms_issuer_certificates_issued_total`,
 `kms_issuer_requests_refused_total`.
 
 ## Create an issuer and a certificate
@@ -111,7 +124,7 @@ metadata:
 spec:
   keyId: <issuing key ARN>   # immutable
   permittedDNSDomains: [example.internal]
-  maxCertificateDuration: 2160h
+  maxCertificateDuration: 720h
   intermediateCertificate: |
     -----BEGIN CERTIFICATE-----
     ...the contents of intermediate.pem...
@@ -133,14 +146,46 @@ spec:
 
 ## Renewal
 
-- **Intermediate:** make a new one with `kms-ca intermediate` and replace `intermediateCertificate`. The
-  issuer raises an `IntermediateExpiringSoon` warning event from 90 days before expiry, and the expiry metric
-  is there to alert on. Devices are unaffected: they trust the root.
-- **Root:** a new root means distributing it to every device and pinning it in the controller (the chart
-  restarts the controller when `rootCertificate` changes). Plan it well before the root's expiry.
+**Intermediate (by hand, every 183 days at most).** Make a new one with `kms-ca intermediate` and replace the
+issuer's `intermediateCertificate`; devices are unaffected (they trust the root). Leaves are cut short to end
+with the intermediate in its last `maxCertificateDuration`, so renew before then:
+
+- the issuer raises `IntermediateExpiringSoon` warning events from twice `maxCertificateDuration` (at least
+  30 days) before expiry;
+- `kms_issuer_intermediate_not_after_timestamp_seconds` is the expiry to alert on, and
+  `kms_issuer_leaves_truncated` turns 1 once leaves are being cut short (an overdue renewal);
+- under an hour of intermediate left, requests wait (pending) rather than get a uselessly short certificate.
+
+**Root replacement (planned, no hard cutover).**
+
+1. Make the new root on a new KMS key (`kms-ca root`), and distribute it to every device that trusts the old
+   one.
+2. Pin both: set `rootCertificate` to the old and new roots concatenated. The controller accepts
+   intermediates from either; each certificate's `ca.crt` is the root its intermediate chains to.
+3. Make a new intermediate under the new root and replace each issuer's `intermediateCertificate`.
+4. Once every certificate has renewed under the new root, remove the old root from `rootCertificate` and
+   from devices, and schedule the old root key's deletion.
+
+`rootCertificate` lives in an immutable ConfigMap named by its content, so every change is a rollout.
+
+**Revocation.** There is no CRL or OCSP. What contains a compromise is the lifetimes:
+
+- A leaked leaf key: it stops working when the leaf expires (at most `maxCertificateDuration`). Replace the
+  certificate (delete its Secret; cert-manager issues a new one) and fix the leak.
+- Misuse of the issuing key (anything that could call `kms:Sign` on it): within the intermediate's
+  constraints, certificates it signed can last until the intermediate expires (at most 183 days), and a
+  self-issued sub-CA under the intermediate is accepted by some clients (OpenSSL) until then. Cut access
+  (IAM), rotate the issuing key: new KMS key, new intermediate, new `keyId` (a new KMSIssuer), and expect
+  the old intermediate's window to run out. If that window is unacceptable, replace the root (above).
+- Root key compromise: replace the root, removing the old one from every device first.
+
+**Watch the issuing key.** Alert (CloudTrail) on `kms:Sign` calls for the issuing key by any identity but the
+controller's, and reconcile the controller's calls against its `issued certificate` log lines. Treat the
+controller's namespace as CA-critical: nobody else creates pods or execs there, since its service account
+can use the key.
 
 A KMS error never makes an issuer stop issuing while its intermediate is still valid: the controller retries
-with backoff and stays ready. There is no revocation (no CRL or OCSP): keep certificate lifetimes short.
+with backoff and stays ready.
 
 ## KMSKey (optional)
 

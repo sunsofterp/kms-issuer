@@ -22,7 +22,9 @@ awsRegion: ""
 
 # -- Required. The root CA certificate (PEM), made with `kms-ca root` on a KMS key
 # the controller cannot use. Every KMSIssuer's intermediate must chain to it, and it
-# is the `ca.crt` handed out with each certificate: what clients trust.
+# is the `ca.crt` handed out with each certificate: what clients trust. While
+# replacing a root, list both (old and new, concatenated); intermediates may chain
+# to either, and each certificate's `ca.crt` is the root its intermediate chains to.
 rootCertificate: ""
 
 args:
@@ -36,8 +38,12 @@ args:
   permittedDNSDomains: []
   # -- Let KMSIssuers allow wildcard names.
   allowWildcards: false
-  # -- The longest issued validity any KMSIssuer may allow.
-  maxCertificateDuration: 2160h
+  # -- The longest issued validity any KMSIssuer may allow. Short: cert-manager
+  # renews automatically.
+  maxCertificateDuration: 720h
+  # -- The longest an intermediate may be valid (at most 4392h, 183 days, which
+  # kms-ca also enforces). Renewing one is a manual step with the root key.
+  maxIntermediateDuration: 4392h
   # -- Run the KMSKey controller, which creates and deletes KMS keys. Off: create
   # keys outside the cluster and grant the controller only kms:Sign and
   # kms:GetPublicKey on them.
