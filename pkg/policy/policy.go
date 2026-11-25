@@ -115,8 +115,10 @@ func Template(req *Request, iss *Issuer, parent *x509.Certificate, serial *big.I
 	if iss.MaxDuration <= 0 || duration > iss.MaxDuration {
 		return nil, nil, deny("duration %s is longer than the issuer allows (%s)", duration, iss.MaxDuration)
 	}
+	// The validity is exactly the duration, backdating included, so it never
+	// exceeds what the issuer allows.
 	notBefore := now.Add(-clockSkew).UTC().Truncate(time.Second)
-	notAfter := now.Add(duration).UTC().Truncate(time.Second)
+	notAfter := notBefore.Add(duration)
 	if notAfter.After(parent.NotAfter) {
 		notAfter = parent.NotAfter
 	}

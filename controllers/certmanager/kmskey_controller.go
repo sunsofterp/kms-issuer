@@ -18,6 +18,8 @@ package certmanager
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	core "k8s.io/api/core/v1"
@@ -84,10 +86,15 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				log.Info("delete KMSKey")
 				err := r.KMSCA.DeleteKey(ctx, &kmsca.DeleteKeyInput{
 					AliasName:           kmsKey.Spec.AliasName,
-					OwnedKeyID:          kmsKey.Status.KeyID,
+					OwnerUID:            string(kmsKey.UID),
 					PendingWindowInDays: kmsKey.Spec.DeletionPendingWindowInDays,
 				})
-				if err != nil {
+				switch {
+				case errors.Is(err, kmsca.ErrNotOwned):
+					// Never delete a key this KMSKey didn't create; let the object go.
+					r.Recorder.Event(kmsKey, core.EventTypeWarning, kmsiapi.KMSKeyReasonFailed,
+						"The alias points at a key this KMSKey did not create; the key was not deleted")
+				case err != nil:
 					return ctrl.Result{}, r.manageFailure(ctx, log, kmsKey, err, "Failed to delete the KMS key")
 				}
 			}
@@ -103,7 +110,7 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Create the KMS key
 	keyID, err := r.KMSCA.CreateKey(ctx, &kmsca.CreateKeyInput{
 		AliasName:             kmsKey.Spec.AliasName,
-		OwnedKeyID:            kmsKey.Status.KeyID,
+		OwnerUID:              string(kmsKey.UID),
 		Description:           kmsKey.Spec.Description,
 		CustomerMasterKeySpec: kmsKey.Spec.CustomerMasterKeySpec,
 		Policy:                kmsKey.Spec.Policy,
@@ -150,12 +157,14 @@ func (r *KMSKeyReconciler) manageSuccess(ctx context.Context, log logr.Logger, k
 	return r.patchKeyStatus(ctx, kmskey)
 }
 
-// manageFailure
+// manageFailure marks the KMSKey not ready and returns the cause, so the work queue
+// retries with backoff.
 func (r *KMSKeyReconciler) manageFailure(ctx context.Context, log logr.Logger, kmskey *kmsiapi.KMSKey, issue error, msg string) error {
 	reason := kmsiapi.KMSKeyReasonFailed
+	msg = fmt.Sprintf("%s: %v", msg, issue)
 	log.Error(issue, msg)
 	r.Recorder.Event(kmskey, core.EventTypeWarning, reason, msg)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, msg)
 	kmskey.Status.SetCondition(&ready)
-	return r.patchKeyStatus(ctx, kmskey)
+	return errors.Join(issue, r.patchKeyStatus(ctx, kmskey))
 }

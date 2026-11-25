@@ -21,22 +21,22 @@ import (
 	"flag"
 	"os"
 	"strings"
+	"time"
 
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/utils/clock"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
@@ -65,8 +65,10 @@ func main() {
 	var (
 		metricsAddr, probeAddr, localAWSEndpoint string
 		allowedNamespaces, allowedKeyIDs         string
+		permittedDomains                         string
 		enableLeaderElection, secureMetrics      bool
-		enableKMSKeyController                   bool
+		enableKMSKeyController, allowWildcards   bool
+		maxCertificateDuration, maxCADuration    time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to. \"0\" disables it.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true, "Serve metrics over HTTPS, to authenticated and authorized callers only.")
@@ -78,6 +80,14 @@ func main() {
 		"Required. Comma-separated namespaces a KMSIssuer may live in; KMSIssuers anywhere else sign nothing.")
 	flag.StringVar(&allowedKeyIDs, "allowed-key-ids", "",
 		"Required. Comma-separated KMS key IDs or ARNs (not aliases) a KMSIssuer may sign with.")
+	flag.StringVar(&permittedDomains, "permitted-dns-domains", "",
+		"Required. Comma-separated DNS domains (two labels or more): every KMSIssuer's permittedDNSDomains must be inside them.")
+	flag.BoolVar(&allowWildcards, "allow-wildcards", false,
+		"Let KMSIssuers allow wildcard names (allowWildcards). Off by default.")
+	flag.DurationVar(&maxCertificateDuration, "max-certificate-duration", 90*24*time.Hour,
+		"The longest issued validity any KMSIssuer may allow (maxCertificateDuration).")
+	flag.DurationVar(&maxCADuration, "max-ca-duration", 10*365*24*time.Hour,
+		"The longest CA certificate validity any KMSIssuer may ask for (duration).")
 	flag.BoolVar(&enableKMSKeyController, "enable-kmskey-controller", false,
 		"Run the KMSKey controller, which creates and deletes KMS keys. Off by default: create keys outside the cluster.")
 	flag.StringVar(&localAWSEndpoint, "local-aws-endpoint", "", "Test only: a local KMS endpoint, with static test credentials.")
@@ -88,10 +98,22 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
-	access, err := certmanager.NewAccess(splitList(allowedNamespaces), splitList(allowedKeyIDs))
+	namespaces := splitList(allowedNamespaces)
+	access, err := certmanager.NewAccess(namespaces, splitList(allowedKeyIDs), certmanager.Ceilings{
+		PermittedDNSDomains:    splitList(permittedDomains),
+		AllowWildcards:         allowWildcards,
+		MaxCertificateDuration: maxCertificateDuration,
+		MaxCADuration:          maxCADuration,
+	})
 	if err != nil {
-		setupLog.Error(err, "invalid --allowed-issuer-namespaces / --allowed-key-ids")
+		setupLog.Error(err, "invalid access flags")
 		os.Exit(1)
+	}
+	// Watch and cache namespaced objects (KMSIssuers, CertificateRequests) in the
+	// allowed namespaces only: nothing elsewhere is read, let alone written.
+	defaultNamespaces := map[string]cache.Config{}
+	for _, ns := range namespaces {
+		defaultNamespaces[ns] = cache.Config{}
 	}
 
 	metricsOptions := metricsserver.Options{
@@ -108,6 +130,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "kms-issuer.cert-manager.skyscanner.net",
+		Cache:                  cache.Options{DefaultNamespaces: defaultNamespaces},
+		// No reconcile (and so no KMS call) can hang a controller's worker.
+		Controller: config.Controller{ReconciliationTimeout: 2 * time.Minute},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -116,17 +141,17 @@ func main() {
 
 	// Default AWS configuration (environment, Pod Identity, IMDS...), unless a local
 	// test endpoint is given.
-	awsLoadConfigOpts := []func(*config.LoadOptions) error{}
+	awsLoadConfigOpts := []func(*awsconfig.LoadOptions) error{}
 	if localAWSEndpoint != "" {
 		setupLog.Info("Using a local AWS endpoint with test credentials", "endpoint", localAWSEndpoint)
 		awsLoadConfigOpts = append(
 			awsLoadConfigOpts,
-			config.WithBaseEndpoint(localAWSEndpoint),
-			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
-			config.WithRegion("eu-west-1"),
+			awsconfig.WithBaseEndpoint(localAWSEndpoint),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
+			awsconfig.WithRegion("eu-west-1"),
 		)
 	}
-	cfg, err := config.LoadDefaultConfig(context.Background(), awsLoadConfigOpts...)
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsLoadConfigOpts...)
 	if err != nil {
 		setupLog.Error(err, "Error loading default aws config")
 		os.Exit(1)
@@ -144,12 +169,13 @@ func main() {
 	}
 
 	if err = (&certmanager.CertificateRequestReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("CertificateRequest"),
-		Recorder: mgr.GetEventRecorderFor("certificaterequests-controller"),
-		KMSCA:    ca,
-		Access:   access,
-		Clock:    clock.RealClock{},
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("CertificateRequest"),
+		Recorder:  mgr.GetEventRecorderFor("certificaterequests-controller"),
+		KMSCA:     ca,
+		Access:    access,
+		Clock:     clock.RealClock{},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CertificateRequest")
 		os.Exit(1)

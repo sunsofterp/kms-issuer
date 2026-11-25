@@ -1,5 +1,6 @@
 {{- $namespaces := required "args.allowedIssuerNamespaces is required" .Values.args.allowedIssuerNamespaces }}
 {{- $keys := required "args.allowedKeyIds is required" .Values.args.allowedKeyIds }}
+{{- $domains := required "args.permittedDNSDomains is required" .Values.args.permittedDNSDomains }}
 {{- $region := required "awsRegion is required" .Values.awsRegion }}
 ---
 apiVersion: apps/v1
@@ -33,6 +34,10 @@ spec:
         - /manager
         - --allowed-issuer-namespaces={{ join "," $namespaces }}
         - --allowed-key-ids={{ join "," $keys }}
+        - --permitted-dns-domains={{ join "," $domains }}
+        - --allow-wildcards={{ .Values.args.allowWildcards }}
+        - --max-certificate-duration={{ .Values.args.maxCertificateDuration }}
+        - --max-ca-duration={{ .Values.args.maxCADuration }}
         - --enable-kmskey-controller={{ .Values.args.enableKMSKeyController }}
         - --health-probe-bind-address={{ .Values.args.healthProbeBindAddress }}
         - --metrics-bind-address={{ .Values.args.metricsBindAddress }}
@@ -43,8 +48,10 @@ spec:
         {{- end }}
         {{- if .Values.image.digest }}
         image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
-        {{- else }}
+        {{- else if .Values.image.allowTag }}
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        {{- else }}
+        {{- fail "image.digest is required (tags can move); set image.allowTag=true only for tests" }}
         {{- end }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         env:

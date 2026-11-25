@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 )
@@ -42,15 +43,30 @@ func TestShouldReplacePreExistingConditions(t *testing.T) {
 	g.Expect(len(status.Conditions)).To(Equal(1))
 }
 
-// should not update the condition if it already exists and has the same status and reason.
+// should not touch the condition when status, reason and message are all unchanged.
 func TestShouldNotUpdateExistingCondition(t *testing.T) {
 	g := NewWithT(t)
 	status := &Status{}
 	because := NewCondition(ConditionReady, ConditionFalse, KMSIssuerReasonFailed, "because")
 	status.SetCondition(&because)
-	otherMsg := NewCondition(ConditionReady, ConditionFalse, KMSIssuerReasonFailed, "othermsg")
-	status.SetCondition(&otherMsg)
+	same := NewCondition(ConditionReady, ConditionFalse, KMSIssuerReasonFailed, "because")
+	same.LastTransitionTime.Time = same.LastTransitionTime.Add(time.Hour)
+	status.SetCondition(&same)
 	g.Expect(status.Conditions[0]).To(Equal(because))
+	g.Expect(len(status.Conditions)).To(Equal(1))
+}
+
+// a new message with the same status replaces the message but keeps the transition time.
+func TestShouldUpdateTheMessageKeepingTheTransitionTime(t *testing.T) {
+	g := NewWithT(t)
+	status := &Status{}
+	because := NewCondition(ConditionReady, ConditionFalse, KMSIssuerReasonFailed, "because")
+	status.SetCondition(&because)
+	otherMsg := NewCondition(ConditionReady, ConditionFalse, KMSIssuerReasonFailed, "othermsg")
+	otherMsg.LastTransitionTime.Time = otherMsg.LastTransitionTime.Add(time.Hour)
+	status.SetCondition(&otherMsg)
+	g.Expect(status.Conditions[0].Message).To(Equal("othermsg"))
+	g.Expect(status.Conditions[0].LastTransitionTime).To(Equal(because.LastTransitionTime))
 	g.Expect(len(status.Conditions)).To(Equal(1))
 }
 

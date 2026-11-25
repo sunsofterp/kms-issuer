@@ -17,8 +17,9 @@ limitations under the License.
 package certmanager
 
 import (
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubectl/pkg/util/slice"
 )
 
 const (
@@ -28,7 +29,7 @@ const (
 
 // NeedToAddFinalizer checks if need to add finalizer to object
 func NeedToAddFinalizer(obj metav1.Object) bool {
-	return obj.GetDeletionTimestamp() == nil && !slice.ContainsString(obj.GetFinalizers(), FinalizerName, nil)
+	return obj.GetDeletionTimestamp() == nil && !slices.Contains(obj.GetFinalizers(), FinalizerName)
 }
 
 // AddFinalizer adds the finalizer to the object

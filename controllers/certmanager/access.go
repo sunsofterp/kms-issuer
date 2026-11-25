@@ -3,19 +3,38 @@ package certmanager
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
 )
 
-// Access is what the operator allows, from the controller's flags: the namespaces a
-// KMSIssuer may live in and the KMS keys one may name. Both lists are required, so
-// a KMSIssuer created anywhere else, or naming any other key, signs nothing.
+// Access is what the operator allows, from the controller's flags. A KMSIssuer may
+// only live in an allowed namespace, use an allowed key, and stay within the
+// ceilings: its permitted domains inside the operator's, its lifetimes no longer,
+// and wildcards only if the operator allows them. Whoever can write KMSIssuers can
+// narrow the policy, never widen it past these. Any issuer outside them signs
+// nothing.
 type Access struct {
 	namespaces map[string]bool
 	keyIDs     map[string]bool
+	ceilings   Ceilings
 }
 
-// NewAccess builds an Access from lists of namespaces and key IDs or ARNs. Aliases
-// are refused: they can be re-pointed at another key.
-func NewAccess(namespaces, keyIDs []string) (*Access, error) {
+// Ceilings are the operator's upper bounds on every KMSIssuer.
+type Ceilings struct {
+	// PermittedDNSDomains: every issuer domain must equal one or be a subdomain.
+	PermittedDNSDomains []string
+	// AllowWildcards: whether any issuer may allow wildcard names.
+	AllowWildcards bool
+	// MaxCertificateDuration: the longest issued validity any issuer may allow.
+	MaxCertificateDuration time.Duration
+	// MaxCADuration: the longest CA certificate validity any issuer may ask for.
+	MaxCADuration time.Duration
+}
+
+// NewAccess builds an Access. Namespaces, key IDs and permitted domains are all
+// required. Aliases are refused as keys: they can be re-pointed at another key.
+func NewAccess(namespaces, keyIDs []string, ceilings Ceilings) (*Access, error) {
 	a := &Access{namespaces: map[string]bool{}, keyIDs: map[string]bool{}}
 	for _, ns := range namespaces {
 		if ns = strings.TrimSpace(ns); ns != "" {
@@ -38,6 +57,25 @@ func NewAccess(namespaces, keyIDs []string) (*Access, error) {
 	if len(a.keyIDs) == 0 {
 		return nil, fmt.Errorf("at least one allowed KMS key is required")
 	}
+	for _, d := range ceilings.PermittedDNSDomains {
+		d = normalizeDomain(d)
+		if d == "" || !strings.Contains(d, ".") {
+			return nil, fmt.Errorf("permitted DNS domain %q must have at least two labels", d)
+		}
+		a.ceilings.PermittedDNSDomains = append(a.ceilings.PermittedDNSDomains, d)
+	}
+	if len(a.ceilings.PermittedDNSDomains) == 0 {
+		return nil, fmt.Errorf("at least one permitted DNS domain is required")
+	}
+	if ceilings.MaxCertificateDuration < time.Hour {
+		return nil, fmt.Errorf("the maximum certificate duration must be at least 1h")
+	}
+	if ceilings.MaxCADuration < minCertDuration {
+		return nil, fmt.Errorf("the maximum CA duration must be at least %s", minCertDuration)
+	}
+	a.ceilings.AllowWildcards = ceilings.AllowWildcards
+	a.ceilings.MaxCertificateDuration = ceilings.MaxCertificateDuration
+	a.ceilings.MaxCADuration = ceilings.MaxCADuration
 	return a, nil
 }
 
@@ -55,6 +93,46 @@ func (a *Access) Check(namespace, keyID string) error {
 	return nil
 }
 
+// CheckIssuer returns an error unless the issuer is allowed (namespace and key) and
+// its policy stays within the ceilings.
+func (a *Access) CheckIssuer(issuer *kmsiapi.KMSIssuer, s settings) error {
+	if err := a.Check(issuer.Namespace, issuer.Spec.KeyID); err != nil {
+		return err
+	}
+	if len(issuer.Spec.PermittedDNSDomains) == 0 {
+		return fmt.Errorf("permittedDNSDomains is required")
+	}
+	for _, d := range issuer.Spec.PermittedDNSDomains {
+		if !withinDomains(normalizeDomain(d), a.ceilings.PermittedDNSDomains) {
+			return fmt.Errorf("permitted DNS domain %q is outside the operator's %v", d, a.ceilings.PermittedDNSDomains)
+		}
+	}
+	if issuer.Spec.AllowWildcards && !a.ceilings.AllowWildcards {
+		return fmt.Errorf("allowWildcards is set but the operator does not allow wildcards")
+	}
+	if s.maxCertificateDuration > a.ceilings.MaxCertificateDuration {
+		return fmt.Errorf("maxCertificateDuration %s is longer than the operator's %s", s.maxCertificateDuration, a.ceilings.MaxCertificateDuration)
+	}
+	if s.duration > a.ceilings.MaxCADuration {
+		return fmt.Errorf("duration %s is longer than the operator's %s", s.duration, a.ceilings.MaxCADuration)
+	}
+	return nil
+}
+
 func isAlias(id string) bool {
 	return strings.HasPrefix(id, "alias/") || strings.Contains(id, ":alias/")
+}
+
+func normalizeDomain(d string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
+}
+
+// withinDomains reports whether d equals one of domains or is a subdomain of one.
+func withinDomains(d string, domains []string) bool {
+	for _, c := range domains {
+		if d == c || strings.HasSuffix(d, "."+c) {
+			return true
+		}
+	}
+	return false
 }

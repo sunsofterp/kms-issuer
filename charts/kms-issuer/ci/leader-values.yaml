@@ -2,11 +2,13 @@
 image:
   repository: kms-issuer
   tag: ci
+  allowTag: true
   pullPolicy: Never
 
 awsRegion: eu-west-1
 args:
   allowedIssuerNamespaces: [default]
   allowedKeyIds: [00000000-0000-0000-0000-000000000000]
+  permittedDNSDomains: [example.internal]
 
 replicaCount: 2

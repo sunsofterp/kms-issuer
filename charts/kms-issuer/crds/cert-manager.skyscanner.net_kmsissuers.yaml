@@ -56,8 +56,8 @@ spec:
                   rule: self == oldSelf
               duration:
                 description: |-
-                  Duration is the CA certificate's validity. Defaults to 87600h (10 years);
-                  at least 24h.
+                  Duration is the CA certificate's validity, in whole seconds. Defaults to 87600h
+                  (10 years); at least 24h, and at most the controller's --max-ca-duration.
                 type: string
               keyId:
                 description: |-
@@ -93,7 +93,7 @@ spec:
                   RenewBefore is how long before the CA certificate's notAfter a new CA
                   certificate (same key, same subject) is made. Certificates issued before and
                   after chain to either, so devices holding the older copy keep working until that
-                  copy expires. Defaults to 8760h (1 year); must be shorter than duration.
+                  copy expires. Defaults to 8760h (1 year); whole seconds, at most half of duration.
                 type: string
             required:
             - commonName
@@ -150,6 +150,12 @@ spec:
                   - type
                   type: object
                 type: array
+              previousCertificate:
+                description: |-
+                  PreviousCertificate is the CA certificate the current one replaced (same key and
+                  subject), kept for reference while devices move to the new copy.
+                format: byte
+                type: string
             type: object
         type: object
     served: true

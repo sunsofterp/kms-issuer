@@ -78,8 +78,11 @@ Ce+P5wm/tp+Zl38cj6s1xlld+H9IfKrqcpdlQ4fJKzfrPWM7jgpcUw==
 
 // KMSMock Define a simple mock of the KMS client
 type KMSMock struct {
-	keys  map[string]*kms.CreateKeyInput
-	alias map[string]string
+	keys    map[string]*kms.CreateKeyInput
+	alias   map[string]string
+	pending map[string]bool
+	// FailCreateAlias makes CreateAlias fail, for testing cleanup.
+	FailCreateAlias bool
 }
 
 // Ensure KMSMock implements interface
@@ -88,9 +91,24 @@ var _ interfaces.KMSClient = &KMSMock{}
 // New creates a new KMSMock instance
 func New() *KMSMock {
 	return &KMSMock{
-		keys:  map[string]*kms.CreateKeyInput{},
-		alias: map[string]string{},
+		keys:    map[string]*kms.CreateKeyInput{},
+		alias:   map[string]string{},
+		pending: map[string]bool{},
 	}
+}
+
+// PendingDeletion reports whether ScheduleKeyDeletion was called for keyID.
+func (m *KMSMock) PendingDeletion(keyID string) bool {
+	return m.pending[keyID]
+}
+
+// KeyIDs returns the IDs of the keys created.
+func (m *KMSMock) KeyIDs() []string {
+	ids := make([]string, 0, len(m.keys))
+	for id := range m.keys {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // CreateKey mocks of the KMS CreateKey method.
@@ -108,6 +126,9 @@ func (m *KMSMock) CreateKey(_ context.Context, input *kms.CreateKeyInput, _ ...f
 // CreateAlias mocks of the KMS CreateAlias method.
 // Returns a valid CreateAliasOutput response
 func (m *KMSMock) CreateAlias(_ context.Context, input *kms.CreateAliasInput, _ ...func(*kms.Options)) (*kms.CreateAliasOutput, error) {
+	if m.FailCreateAlias {
+		return nil, &kmstypes.LimitExceededException{Message: aws.String("mock: alias creation fails")}
+	}
 	m.alias[aws.ToString(input.AliasName)] = aws.ToString(input.TargetKeyId)
 	return &kms.CreateAliasOutput{}, nil
 }
@@ -130,9 +151,14 @@ func (m *KMSMock) DescribeKey(_ context.Context, input *kms.DescribeKeyInput, _ 
 			return nil, &kmstypes.NotFoundException{}
 		}
 	}
+	state := kmstypes.KeyStateEnabled
+	if m.pending[keyID] {
+		state = kmstypes.KeyStatePendingDeletion
+	}
 	return &kms.DescribeKeyOutput{
 		KeyMetadata: &kmstypes.KeyMetadata{
-			KeyId: aws.String(keyID),
+			KeyId:    aws.String(keyID),
+			KeyState: state,
 		},
 	}, nil
 }
@@ -149,10 +175,15 @@ func (m *KMSMock) ListResourceTags(_ context.Context, input *kms.ListResourceTag
 
 // ScheduleKeyDeletion mocks of the KMS ScheduleKeyDeletion method.
 func (m *KMSMock) ScheduleKeyDeletion(_ context.Context, input *kms.ScheduleKeyDeletionInput, _ ...func(*kms.Options)) (*kms.ScheduleKeyDeletionOutput, error) {
-	if _, ok := m.keys[aws.ToString(input.KeyId)]; ok {
-		return &kms.ScheduleKeyDeletionOutput{}, nil
+	keyID := aws.ToString(input.KeyId)
+	if _, ok := m.keys[keyID]; !ok {
+		return nil, &kmstypes.NotFoundException{}
 	}
-	return nil, &kmstypes.NotFoundException{}
+	if m.pending[keyID] {
+		return nil, &kmstypes.KMSInvalidStateException{Message: aws.String("mock: already pending deletion")}
+	}
+	m.pending[keyID] = true
+	return &kms.ScheduleKeyDeletionOutput{}, nil
 }
 
 // GetPublicKey mocks of the KMS GetPublicKey method.

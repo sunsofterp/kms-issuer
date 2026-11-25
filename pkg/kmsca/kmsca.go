@@ -57,36 +57,50 @@ func NewKMSCA(cfg *aws.Config) *KMSCA {
 	}
 }
 
+// OwnerTag is the KMS key tag naming the KMSKey (by UID) that created the key. It is
+// the only proof of ownership: a key without it, or with another UID, is never
+// adopted or deleted.
+const OwnerTag = "kms-issuer.cert-manager.skyscanner.net/kmskey-uid"
+
 // ErrAliasTaken is returned when an alias already points at a key the caller did
 // not create.
 var ErrAliasTaken = errors.New("the alias already points at a key this KMSKey did not create; refusing to adopt it")
 
-// CreateKey creates an asymmetric KMS key used to sign certificates and an alias
-// pointing at it. If the alias already exists it must point at input.OwnedKeyID (the
-// key a previous run of this KMSKey created); any other existing key is refused.
-// Returns the key ID.
+// ErrNotOwned is returned by DeleteKey when the alias points at a key this KMSKey
+// did not create: nothing is deleted.
+var ErrNotOwned = errors.New("the alias points at a key this KMSKey did not create; not deleting it")
+
+// CreateKey creates an asymmetric KMS key used to sign certificates, tagged with its
+// owner's UID, and an alias pointing at it. If the alias already exists, its key must
+// carry this owner's tag (a previous run created it); any other key is refused. If
+// the alias cannot be created, the new key is scheduled for deletion again rather
+// than left behind. Returns the key ID.
 func (ca *KMSCA) CreateKey(ctx context.Context, input *CreateKeyInput) (string, error) {
 	if err := validateAlias(input.AliasName); err != nil {
 		return "", err
 	}
-	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{
-		KeyId: aws.String(input.AliasName),
-	})
-	if err == nil {
-		existing := aws.ToString(response.KeyMetadata.KeyId)
-		if input.OwnedKeyID != "" && existing == input.OwnedKeyID {
-			return existing, nil
-		}
-		return "", ErrAliasTaken
+	if input.OwnerUID == "" {
+		return "", errors.New("an owner UID is required")
 	}
-	var nsk *kmstypes.NotFoundException
-	if !errors.As(err, &nsk) {
+	existing, found, err := ca.describeAlias(ctx, input.AliasName)
+	if err != nil {
 		return "", err
+	}
+	if found {
+		owned, err := ca.ownedBy(ctx, existing, input.OwnerUID)
+		if err != nil {
+			return "", err
+		}
+		if !owned {
+			return "", ErrAliasTaken
+		}
+		return existing, nil
 	}
 
 	keyInput := &kms.CreateKeyInput{
 		KeyUsage: kmstypes.KeyUsageTypeSignVerify,
 		KeySpec:  kmstypes.KeySpecRsa3072,
+		Tags:     []kmstypes.Tag{{TagKey: aws.String(OwnerTag), TagValue: aws.String(input.OwnerUID)}},
 	}
 	if input.CustomerMasterKeySpec != "" {
 		keyInput.KeySpec = kmstypes.KeySpec(input.CustomerMasterKeySpec)
@@ -98,54 +112,99 @@ func (ca *KMSCA) CreateKey(ctx context.Context, input *CreateKeyInput) (string, 
 		keyInput.Policy = aws.String(input.Policy)
 	}
 	for k, v := range input.Tags {
+		if k == OwnerTag {
+			continue
+		}
 		keyInput.Tags = append(keyInput.Tags, kmstypes.Tag{TagKey: aws.String(k), TagValue: aws.String(v)})
 	}
 	key, err := ca.Client.CreateKey(ctx, keyInput)
 	if err != nil {
 		return "", err
 	}
-	_, err = ca.Client.CreateAlias(ctx, &kms.CreateAliasInput{
-		TargetKeyId: key.KeyMetadata.KeyId,
+	keyID := aws.ToString(key.KeyMetadata.KeyId)
+	if _, err = ca.Client.CreateAlias(ctx, &kms.CreateAliasInput{
+		TargetKeyId: aws.String(keyID),
 		AliasName:   aws.String(input.AliasName),
-	})
-	if err != nil {
-		return "", err
+	}); err != nil {
+		// Don't leave an unreferenced key behind; the next attempt makes a new one.
+		_, cleanupErr := ca.Client.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
+			KeyId: aws.String(keyID), PendingWindowInDays: aws.Int32(7),
+		})
+		return "", errors.Join(fmt.Errorf("creating alias %s: %w", input.AliasName, err), cleanupErr)
 	}
-	return aws.ToString(key.KeyMetadata.KeyId), nil
+	return keyID, nil
 }
 
-// DeleteKey schedules deletion of the key this KMSKey created (input.OwnedKeyID) and
-// deletes its alias. It refuses when the alias now points at any other key.
+// DeleteKey schedules deletion of the key behind the alias and deletes the alias,
+// only when that key carries this owner's tag. A missing alias means there is
+// nothing left to delete. A key already pending deletion is not scheduled again,
+// so a retry after a partial failure completes.
 func (ca *KMSCA) DeleteKey(ctx context.Context, input *DeleteKeyInput) error {
 	if err := validateAlias(input.AliasName); err != nil {
 		return err
 	}
-	if input.OwnedKeyID == "" {
-		return errors.New("no key was recorded as created by this KMSKey; refusing to delete anything")
+	if input.OwnerUID == "" {
+		return errors.New("an owner UID is required")
 	}
-	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{
-		KeyId: aws.String(input.AliasName),
-	})
+	keyID, found, err := ca.describeAlias(ctx, input.AliasName)
+	if err != nil || !found {
+		return err
+	}
+	owned, err := ca.ownedBy(ctx, keyID, input.OwnerUID)
 	if err != nil {
 		return err
 	}
-	if aws.ToString(response.KeyMetadata.KeyId) != input.OwnedKeyID {
-		return fmt.Errorf("alias %s points at %s, not the key this KMSKey created (%s); refusing to delete it",
-			input.AliasName, aws.ToString(response.KeyMetadata.KeyId), input.OwnedKeyID)
+	if !owned {
+		return ErrNotOwned
 	}
-	deleteInput := &kms.ScheduleKeyDeletionInput{
-		KeyId: aws.String(input.OwnedKeyID),
-	}
-	if input.PendingWindowInDays >= 7 && input.PendingWindowInDays <= 30 {
-		deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) //nolint:gosec // G115: bounded to 7-30 just above
-	}
-	if _, err := ca.Client.ScheduleKeyDeletion(ctx, deleteInput); err != nil {
+	described, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(keyID)})
+	if err != nil {
 		return err
 	}
-	_, err = ca.Client.DeleteAlias(ctx, &kms.DeleteAliasInput{
-		AliasName: aws.String(input.AliasName),
-	})
+	if described.KeyMetadata.KeyState != kmstypes.KeyStatePendingDeletion {
+		deleteInput := &kms.ScheduleKeyDeletionInput{KeyId: aws.String(keyID)}
+		if input.PendingWindowInDays >= 7 && input.PendingWindowInDays <= 30 {
+			deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) //nolint:gosec // G115: bounded to 7-30 just above
+		}
+		if _, err := ca.Client.ScheduleKeyDeletion(ctx, deleteInput); err != nil {
+			return err
+		}
+	}
+	_, err = ca.Client.DeleteAlias(ctx, &kms.DeleteAliasInput{AliasName: aws.String(input.AliasName)})
 	return err
+}
+
+// describeAlias returns the key ID an alias points at, and whether it exists.
+func (ca *KMSCA) describeAlias(ctx context.Context, alias string) (string, bool, error) {
+	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(alias)})
+	if err != nil {
+		var nsk *kmstypes.NotFoundException
+		if errors.As(err, &nsk) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return aws.ToString(response.KeyMetadata.KeyId), true, nil
+}
+
+// ownedBy reports whether keyID carries the owner tag with uid.
+func (ca *KMSCA) ownedBy(ctx context.Context, keyID, uid string) (bool, error) {
+	input := &kms.ListResourceTagsInput{KeyId: aws.String(keyID)}
+	for {
+		out, err := ca.Client.ListResourceTags(ctx, input)
+		if err != nil {
+			return false, err
+		}
+		for _, t := range out.Tags {
+			if aws.ToString(t.TagKey) == OwnerTag {
+				return aws.ToString(t.TagValue) == uid, nil
+			}
+		}
+		if !out.Truncated || out.NextMarker == nil {
+			return false, nil
+		}
+		input.Marker = out.NextMarker
+	}
 }
 
 func validateAlias(alias string) error {
@@ -256,8 +315,8 @@ type CreateKeyInput struct {
 	// AliasName Specifies the alias name for the kms key. This value must begin with alias/ followed by a
 	// name, such as alias/ExampleAlias.
 	AliasName string
-	// OwnedKeyID is the key a previous run created for this alias, if any.
-	OwnedKeyID string
+	// OwnerUID is the creating KMSKey's UID, tagged on the key as proof of ownership.
+	OwnerUID string
 	// Description for the key
 	Description string
 	// CustomerMasterKeySpec determines the key spec (default RSA_3072).
@@ -272,8 +331,8 @@ type CreateKeyInput struct {
 type DeleteKeyInput struct {
 	// AliasName Specifies the alias name for the kms key.
 	AliasName string
-	// OwnedKeyID is the key this KMSKey created: the only key it will delete.
-	OwnedKeyID string
+	// OwnerUID is the KMSKey's UID: only a key tagged with it is deleted.
+	OwnerUID string
 	// PendingWindowInDays, 7 to 30; anything else uses KMS's default of 30.
 	PendingWindowInDays int
 }

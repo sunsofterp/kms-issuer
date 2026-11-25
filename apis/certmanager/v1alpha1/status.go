@@ -101,11 +101,17 @@ func (status *Status) GetCondition(condType ConditionType) *Condition {
 }
 
 // SetCondition adds/replaces the given condition in the KMSIssuer status. If the condition that we
-// are about to add already exists and has the same status and reason then we are not going to update.
+// are about to add already exists with the same status, reason and message, nothing changes. A new
+// message with the same status keeps the original LastTransitionTime.
 func (status *Status) SetCondition(condition *Condition) {
 	currentCond := status.GetCondition(condition.Type)
-	if currentCond != nil && currentCond.Status == condition.Status && currentCond.Reason == condition.Reason {
-		return
+	if currentCond != nil && currentCond.Status == condition.Status {
+		if currentCond.Reason == condition.Reason && currentCond.Message == condition.Message {
+			return
+		}
+		updated := *condition
+		updated.LastTransitionTime = currentCond.LastTransitionTime
+		condition = &updated
 	}
 	status.Conditions = append(status.filterOutCondition(condition.Type), *condition)
 }

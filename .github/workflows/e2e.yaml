@@ -69,13 +69,15 @@ jobs:
           KEY_ID: ${{ steps.key.outputs.key_id }}
         run: |
           helm install kms-issuer charts/kms-issuer -n kms-issuer-system --create-namespace --wait \
-            --set image.repository=kms-issuer --set image.tag=ci --set image.pullPolicy=Never \
+            --set image.repository=kms-issuer --set image.tag=ci --set image.allowTag=true --set image.pullPolicy=Never \
             --set awsRegion=eu-west-1 \
             --set "args.allowedIssuerNamespaces={default}" \
             --set "args.allowedKeyIds={${KEY_ID}}" \
+            --set "args.permittedDNSDomains={example.internal}" \
             --set args.enableKMSKeyController=true \
             --set args.localAwsEndpoint=http://local-kms.local-kms:8080 \
-            --set certManagerApprovalRBAC.enable=true
+            --set certManagerApprovalRBAC.enable=true \
+            --set "certManagerApprovalRBAC.issuers={default.kms-issuer-sample}"
 
       - name: Create a KMSIssuer
         env:

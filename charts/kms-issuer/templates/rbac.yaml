@@ -1,11 +1,18 @@
+{{- /*
+What the controller needs, and no more. Namespaced objects (KMSIssuers,
+CertificateRequests, their events) only in the allowed issuer namespaces, through a
+Role in each; the controller's cache watches only those namespaces. It can read and
+write the status of these objects, never create or delete them.
+*/ -}}
+{{- $sa := include "kms-issuer.serviceAccountName" . }}
+{{- $fullname := include "kms-issuer.fullname" . }}
+{{- range $ns := .Values.args.allowedIssuerNamespaces }}
 ---
-# What the controller needs, and no more: read KMSIssuers, KMSKeys and
-# CertificateRequests; write their status; update KMSKeys (their finalizer) only when
-# the KMSKey controller runs. It can never create or delete any of them.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-manager-role
+  name: {{ $fullname }}-manager
+  namespace: {{ $ns }}
 rules:
 - apiGroups:
   - ""
@@ -46,6 +53,30 @@ rules:
   - get
   - patch
   - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-manager
+  namespace: {{ $ns }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-manager
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- if or .Values.args.enableKMSKeyController .Values.args.metricsSecure }}
+---
+# Cluster-wide only for what has no namespace: KMSKeys (cluster-scoped, and their
+# events) when that controller runs, and the metrics endpoint's token checks.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-manager-role
+rules:
 {{- if .Values.args.enableKMSKeyController }}
 - apiGroups:
   - cert-manager.skyscanner.net
@@ -64,9 +95,15 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 {{- end }}
 {{- if .Values.args.metricsSecure }}
-# The metrics endpoint checks each caller's token and its right to get /metrics.
 - apiGroups:
   - authentication.k8s.io
   resources:
@@ -84,21 +121,22 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-manager-role
+  name: {{ $fullname }}-manager-role
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "kms-issuer.fullname" . }}-manager-role
+  name: {{ $fullname }}-manager-role
 subjects:
 - kind: ServiceAccount
-  name: {{ include "kms-issuer.serviceAccountName" . }}
+  name: {{ $sa }}
   namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- if .Values.args.leaderElect }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-leader-election-role
+  name: {{ $fullname }}-leader-election-role
   namespace: {{ .Release.Namespace }}
 rules:
 - apiGroups:
@@ -124,28 +162,33 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-leader-election-role
+  name: {{ $fullname }}-leader-election-role
   namespace: {{ .Release.Namespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "kms-issuer.fullname" . }}-leader-election-role
+  name: {{ $fullname }}-leader-election-role
 subjects:
 - kind: ServiceAccount
-  name: {{ include "kms-issuer.serviceAccountName" . }}
+  name: {{ $sa }}
   namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- if .Values.certManagerApprovalRBAC.enable }}
+{{- $issuers := required "certManagerApprovalRBAC.issuers is required when enabled" .Values.certManagerApprovalRBAC.issuers }}
 ---
+# cert-manager's built-in approver approves every request it may; these are the
+# only KMSIssuers it may approve for. A policy approver is the better choice.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-cert-manager-controller-approve
+  name: {{ $fullname }}-cert-manager-controller-approve
 rules:
 - apiGroups:
   - cert-manager.io
   resourceNames:
-  - kmsissuers.cert-manager.skyscanner.net/*
+  {{- range $issuers }}
+  - kmsissuers.cert-manager.skyscanner.net/{{ . }}
+  {{- end }}
   resources:
   - signers
   verbs:
@@ -154,11 +197,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-cert-manager-controller-approve
+  name: {{ $fullname }}-cert-manager-controller-approve
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "kms-issuer.fullname" . }}-cert-manager-controller-approve
+  name: {{ $fullname }}-cert-manager-controller-approve
 subjects:
 - kind: ServiceAccount
   name: {{ .Values.certManagerApprovalRBAC.serviceAccountName }}
@@ -170,7 +213,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-metrics-reader
+  name: {{ $fullname }}-metrics-reader
 rules:
 - nonResourceURLs:
   - /metrics

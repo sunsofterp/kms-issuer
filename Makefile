@@ -40,9 +40,11 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=charts/kms-issuer/crds
+# RBAC is the chart's (charts/kms-issuer/templates/rbac.yaml, namespaced per allowed
+# namespace); the kubebuilder rbac markers document it but generate nothing.
+manifests: controller-gen ## Generate CustomResourceDefinition objects.
+	$(CONTROLLER_GEN) crd paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) crd paths="./..." output:crd:artifacts:config=charts/kms-issuer/crds
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -69,6 +71,11 @@ generate-chart-docs: helm-docs ## Generate Helm chart documentation.
 .PHONY: build
 build: generate fmt vet ## Build manager binary.
 	go build -o bin/manager main.go
+
+# Binary mode: it checks exactly what ships, Go standard library included.
+.PHONY: vulncheck
+vulncheck: build govulncheck ## Check the built binary for known vulnerabilities.
+	$(GOVULNCHECK) -mode=binary bin/manager
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -110,6 +117,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 HELM_DOCS ?= $(LOCALBIN)/helm-docs
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 
 ## Tool Versions (all pinned; installed with go install, checked against go.sum's
 ## checksum database like any module)
@@ -117,6 +125,7 @@ KUSTOMIZE_VERSION ?= v5.8.3
 CONTROLLER_TOOLS_VERSION ?= v0.23.0
 SETUP_ENVTEST_VERSION ?= v0.25.3
 HELM_DOCS_VERSION ?= v1.14.2
+GOVULNCHECK_VERSION ?= v1.10.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -137,3 +146,8 @@ $(ENVTEST): $(LOCALBIN)
 helm-docs: $(HELM_DOCS) ## Download helm-docs locally if necessary.
 $(HELM_DOCS): $(LOCALBIN)
 	GOBIN=$(LOCALBIN) go install github.com/norwoodj/helm-docs/cmd/helm-docs@$(HELM_DOCS_VERSION)
+
+.PHONY: govulncheck
+govulncheck: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
+$(GOVULNCHECK): $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)

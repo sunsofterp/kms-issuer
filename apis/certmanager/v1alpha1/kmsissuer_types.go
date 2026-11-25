@@ -69,15 +69,15 @@ type KMSIssuerSpec struct {
 	// +optional
 	MaxCertificateDuration *metav1.Duration `json:"maxCertificateDuration,omitempty"`
 
-	// Duration is the CA certificate's validity. Defaults to 87600h (10 years);
-	// at least 24h.
+	// Duration is the CA certificate's validity, in whole seconds. Defaults to 87600h
+	// (10 years); at least 24h, and at most the controller's --max-ca-duration.
 	// +optional
 	Duration *metav1.Duration `json:"duration,omitempty"`
 
 	// RenewBefore is how long before the CA certificate's notAfter a new CA
 	// certificate (same key, same subject) is made. Certificates issued before and
 	// after chain to either, so devices holding the older copy keep working until that
-	// copy expires. Defaults to 8760h (1 year); must be shorter than duration.
+	// copy expires. Defaults to 8760h (1 year); whole seconds, at most half of duration.
 	// +optional
 	RenewBefore *metav1.Duration `json:"renewBefore,omitempty"`
 }
@@ -88,6 +88,10 @@ type KMSIssuerStatus struct {
 	// Byte slice containing a PEM encoded signed certificate of the CA
 	// +optional
 	Certificate []byte `json:"certificate,omitempty"`
+	// PreviousCertificate is the CA certificate the current one replaced (same key and
+	// subject), kept for reference while devices move to the new copy.
+	// +optional
+	PreviousCertificate []byte `json:"previousCertificate,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -74,8 +74,8 @@ func TestTemplateIssuesAServerCertificate(t *testing.T) {
 	if len(cert.ExtKeyUsage) != 1 || cert.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth {
 		t.Errorf("ext key usage = %v", cert.ExtKeyUsage)
 	}
-	if !cert.NotAfter.Equal(now.Add(90 * 24 * time.Hour)) {
-		t.Errorf("notAfter = %s", cert.NotAfter)
+	if got := cert.NotAfter.Sub(cert.NotBefore); got != 90*24*time.Hour {
+		t.Errorf("validity = %s, want exactly the requested 2160h", got)
 	}
 	if !cert.NotBefore.Before(now) {
 		t.Errorf("notBefore = %s, want slightly before now", cert.NotBefore)

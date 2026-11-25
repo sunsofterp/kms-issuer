@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -54,6 +55,13 @@ var (
 	// "default" the only namespace; otherKeyID exists in KMS but is not allowed.
 	allowedKeyID string
 	otherKeyID   string
+	// testCeilings are the operator ceilings under test: example.internal only,
+	// no wildcards, 90-day certificates, 10-year CA certificates.
+	testCeilings = Ceilings{
+		PermittedDNSDomains:    []string{"example.internal"},
+		MaxCertificateDuration: 90 * 24 * time.Hour,
+		MaxCADuration:          10 * 365 * 24 * time.Hour,
+	}
 )
 
 func TestAPIs(t *testing.T) {
@@ -96,20 +104,21 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	ca.Client = mocks.New()
-	allowedKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/allowed"})
+	allowedKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/allowed", OwnerUID: "suite"})
 	Expect(err).NotTo(HaveOccurred())
-	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other"})
+	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other", OwnerUID: "suite"})
 	Expect(err).NotTo(HaveOccurred())
-	access, err := NewAccess([]string{"default"}, []string{allowedKeyID})
+	access, err := NewAccess([]string{"default"}, []string{allowedKeyID}, testCeilings)
 	Expect(err).NotTo(HaveOccurred())
 
 	err = (&CertificateRequestReconciler{
-		Client:   k8sManager.GetClient(),
-		Log:      logf.Log,
-		Recorder: k8sManager.GetEventRecorderFor("certificaterequests-controller"),
-		KMSCA:    &ca,
-		Access:   access,
-		Clock:    clock.RealClock{},
+		Client:    k8sManager.GetClient(),
+		APIReader: k8sManager.GetAPIReader(),
+		Log:       logf.Log,
+		Recorder:  k8sManager.GetEventRecorderFor("certificaterequests-controller"),
+		KMSCA:     &ca,
+		Access:    access,
+		Clock:     clock.RealClock{},
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred(), "failed to setup the CertificateRequestReconciler controller")
 

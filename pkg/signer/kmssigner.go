@@ -32,7 +32,7 @@ import (
 	"github.com/sunsofterp/kms-issuer/v5/pkg/interfaces"
 )
 
-// signTimeout bounds each KMS Sign call.
+// signTimeout bounds each KMS call (GetPublicKey, Sign).
 const signTimeout = 30 * time.Second
 
 // KMSSigner implements crypto.Signer with an AWS KMS asymmetric SIGN_VERIFY key.
@@ -48,7 +48,9 @@ type KMSSigner struct {
 // New returns a KMSSigner for keyID, fetching its public key. ctx bounds every call
 // the signer makes.
 func New(ctx context.Context, client interfaces.KMSClient, keyID string) (*KMSSigner, error) {
-	response, err := client.GetPublicKey(ctx, &kms.GetPublicKeyInput{
+	getCtx, cancel := context.WithTimeout(ctx, signTimeout)
+	defer cancel()
+	response, err := client.GetPublicKey(getCtx, &kms.GetPublicKeyInput{
 		KeyId: &keyID,
 	})
 	if err != nil {

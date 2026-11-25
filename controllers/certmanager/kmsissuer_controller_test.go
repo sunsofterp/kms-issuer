@@ -18,8 +18,6 @@ package certmanager
 
 import (
 	"context"
-	"crypto/x509/pkix"
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -29,8 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
-	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
-	mocks "github.com/sunsofterp/kms-issuer/v5/pkg/kmsmock"
 )
 
 func WaitIssuerReady(key client.ObjectKey) *kmsiapi.KMSIssuer {
@@ -102,6 +98,14 @@ var _ = Context("KMSIssuer", func() {
 			expectIssuerNeverReady(key)
 		})
 
+		It("should refuse domains outside the operator's ceiling", func() {
+			key := client.ObjectKey{Name: "issuer-wide", Namespace: "default"}
+			issuer := newIssuer(key.Namespace, key.Name, allowedKeyID)
+			issuer.Spec.PermittedDNSDomains = []string{"com"}
+			Expect(k8sClient.Create(context.Background(), issuer)).Should(Succeed())
+			expectIssuerNeverReady(key)
+		})
+
 		It("should refuse an alias as keyId at the API", func() {
 			issuer := newIssuer("default", "issuer-alias", "alias/allowed")
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
@@ -132,84 +136,3 @@ var _ = Context("KMSIssuer", func() {
 		})
 	})
 })
-
-func TestNeedsNewCA(t *testing.T) {
-	ca := &kmsca.KMSCA{Client: mocks.New()}
-	keyID, err := ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/needs-new-ca"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, time.November, 25, 12, 0, 0, 0, time.UTC)
-	issuer := &kmsiapi.KMSIssuer{Spec: kmsiapi.KMSIssuerSpec{
-		KeyID: keyID, CommonName: "Root", PermittedDNSDomains: []string{"example.internal"},
-		Duration:    &metav1.Duration{Duration: 10 * 24 * time.Hour},
-		RenewBefore: &metav1.Duration{Duration: 2 * 24 * time.Hour},
-	}}
-	s := issuerSettings(issuer)
-	cert, err := ca.GenerateAndSignCertificateAuthorityCertificate(context.TODO(), &kmsca.GenerateCertificateAuthorityCertificateInput{
-		KeyID: keyID, Subject: pkix.Name{CommonName: "Root"}, Duration: s.duration,
-		PermittedDNSDomains: []string{"example.internal"}, Now: now,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub, err := ca.PublicKey(context.TODO(), keyID)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if reason := needsNewCA(cert, issuer, s, pub, now); reason != "" {
-		t.Errorf("fresh certificate: %s", reason)
-	}
-	if reason := needsNewCA(cert, issuer, s, pub, now.Add(7*24*time.Hour)); reason != "" {
-		t.Errorf("before renewal: %s", reason)
-	}
-	if reason := needsNewCA(cert, issuer, s, pub, now.Add(8*24*time.Hour)); reason == "" {
-		t.Error("renewal due: no new CA")
-	}
-	if reason := needsNewCA(nil, issuer, s, pub, now); reason == "" {
-		t.Error("no certificate: no new CA")
-	}
-
-	changed := issuer.DeepCopy()
-	changed.Spec.PermittedDNSDomains = []string{"example.internal", "other.internal"}
-	if reason := needsNewCA(cert, changed, issuerSettings(changed), pub, now); reason == "" {
-		t.Error("domains changed: no new CA")
-	}
-	changed = issuer.DeepCopy()
-	changed.Spec.Duration = &metav1.Duration{Duration: 20 * 24 * time.Hour}
-	if reason := needsNewCA(cert, changed, issuerSettings(changed), pub, now); reason == "" {
-		t.Error("duration changed: no new CA")
-	}
-
-	notCA := *cert
-	notCA.MaxPathLenZero = false
-	notCA.MaxPathLen = -1
-	if reason := needsNewCA(&notCA, issuer, s, pub, now); reason == "" {
-		t.Error("unconstrained path length: no new CA")
-	}
-
-	otherCert := *cert
-	otherCert.PublicKey = nil
-	if reason := needsNewCA(&otherCert, issuer, s, pub, now); reason == "" {
-		t.Error("certificate for another key: no new CA")
-	}
-}
-
-func TestSettingsValidate(t *testing.T) {
-	bad := []settings{
-		{duration: time.Hour, renewBefore: 0, maxCertificateDuration: time.Hour},
-		{duration: 48 * time.Hour, renewBefore: 48 * time.Hour, maxCertificateDuration: time.Hour},
-		{duration: 48 * time.Hour, renewBefore: -time.Hour, maxCertificateDuration: time.Hour},
-		{duration: 48 * time.Hour, renewBefore: time.Hour, maxCertificateDuration: time.Minute},
-	}
-	for _, s := range bad {
-		if s.validate() == nil {
-			t.Errorf("%+v validated", s)
-		}
-	}
-	good := settings{duration: 48 * time.Hour, renewBefore: time.Hour, maxCertificateDuration: time.Hour}
-	if err := good.validate(); err != nil {
-		t.Error(err)
-	}
-}

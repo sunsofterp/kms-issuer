@@ -18,6 +18,7 @@ package certmanager
 
 import (
 	"context"
+	"crypto"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -51,11 +52,13 @@ const (
 // name a KMSIssuer, within the issuer's policy.
 type CertificateRequestReconciler struct {
 	client.Client
-	Log      logr.Logger
-	Recorder record.EventRecorder
-	KMSCA    *kmsca.KMSCA
-	Access   *Access
-	Clock    clock.Clock
+	// APIReader reads uncached, for the last check before signing.
+	APIReader client.Reader
+	Log       logr.Logger
+	Recorder  record.EventRecorder
+	KMSCA     *kmsca.KMSCA
+	Access    *Access
+	Clock     clock.Clock
 }
 
 // Annotation for generating RBAC role for writing Events
@@ -105,7 +108,8 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to retrieve KMSIssuer resource %s: %v", issuerName, err)
 		return ctrl.Result{}, err
 	}
-	if err := r.Access.Check(issuer.Namespace, issuer.Spec.KeyID); err != nil {
+	settings := issuerSettings(&issuer)
+	if err := r.Access.CheckIssuer(&issuer, settings); err != nil {
 		return ctrl.Result{}, r.fail(ctx, cr, "KMSIssuer %s may not issue: %v", issuerName, err)
 	}
 	if !issuer.Status.IsReady() {
@@ -115,10 +119,40 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	parent, err := ParseCertificate(issuer.Status.Certificate)
-	if err != nil {
-		return ctrl.Result{}, r.fail(ctx, cr, "Failed to decode the issuer's CA certificate: %v", err)
+	// The CA certificate must be exactly one this controller would have made for
+	// the issuer and its key; anything else in status is never signed under.
+	parent, err := kmsca.ParseCertificatePEM(issuer.Status.Certificate)
+	if err == nil {
+		var pub crypto.PublicKey
+		if pub, err = r.KMSCA.PublicKey(ctx, issuer.Spec.KeyID); err != nil {
+			log.Error(err, "failed to read the KMS key's public key")
+			_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to read the KMS key (will retry): %v", err)
+			return ctrl.Result{}, err
+		}
+		err = kmsca.ValidateCA(parent, kmsca.ExpectedCA{
+			PublicKey: pub, CommonName: issuer.Spec.CommonName,
+			PermittedDNSDomains: issuer.Spec.PermittedDNSDomains, Now: r.Clock.Now(),
+		})
 	}
+	if err != nil {
+		err = fmt.Errorf("the issuer's CA certificate is not acceptable: %w", err)
+		log.Error(err, "not signing")
+		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
+		return ctrl.Result{}, err
+	}
+
+	// The cache may lag a signing that just happened: read the request fresh, so a
+	// second certificate is never signed for it.
+	if r.APIReader != nil {
+		fresh := new(cmapi.CertificateRequest)
+		if err := r.APIReader.Get(ctx, req.NamespacedName, fresh); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		if len(fresh.Status.Certificate) > 0 || fresh.ResourceVersion != cr.ResourceVersion {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
 	serial, err := kmsca.RandomSerial()
 	if err != nil {
 		return ctrl.Result{}, err
@@ -131,7 +165,6 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	for _, u := range cr.Spec.Usages {
 		usages = append(usages, string(u))
 	}
-	settings := issuerSettings(&issuer)
 	template, publicKey, err := policy.Template(
 		&policy.Request{
 			CSR:             cr.Spec.Request,
@@ -150,6 +183,7 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		if errors.Is(err, policy.ErrDenied) {
 			log.Info("request refused", "reason", err.Error(), "requester", cr.Spec.Username)
+			requestsRefused.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
 			return ctrl.Result{}, r.fail(ctx, cr, "%v", err)
 		}
 		return ctrl.Result{}, err
@@ -191,7 +225,7 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 			return nil
 		}
 		latest.Status.Certificate = certPEM
-		latest.Status.CA = issuer.Status.Certificate
+		latest.Status.CA = kmsca.EncodeCertificatePEM(parent)
 		apiutil.SetCertificateRequestCondition(latest, cmapi.CertificateRequestConditionReady, cmmeta.ConditionTrue, cmapi.CertificateRequestReasonIssued, "Certificate issued")
 		return r.Status().Update(ctx, latest)
 	})
@@ -199,6 +233,7 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		log.Error(err, "failed to record the issued certificate", "serial", signed.SerialNumber.Text(16))
 		return ctrl.Result{}, err
 	}
+	certificatesIssued.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
 	r.Recorder.Event(cr, core.EventTypeNormal, cmapi.CertificateRequestReasonIssued, "Certificate issued")
 	return ctrl.Result{}, nil
 }

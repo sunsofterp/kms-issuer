@@ -2,12 +2,19 @@
 image:
   repository: kms-issuer
   tag: ci
+  allowTag: true
   pullPolicy: Never
 
 awsRegion: eu-west-1
 args:
-  allowedIssuerNamespaces: [default, other]
+  # Two namespaces that exist in any cluster: a Role in each.
+  allowedIssuerNamespaces: [default, kube-public]
   allowedKeyIds: [00000000-0000-0000-0000-000000000000]
+  permittedDNSDomains: [example.internal]
   enableKMSKeyController: true
   metricsSecure: false
   metricsBindAddress: ":8080"
+
+certManagerApprovalRBAC:
+  enable: true
+  issuers: [default.kms-issuer-sample]
