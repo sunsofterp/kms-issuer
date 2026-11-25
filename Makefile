@@ -74,8 +74,10 @@ build: generate fmt vet ## Build manager binary.
 
 # Binary mode: it checks exactly what ships, Go standard library included.
 .PHONY: vulncheck
-vulncheck: build govulncheck ## Check the built binary for known vulnerabilities.
+vulncheck: build govulncheck ## Check the built binaries for known vulnerabilities.
+	go build -o bin/kms-ca ./cmd/kms-ca
 	$(GOVULNCHECK) -mode=binary bin/manager
+	$(GOVULNCHECK) -mode=binary bin/kms-ca
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

@@ -6,6 +6,31 @@ image:
   pullPolicy: Never
 
 awsRegion: eu-west-1
+# A throwaway root for chart tests only (see dev-values.yaml).
+rootCertificate: |
+  -----BEGIN CERTIFICATE-----
+  MIIDyzCCArOgAwIBAgIQF6fWg4OSwXyEwZN15uRiYTANBgkqhkiG9w0BAQsFADA+
+  MTwwOgYDVQQDEzNrbXMtaXNzdWVyIGNoYXJ0IENJIHJvb3QgKHRlc3Qgb25seSwg
+  a2V5IGRpc2NhcmRlZCkwHhcNMjYxMTI1MjE0NzE0WhcNNDYxMTIwMjE0NzE0WjA+
+  MTwwOgYDVQQDEzNrbXMtaXNzdWVyIGNoYXJ0IENJIHJvb3QgKHRlc3Qgb25seSwg
+  a2V5IGRpc2NhcmRlZCkwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC2
+  VyVwZ7J98U/GGVZ3izPvgsOoRHEW+IRFB8DUg9hA9O4mMBJbNPjJf44OFtBq5xkd
+  uPIpBNliW1QH4v551wITOwq5lAj20UHlZTpvwY4c7FjlbV7FFNX51i/g/bWM5lXz
+  y3z7Oz49VMmpcmau+FdM76a0WLIEYws+xSzwdiUJmzxK+gEKUvIetCrkfMxUmDbC
+  w+oyMCxWIbaROmzefEf8sNBY6mC1UfpR9MbIyL+tuMRGajjFbGzLQc6qqr8M4tNh
+  6K67cgNS7IZpm0ep4Rw6Ds7A9/YYvTdSXzwtSvE8wgzOxCAiQWOjk8FxkcVtQ9hR
+  mcd0zgdZwTho34TRthRRAgMBAAGjgcQwgcEwDgYDVR0PAQH/BAQDAgEGMBIGA1Ud
+  EwEB/wQIMAYBAf8CAQEwHQYDVR0OBBYEFNhrabIVzsUBJTro5I/CF0dO8AD+MHwG
+  A1UdHgEB/wRyMHCgPDASghBleGFtcGxlLmludGVybmFsMBKBEGV4YW1wbGUuaW50
+  ZXJuYWwwEoYQZXhhbXBsZS5pbnRlcm5hbKEwMAqHCAAAAAAAAAAAMCKHIAAAAAAA
+  AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMA0GCSqGSIb3DQEBCwUAA4IBAQAf
+  MUtxPtSpzQosC6yLcvE8weBhSMcS7fYw3J1iWUwnDh1IpLkhHGQXT0joPam5kTCW
+  oGejBt75Oe5YxAC8d3YE1FjyRmK387t1J/FyDkEikYw5RfDYlCuutjUrChlv8Xad
+  PQe8+XxSCZ+rUc5iXWY7sv/idfiRHtdXngUDoXEWB3iiUBp2AmwfWvlE/8Zmd2VW
+  SvjL36qJStgl7Jnn/yyseVK4++qOZTjTJM3H3Huelt5Z9C2X+/PoKWo40Vx3IEwp
+  3rFn03Enax7GlOd96GXoAbjkAkmP8wiCVAzdePDwEiSDT9Daet0qfXhVX0zOHEYq
+  LdpUr69Gf6hPelm0MFXc
+  -----END CERTIFICATE-----
 args:
   # Two namespaces that exist in any cluster: a Role in each.
   allowedIssuerNamespaces: [default, kube-public]

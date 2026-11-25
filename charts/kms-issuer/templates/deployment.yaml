@@ -2,6 +2,19 @@
 {{- $keys := required "args.allowedKeyIds is required" .Values.args.allowedKeyIds }}
 {{- $domains := required "args.permittedDNSDomains is required" .Values.args.permittedDNSDomains }}
 {{- $region := required "awsRegion is required" .Values.awsRegion }}
+{{- $root := required "rootCertificate is required" .Values.rootCertificate }}
+---
+# The pinned root: every KMSIssuer's intermediate must chain to it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kms-issuer.fullname" . }}-root
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kms-issuer.labels" . | nindent 4 }}
+data:
+  root.pem: |
+    {{- $root | trim | nindent 4 }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +31,12 @@ spec:
       control-plane: {{ include "kms-issuer.fullname" . }}-controller-manager
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
+        # A new root restarts the controller so it pins the new one.
+        checksum/root: {{ $root | sha256sum }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         control-plane: {{ include "kms-issuer.fullname" . }}-controller-manager
     spec:
@@ -37,7 +52,7 @@ spec:
         - --permitted-dns-domains={{ join "," $domains }}
         - --allow-wildcards={{ .Values.args.allowWildcards }}
         - --max-certificate-duration={{ .Values.args.maxCertificateDuration }}
-        - --max-ca-duration={{ .Values.args.maxCADuration }}
+        - --root-certificate=/etc/kms-issuer/root.pem
         - --enable-kmskey-controller={{ .Values.args.enableKMSKeyController }}
         - --health-probe-bind-address={{ .Values.args.healthProbeBindAddress }}
         - --metrics-bind-address={{ .Values.args.metricsBindAddress }}
@@ -86,6 +101,9 @@ spec:
         # server writes its self-signed certificate here).
         - name: tmp
           mountPath: /tmp
+        - name: root
+          mountPath: /etc/kms-issuer
+          readOnly: true
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       serviceAccountName: {{ include "kms-issuer.serviceAccountName" . }}
@@ -94,6 +112,9 @@ spec:
       - name: tmp
         emptyDir:
           sizeLimit: 16Mi
+      - name: root
+        configMap:
+          name: {{ include "kms-issuer.fullname" . }}-root
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

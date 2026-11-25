@@ -45,9 +45,9 @@ func newIssuer(namespace, name, keyID string) *kmsiapi.KMSIssuer {
 	return &kmsiapi.KMSIssuer{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: kmsiapi.KMSIssuerSpec{
-			KeyID:               keyID,
-			CommonName:          "Test Root CA",
-			PermittedDNSDomains: []string{"example.internal"},
+			KeyID:                   keyID,
+			IntermediateCertificate: intermediateFor(keyID),
+			PermittedDNSDomains:     []string{"example.internal"},
 		},
 	}
 }
@@ -65,24 +65,31 @@ func expectIssuerNeverReady(key client.ObjectKey) {
 var _ = Context("KMSIssuer", func() {
 
 	Describe("when a new resource is created", func() {
-		It("should make a constrained CA certificate", func() {
+		It("should accept the intermediate the pinned root signed for its key", func() {
 			key := client.ObjectKey{Name: "issuer", Namespace: "default"}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
 
 			issuer := WaitIssuerReady(key)
 			cert, err := ParseCertificate(issuer.Status.Certificate)
 			Expect(err).To(BeNil())
-			Expect(cert.NotAfter.Sub(cert.NotBefore)).To(Equal(defaultCertDuration))
-			Expect(cert.PermittedDNSDomains).To(Equal([]string{"example.internal"}))
 			Expect(cert.MaxPathLenZero).To(BeTrue())
+			Expect(cert.CheckSignatureFrom(testRoot)).To(Succeed())
+		})
 
-			By("not re-making it on later reconciles")
-			serial := cert.SerialNumber
-			Consistently(func() string {
-				Expect(k8sClient.Get(context.Background(), key, issuer)).Should(Succeed())
-				c, _ := ParseCertificate(issuer.Status.Certificate)
-				return c.SerialNumber.String()
-			}, time.Second*2, time.Millisecond*200).Should(Equal(serial.String()))
+		It("should refuse an intermediate for another key", func() {
+			key := client.ObjectKey{Name: "issuer-swapped", Namespace: "default"}
+			issuer := newIssuer(key.Namespace, key.Name, allowedKeyID)
+			issuer.Spec.IntermediateCertificate = otherIntermediate
+			Expect(k8sClient.Create(context.Background(), issuer)).Should(Succeed())
+			expectIssuerNeverReady(key)
+		})
+
+		It("should refuse the root itself as the intermediate", func() {
+			key := client.ObjectKey{Name: "issuer-root", Namespace: "default"}
+			issuer := newIssuer(key.Namespace, key.Name, allowedKeyID)
+			issuer.Spec.IntermediateCertificate = string(ParseableRoot())
+			Expect(k8sClient.Create(context.Background(), issuer)).Should(Succeed())
+			expectIssuerNeverReady(key)
 		})
 
 		It("should refuse a key that is not allowed", func() {
@@ -111,28 +118,26 @@ var _ = Context("KMSIssuer", func() {
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
 		})
 
-		It("should refuse an issuer without permitted domains at the API", func() {
+		It("should refuse an issuer without permitted domains or an intermediate at the API", func() {
 			issuer := newIssuer("default", "issuer-no-domains", allowedKeyID)
 			issuer.Spec.PermittedDNSDomains = nil
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
-		})
-
-		It("should refuse renewBefore not shorter than duration at the API", func() {
-			issuer := newIssuer("default", "issuer-loop", allowedKeyID)
-			issuer.Spec.Duration = &metav1.Duration{Duration: 48 * time.Hour}
-			issuer.Spec.RenewBefore = &metav1.Duration{Duration: 48 * time.Hour}
+			issuer = newIssuer("default", "issuer-no-intermediate", allowedKeyID)
+			issuer.Spec.IntermediateCertificate = ""
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
 		})
 
-		It("should refuse changing keyId or commonName", func() {
+		It("should refuse changing keyId", func() {
 			key := client.ObjectKey{Name: "issuer-immutable", Namespace: "default"}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
 			issuer := WaitIssuerReady(key)
-			issuer.Spec.CommonName = "Another CA"
-			Expect(k8sClient.Update(context.Background(), issuer)).ShouldNot(Succeed())
-			Expect(k8sClient.Get(context.Background(), key, issuer)).Should(Succeed())
 			issuer.Spec.KeyID = otherKeyID
 			Expect(k8sClient.Update(context.Background(), issuer)).ShouldNot(Succeed())
 		})
 	})
 })
+
+// ParseableRoot is the suite's root certificate, PEM.
+func ParseableRoot() []byte {
+	return encodeForTest(testRoot.Raw)
+}

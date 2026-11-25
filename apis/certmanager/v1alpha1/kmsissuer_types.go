@@ -29,29 +29,32 @@ const (
 
 // KMSIssuerSpec defines the desired state of KMSIssuer.
 //
-// +kubebuilder:validation:XValidation:rule="!has(self.duration) || !has(self.renewBefore) || duration(self.renewBefore) < duration(self.duration)",message="renewBefore must be shorter than duration"
+// The CA is two-tier. An offline root (its own KMS key, never usable by the
+// controller) signs an intermediate certificate for this issuer's KMS key, by hand,
+// with the kms-ca tool. The issuer signs leaves with that key, under that
+// intermediate. The root it must chain to is the controller's --root-certificate,
+// not anything here, so editing a KMSIssuer can never swap in another root.
 type KMSIssuerSpec struct {
-	// KeyID is the KMS key that signs: a key ID or key ARN, never an alias (an alias
-	// can be re-pointed at another key by anyone allowed to update it). The key must
-	// be an asymmetric SIGN_VERIFY key, and the controller must be started with it in
-	// --allowed-key-ids. Immutable: a different key is a different CA.
+	// KeyID is the KMS key that signs leaves: a key ID or key ARN, never an alias (an
+	// alias can be re-pointed at another key). The key must be an asymmetric
+	// SIGN_VERIFY key, and the controller must be started with it in
+	// --allowed-key-ids. Immutable: a different key needs a different intermediate.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^(arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/)?(mrk-)?[0-9a-fA-F-]{32,36}$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="keyId is immutable"
 	KeyID string `json:"keyId"`
 
-	// CommonName is the CA certificate's subject common name. Immutable: devices that
-	// trust the CA identify it by subject and key.
+	// IntermediateCertificate is the PEM intermediate CA certificate for KeyID, made
+	// with `kms-ca intermediate`. It must be for this KMS key, signed by the
+	// controller's root, a CA with path length 0, and name-constrained (critically)
+	// to domains inside the operator's ceilings. Replacing it renews the issuer.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=64
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="commonName is immutable"
-	CommonName string `json:"commonName"`
+	IntermediateCertificate string `json:"intermediateCertificate"`
 
-	// PermittedDNSDomains are the DNS domains this CA may ever certify. They are
-	// written into the CA certificate as critical name constraints (so clients reject
-	// any certificate under it for another name, however it was issued), and every
-	// request must name only these domains or their subdomains.
+	// PermittedDNSDomains are the DNS domains this issuer certifies: every request
+	// must name only these domains or their subdomains. They must be inside both the
+	// intermediate's name constraints and the operator's ceilings.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`
@@ -59,39 +62,24 @@ type KMSIssuerSpec struct {
 	PermittedDNSDomains []string `json:"permittedDNSDomains"`
 
 	// AllowWildcards lets a request include wildcard names (*.example.internal).
-	// Off by default.
+	// Off by default, and only possible if the operator allows wildcards.
 	// +optional
 	AllowWildcards bool `json:"allowWildcards,omitempty"`
 
-	// MaxCertificateDuration is the longest validity a request may ask for. Requests
-	// asking for longer are refused, not shortened. Issued certificates also never
-	// outlive the CA certificate. Defaults to 2160h (90 days, cert-manager's default).
+	// MaxCertificateDuration is the longest validity a request may ask for, in whole
+	// seconds. Requests asking for longer are refused, not shortened. Issued
+	// certificates also never outlive the intermediate. Defaults to 2160h (90 days,
+	// cert-manager's default); at most the operator's --max-certificate-duration.
 	// +optional
 	MaxCertificateDuration *metav1.Duration `json:"maxCertificateDuration,omitempty"`
-
-	// Duration is the CA certificate's validity, in whole seconds. Defaults to 87600h
-	// (10 years); at least 24h, and at most the controller's --max-ca-duration.
-	// +optional
-	Duration *metav1.Duration `json:"duration,omitempty"`
-
-	// RenewBefore is how long before the CA certificate's notAfter a new CA
-	// certificate (same key, same subject) is made. Certificates issued before and
-	// after chain to either, so devices holding the older copy keep working until that
-	// copy expires. Defaults to 8760h (1 year); whole seconds, at most half of duration.
-	// +optional
-	RenewBefore *metav1.Duration `json:"renewBefore,omitempty"`
 }
 
 // KMSIssuerStatus defines the observed state of KMSIssuer
 type KMSIssuerStatus struct {
 	Status `json:",inline"`
-	// Byte slice containing a PEM encoded signed certificate of the CA
+	// Certificate is the intermediate certificate as last verified, PEM.
 	// +optional
 	Certificate []byte `json:"certificate,omitempty"`
-	// PreviousCertificate is the CA certificate the current one replaced (same key and
-	// subject), kept for reference while devices move to the new copy.
-	// +optional
-	PreviousCertificate []byte `json:"previousCertificate,omitempty"`
 }
 
 // +kubebuilder:object:root=true

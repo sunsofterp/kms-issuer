@@ -2,7 +2,9 @@ package certmanager
 
 import (
 	"context"
+	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"testing"
 	"time"
 
@@ -23,91 +25,72 @@ import (
 
 var unitNow = time.Date(2026, time.November, 25, 12, 0, 0, 0, time.UTC)
 
-func TestNeedsNewCA(t *testing.T) {
-	ca := &kmsca.KMSCA{Client: mocks.New()}
-	keyID, err := ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/needs-new-ca", OwnerUID: "t"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := settings{duration: 10 * 24 * time.Hour, renewBefore: 2 * 24 * time.Hour, maxCertificateDuration: time.Hour}
-	cert, err := ca.GenerateAndSignCertificateAuthorityCertificate(context.TODO(), &kmsca.GenerateCertificateAuthorityCertificateInput{
-		KeyID: keyID, Subject: pkix.Name{CommonName: "Root"}, Duration: s.duration,
-		PermittedDNSDomains: []string{"example.internal"}, Now: unitNow,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub, err := ca.PublicKey(context.TODO(), keyID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := func(now time.Time, domains ...string) kmsca.ExpectedCA {
-		if len(domains) == 0 {
-			domains = []string{"example.internal"}
-		}
-		return kmsca.ExpectedCA{PublicKey: pub, CommonName: "Root", PermittedDNSDomains: domains, Now: now}
-	}
+func encodeForTest(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
 
-	if reason := needsNewCA(cert, s, expected(unitNow)); reason != "" {
-		t.Errorf("fresh certificate: %s", reason)
+// unitCA is a two-tier CA in a fresh mock: root key, issuing key, root and
+// intermediate.
+type unitCA struct {
+	mock                *mocks.KMSMock
+	ca                  *kmsca.KMSCA
+	rootKey, issuingKey string
+	root, intermediate  *x509.Certificate
+}
+
+func newUnitCA(t *testing.T, domains ...string) *unitCA {
+	t.Helper()
+	if len(domains) == 0 {
+		domains = []string{"example.internal"}
 	}
-	if reason := needsNewCA(cert, s, expected(unitNow.Add(7*24*time.Hour))); reason != "" {
-		t.Errorf("before renewal: %s", reason)
+	u := &unitCA{mock: mocks.New()}
+	u.ca = &kmsca.KMSCA{Client: u.mock}
+	var err error
+	if u.rootKey, err = u.ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/root", OwnerUID: "t"}); err != nil {
+		t.Fatal(err)
 	}
-	if reason := needsNewCA(cert, s, expected(unitNow.Add(8*24*time.Hour))); reason == "" {
-		t.Error("renewal due: no new CA")
+	if u.issuingKey, err = u.ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/issuing", OwnerUID: "t"}); err != nil {
+		t.Fatal(err)
 	}
-	if reason := needsNewCA(nil, s, expected(unitNow)); reason == "" {
-		t.Error("no certificate: no new CA")
+	in := func(name string, d time.Duration) *kmsca.CAInput {
+		return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: domains, Duration: d, Now: unitNow}
 	}
-	if reason := needsNewCA(cert, s, expected(unitNow, "example.internal", "other.internal")); reason == "" {
-		t.Error("domains changed: no new CA")
+	if u.root, err = u.ca.MakeRoot(context.TODO(), u.rootKey, in("Root", 20*365*24*time.Hour)); err != nil {
+		t.Fatal(err)
 	}
-	longer := s
-	longer.duration = 20 * 24 * time.Hour
-	if reason := needsNewCA(cert, longer, expected(unitNow)); reason == "" {
-		t.Error("duration changed: no new CA")
+	if u.intermediate, err = u.ca.MakeIntermediate(context.TODO(), u.rootKey, u.root, u.issuingKey, in("Issuing", 365*24*time.Hour)); err != nil {
+		t.Fatal(err)
 	}
-	tampered := *cert
-	tampered.MaxPathLenZero = false
-	tampered.MaxPathLen = -1
-	if reason := needsNewCA(&tampered, s, expected(unitNow)); reason == "" {
-		t.Error("unconstrained path length: no new CA")
-	}
+	return u
 }
 
 func TestSettingsValidate(t *testing.T) {
 	bad := map[string]settings{
-		"duration under 24h":        {duration: time.Hour, renewBefore: 0, maxCertificateDuration: time.Hour},
-		"renewBefore == duration":   {duration: 48 * time.Hour, renewBefore: 48 * time.Hour, maxCertificateDuration: time.Hour},
-		"renewBefore near duration": {duration: 24 * time.Hour, renewBefore: 23*time.Hour + 57*time.Minute, maxCertificateDuration: time.Hour},
-		"negative renewBefore":      {duration: 48 * time.Hour, renewBefore: -time.Hour, maxCertificateDuration: time.Hour},
-		"max under 1h":              {duration: 48 * time.Hour, renewBefore: time.Hour, maxCertificateDuration: time.Minute},
-		"sub-second duration":       {duration: 87600*time.Hour + 500*time.Millisecond, renewBefore: time.Hour, maxCertificateDuration: time.Hour},
-		"sub-second renewBefore":    {duration: 48 * time.Hour, renewBefore: time.Hour + time.Millisecond, maxCertificateDuration: time.Hour},
+		"under 1h":   {maxCertificateDuration: time.Minute},
+		"sub-second": {maxCertificateDuration: time.Hour + time.Millisecond},
 	}
 	for name, s := range bad {
 		if s.validate() == nil {
 			t.Errorf("%s: validated", name)
 		}
 	}
-	good := settings{duration: 48 * time.Hour, renewBefore: 24 * time.Hour, maxCertificateDuration: time.Hour}
-	if err := good.validate(); err != nil {
+	if err := (settings{maxCertificateDuration: time.Hour}).validate(); err != nil {
 		t.Error(err)
 	}
 }
 
 func TestCheckIssuerCeilings(t *testing.T) {
+	u := newUnitCA(t, "fleet.internal")
 	access, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
-		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: 90 * 24 * time.Hour, MaxCADuration: 10 * 365 * 24 * time.Hour,
-	})
+		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: 90 * 24 * time.Hour,
+	}, u.root, unitNow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	issuer := func(mutate func(*kmsiapi.KMSIssuer)) *kmsiapi.KMSIssuer {
 		i := &kmsiapi.KMSIssuer{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "ca", Name: "i"},
-			Spec:       kmsiapi.KMSIssuerSpec{KeyID: "key-1", CommonName: "Root", PermittedDNSDomains: []string{"fleet.internal"}},
+			Spec:       kmsiapi.KMSIssuerSpec{KeyID: "key-1", PermittedDNSDomains: []string{"fleet.internal"}},
 		}
 		if mutate != nil {
 			mutate(i)
@@ -130,7 +113,6 @@ func TestCheckIssuerCeilings(t *testing.T) {
 		"longer leaves": func(i *kmsiapi.KMSIssuer) {
 			i.Spec.MaxCertificateDuration = &metav1.Duration{Duration: 91 * 24 * time.Hour}
 		},
-		"a longer CA":       func(i *kmsiapi.KMSIssuer) { i.Spec.Duration = &metav1.Duration{Duration: 11 * 365 * 24 * time.Hour} },
 		"another namespace": func(i *kmsiapi.KMSIssuer) { i.Namespace = "other" },
 		"another key":       func(i *kmsiapi.KMSIssuer) { i.Spec.KeyID = "key-2" },
 	}
@@ -141,48 +123,89 @@ func TestCheckIssuerCeilings(t *testing.T) {
 		}
 	}
 	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
-		PermittedDNSDomains: []string{"internal"}, MaxCertificateDuration: time.Hour, MaxCADuration: 48 * time.Hour,
-	}); err == nil {
+		PermittedDNSDomains: []string{"internal"}, MaxCertificateDuration: time.Hour,
+	}, u.root, unitNow); err == nil {
 		t.Error("a single-label ceiling was accepted")
+	}
+	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
+		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: time.Hour,
+	}, u.intermediate, unitNow); err == nil {
+		t.Error("an intermediate was accepted as the root")
 	}
 }
 
-// A KMS failure while a valid CA certificate is stored keeps the issuer ready and
-// returns the error for a retry with backoff.
-func TestKMSErrorKeepsTheIssuerReady(t *testing.T) {
-	mock := mocks.New()
-	ca := &kmsca.KMSCA{Client: mock}
-	keyID, err := ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/kms-error", OwnerUID: "t"})
+func TestVerifyIssuer(t *testing.T) {
+	u := newUnitCA(t)
+	access, err := NewAccess([]string{"default"}, []string{u.issuingKey, u.rootKey}, testCeilings, u.root, unitNow)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, err := ca.GenerateAndSignCertificateAuthorityCertificate(context.TODO(), &kmsca.GenerateCertificateAuthorityCertificateInput{
-		KeyID: keyID, Subject: pkix.Name{CommonName: "Root"}, Duration: defaultCertDuration,
-		PermittedDNSDomains: []string{"example.internal"}, Now: unitNow,
+	issuer := func(keyID string, intermediate []byte, domains ...string) *kmsiapi.KMSIssuer {
+		if len(domains) == 0 {
+			domains = []string{"example.internal"}
+		}
+		return &kmsiapi.KMSIssuer{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "i"},
+			Spec:       kmsiapi.KMSIssuerSpec{KeyID: keyID, IntermediateCertificate: string(intermediate), PermittedDNSDomains: domains},
+		}
+	}
+	good := encodeForTest(u.intermediate.Raw)
+	if _, err := verifyIssuer(context.TODO(), u.ca, access, issuer(u.issuingKey, good), unitNow.Add(time.Hour)); err != nil {
+		t.Errorf("good issuer: %v", err)
+	}
+	cases := map[string]*kmsiapi.KMSIssuer{
+		"the root key with the intermediate": issuer(u.rootKey, good),
+		"the root as its own intermediate":   issuer(u.rootKey, encodeForTest(u.root.Raw)),
+		"two certificates":                   issuer(u.issuingKey, append(append([]byte{}, good...), good...)),
+		"garbage":                            issuer(u.issuingKey, []byte("garbage")),
+	}
+	for name, i := range cases {
+		if _, err := verifyIssuer(context.TODO(), u.ca, access, i, unitNow.Add(time.Hour)); err == nil {
+			t.Errorf("%s: verified", name)
+		}
+	}
+	if _, err := verifyIssuer(context.TODO(), u.ca, access, issuer(u.issuingKey, good), u.intermediate.NotAfter.Add(time.Second)); err == nil {
+		t.Error("an expired intermediate verified")
+	}
+
+	narrow, err := u.ca.MakeIntermediate(context.TODO(), u.rootKey, u.root, u.issuingKey, &kmsca.CAInput{
+		Subject: pkix.Name{CommonName: "Narrow"}, PermittedDNSDomains: []string{"sso.example.internal"}, Duration: 48 * time.Hour, Now: unitNow,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := verifyIssuer(context.TODO(), u.ca, access, issuer(u.issuingKey, encodeForTest(narrow.Raw), "example.internal"), unitNow.Add(time.Hour)); err == nil {
+		t.Error("issuer domains wider than its intermediate's constraints verified")
+	}
+}
+
+// A KMS failure while the intermediate is valid keeps the issuer ready and returns
+// the error for a retry with backoff.
+func TestKMSErrorKeepsTheIssuerReady(t *testing.T) {
+	u := newUnitCA(t)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionTrue, kmsiapi.KMSIssuerReasonIssued, "")
 	issuer := &kmsiapi.KMSIssuer{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "i"},
-		Spec:       kmsiapi.KMSIssuerSpec{KeyID: keyID, CommonName: "Root", PermittedDNSDomains: []string{"example.internal"}},
+		Spec: kmsiapi.KMSIssuerSpec{
+			KeyID: u.issuingKey, IntermediateCertificate: string(encodeForTest(u.intermediate.Raw)),
+			PermittedDNSDomains: []string{"example.internal"},
+		},
 		Status: kmsiapi.KMSIssuerStatus{
 			Status:      kmsiapi.Status{Conditions: []kmsiapi.Condition{ready}},
-			Certificate: kmsca.EncodeCertificatePEM(cert),
+			Certificate: encodeForTest(u.intermediate.Raw),
 		},
 	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = kmsiapi.AddToScheme(scheme)
 	fc := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(issuer).WithStatusSubresource(issuer).Build()
-	access, err := NewAccess([]string{"default"}, []string{keyID}, testCeilings)
+	access, err := NewAccess([]string{"default"}, []string{u.issuingKey}, testCeilings, u.root, unitNow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := &KMSIssuerReconciler{
 		Client: fc, Log: logf.Log, Recorder: record.NewFakeRecorder(10),
-		KMSCA: &kmsca.KMSCA{Client: failingKMS{mock}}, Access: access, Clock: fakeclock.NewFakeClock(unitNow.Add(time.Hour)),
+		KMSCA: &kmsca.KMSCA{Client: failingKMS{u.mock}}, Access: access, Clock: fakeclock.NewFakeClock(unitNow.Add(time.Hour)),
 	}
 	_, err = r.Reconcile(context.TODO(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(issuer)})
 	if err == nil {
@@ -193,6 +216,6 @@ func TestKMSErrorKeepsTheIssuerReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.Status.IsReady() {
-		t.Error("the issuer was marked not ready while its CA certificate is valid")
+		t.Error("the issuer was marked not ready while its intermediate is valid")
 	}
 }

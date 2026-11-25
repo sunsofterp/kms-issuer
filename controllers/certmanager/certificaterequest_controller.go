@@ -18,7 +18,6 @@ package certmanager
 
 import (
 	"context"
-	"crypto"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -119,23 +118,12 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// The CA certificate must be exactly one this controller would have made for
-	// the issuer and its key; anything else in status is never signed under.
-	parent, err := kmsca.ParseCertificatePEM(issuer.Status.Certificate)
-	if err == nil {
-		var pub crypto.PublicKey
-		if pub, err = r.KMSCA.PublicKey(ctx, issuer.Spec.KeyID); err != nil {
-			log.Error(err, "failed to read the KMS key's public key")
-			_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to read the KMS key (will retry): %v", err)
-			return ctrl.Result{}, err
-		}
-		err = kmsca.ValidateCA(parent, kmsca.ExpectedCA{
-			PublicKey: pub, CommonName: issuer.Spec.CommonName,
-			PermittedDNSDomains: issuer.Spec.PermittedDNSDomains, Now: r.Clock.Now(),
-		})
-	}
+	// Verify the issuer here, at signing time, from its spec: never trust the issuer
+	// controller's earlier verdict or anything in its status. The intermediate must
+	// be for the KMS key, signed by the pinned root and within the ceilings.
+	parent, err := verifyIssuer(ctx, r.KMSCA, r.Access, &issuer, r.Clock.Now())
 	if err != nil {
-		err = fmt.Errorf("the issuer's CA certificate is not acceptable: %w", err)
+		err = fmt.Errorf("KMSIssuer %s cannot sign now: %w", issuerName, err)
 		log.Error(err, "not signing")
 		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
 		return ctrl.Result{}, err
@@ -215,7 +203,10 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	// Record the certificate. A conflicting write is retried with the certificate
 	// already signed: signing again would issue a second certificate.
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signed.Raw})
+	// The chain handed out is the leaf then the intermediate; ca.crt is the pinned
+	// root, the certificate clients trust. All re-encoded from parsed certificates.
+	certPEM := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signed.Raw}), kmsca.EncodeCertificatePEM(parent)...)
+	rootPEM := kmsca.EncodeCertificatePEM(r.Access.Root())
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := new(cmapi.CertificateRequest)
 		if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
@@ -225,7 +216,7 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 			return nil
 		}
 		latest.Status.Certificate = certPEM
-		latest.Status.CA = kmsca.EncodeCertificatePEM(parent)
+		latest.Status.CA = rootPEM
 		apiutil.SetCertificateRequestCondition(latest, cmapi.CertificateRequestConditionReady, cmmeta.ConditionTrue, cmapi.CertificateRequestReasonIssued, "Certificate issued")
 		return r.Status().Update(ctx, latest)
 	})

@@ -4,13 +4,17 @@ metadata:
   name: kms-issuer-sample
   namespace: default
 spec:
-  # A key ID or key ARN, never an alias; it must also be in the controller's
-  # --allowed-key-ids, and this namespace in --allowed-issuer-namespaces.
+  # The issuing KMS key: a key ID or key ARN, never an alias; it must also be in the
+  # controller's --allowed-key-ids, and this namespace in --allowed-issuer-namespaces.
   keyId: 00000000-0000-0000-0000-000000000000
-  commonName: Example Root CA
-  # The only names this CA may ever certify (written into it as name constraints).
+  # The only names this issuer certifies: inside its intermediate's name constraints
+  # and the controller's --permitted-dns-domains.
   permittedDNSDomains:
     - example.internal
-  duration: 87600h # 10 years
-  renewBefore: 8760h # 1 year
   maxCertificateDuration: 2160h # 90 days
+  # Made by hand with `kms-ca intermediate`, signed by the root the controller pins
+  # (--root-certificate). Replace it to renew.
+  intermediateCertificate: |
+    -----BEGIN CERTIFICATE-----
+    (the PEM kms-ca wrote)
+    -----END CERTIFICATE-----

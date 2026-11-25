@@ -224,12 +224,19 @@ func RandomSerial() (*big.Int, error) {
 	return n.Add(n, big.NewInt(1)), nil
 }
 
-// CertificateAuthorityTemplate returns the CA certificate template: a root with
-// path length 0 (it can sign leaves only) and critical name constraints limiting
-// every name under it to input.PermittedDNSDomains.
-func CertificateAuthorityTemplate(input *GenerateCertificateAuthorityCertificateInput) (*x509.Certificate, error) {
+// CATemplate returns a CA certificate template: critical name constraints limiting
+// every name under it to input.PermittedDNSDomains (DNS names, URI hosts and email
+// domains; no IP address at all), cert-sign and CRL-sign only, no extended key
+// usages, and the given path length (1 for a root, 0 for an intermediate).
+func CATemplate(input *CAInput, maxPathLen int) (*x509.Certificate, error) {
 	if len(input.PermittedDNSDomains) == 0 {
 		return nil, errors.New("a CA certificate needs at least one permitted DNS domain")
+	}
+	if input.Duration%time.Second != 0 || input.Duration < 24*time.Hour {
+		return nil, fmt.Errorf("duration %s must be whole seconds and at least 24h", input.Duration)
+	}
+	if input.Subject.CommonName == "" {
+		return nil, errors.New("a common name is required")
 	}
 	serial, err := RandomSerial()
 	if err != nil {
@@ -237,18 +244,15 @@ func CertificateAuthorityTemplate(input *GenerateCertificateAuthorityCertificate
 	}
 	notBefore := input.Now.Add(-clockSkew).UTC().Truncate(time.Second)
 	return &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               input.Subject,
-		NotBefore:             notBefore,
-		NotAfter:              notBefore.Add(input.Duration),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		MaxPathLen:            0,
-		MaxPathLenZero:        true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		// Every name of every type under this CA must be in the permitted domains:
-		// DNS names, URI hosts and email domains are limited to them, and no IP
-		// address is permitted at all.
+		SerialNumber:                serial,
+		Subject:                     input.Subject,
+		NotBefore:                   notBefore,
+		NotAfter:                    notBefore.Add(input.Duration),
+		IsCA:                        true,
+		BasicConstraintsValid:       true,
+		MaxPathLen:                  maxPathLen,
+		MaxPathLenZero:              maxPathLen == 0,
+		KeyUsage:                    x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		PermittedDNSDomainsCritical: true,
 		PermittedDNSDomains:         input.PermittedDNSDomains,
 		PermittedURIDomains:         input.PermittedDNSDomains,
@@ -257,22 +261,65 @@ func CertificateAuthorityTemplate(input *GenerateCertificateAuthorityCertificate
 	}, nil
 }
 
-// GenerateAndSignCertificateAuthorityCertificate makes and self-signs the CA
-// certificate with the KMS key.
-func (ca *KMSCA) GenerateAndSignCertificateAuthorityCertificate(ctx context.Context, input *GenerateCertificateAuthorityCertificateInput) (*x509.Certificate, error) {
-	cert, err := CertificateAuthorityTemplate(input)
+// MakeRoot self-signs the root CA certificate with the root KMS key: path length 1
+// (it signs intermediates, which sign leaves).
+func (ca *KMSCA) MakeRoot(ctx context.Context, rootKeyID string, input *CAInput) (*x509.Certificate, error) {
+	cert, err := CATemplate(input, 1)
 	if err != nil {
 		return nil, err
 	}
-	kmsSigner, err := signer.New(ctx, ca.Client, input.KeyID)
+	rootSigner, err := signer.New(ctx, ca.Client, rootKeyID)
 	if err != nil {
 		return nil, err
 	}
-	signedBytes, err := x509.CreateCertificate(rand.Reader, cert, cert, kmsSigner.Public(), kmsSigner)
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, rootSigner.Public(), rootSigner)
 	if err != nil {
 		return nil, err
 	}
-	return x509.ParseCertificate(signedBytes)
+	return x509.ParseCertificate(der)
+}
+
+// MakeIntermediate has the root KMS key sign an intermediate CA certificate for the
+// issuing KMS key: path length 0, never outliving the root, with name constraints
+// inside the root's. The root certificate must be for the root key.
+func (ca *KMSCA) MakeIntermediate(ctx context.Context, rootKeyID string, root *x509.Certificate, keyID string, input *CAInput) (*x509.Certificate, error) {
+	if rootKeyID == keyID {
+		return nil, errors.New("the root and issuing keys must differ")
+	}
+	if err := ValidateRoot(root, input.Now); err != nil {
+		return nil, fmt.Errorf("root: %w", err)
+	}
+	for _, d := range input.PermittedDNSDomains {
+		if !WithinDomains(d, root.PermittedDNSDomains) {
+			return nil, fmt.Errorf("domain %q is outside the root's %v", d, root.PermittedDNSDomains)
+		}
+	}
+	rootSigner, err := signer.New(ctx, ca.Client, rootKeyID)
+	if err != nil {
+		return nil, err
+	}
+	if !publicKeysEqual(root.PublicKey, rootSigner.Public()) {
+		return nil, errors.New("the root certificate is not for the root KMS key")
+	}
+	pub, err := ca.PublicKey(ctx, keyID)
+	if err != nil {
+		return nil, err
+	}
+	if publicKeysEqual(pub, root.PublicKey) {
+		return nil, errors.New("the issuing key is the root key")
+	}
+	cert, err := CATemplate(input, 0)
+	if err != nil {
+		return nil, err
+	}
+	if cert.NotAfter.After(root.NotAfter) {
+		cert.NotAfter = root.NotAfter
+	}
+	der, err := x509.CreateCertificate(rand.Reader, cert, root, pub, rootSigner)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
 }
 
 // PublicKey returns the KMS key's public key.
@@ -342,9 +389,8 @@ type Key struct {
 	KeyID string
 }
 
-type GenerateCertificateAuthorityCertificateInput struct {
-	// KeyID is the KMS Key Id
-	KeyID string
+// CAInput describes a root or intermediate CA certificate.
+type CAInput struct {
 	// Subject of the CA certificate
 	Subject pkix.Name
 	// Duration is certificate validity duration

@@ -1,40 +1,44 @@
 package certmanager
 
 import (
+	"crypto/x509"
 	"fmt"
 	"strings"
 	"time"
 
 	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 )
 
 // Access is what the operator allows, from the controller's flags. A KMSIssuer may
-// only live in an allowed namespace, use an allowed key, and stay within the
-// ceilings: its permitted domains inside the operator's, its lifetimes no longer,
-// and wildcards only if the operator allows them. Whoever can write KMSIssuers can
-// narrow the policy, never widen it past these. Any issuer outside them signs
-// nothing.
+// only live in an allowed namespace, use an allowed key, chain to the pinned root,
+// and stay within the ceilings: its permitted domains inside the operator's, its
+// leaf lifetime no longer, and wildcards only if the operator allows them. Whoever
+// can write KMSIssuers can narrow the policy, never widen it past these. Any issuer
+// outside them signs nothing.
 type Access struct {
 	namespaces map[string]bool
 	keyIDs     map[string]bool
 	ceilings   Ceilings
+	root       *x509.Certificate
 }
 
 // Ceilings are the operator's upper bounds on every KMSIssuer.
 type Ceilings struct {
-	// PermittedDNSDomains: every issuer domain must equal one or be a subdomain.
+	// PermittedDNSDomains: every issuer domain, and every name constraint of its
+	// intermediate, must equal one or be a subdomain.
 	PermittedDNSDomains []string
 	// AllowWildcards: whether any issuer may allow wildcard names.
 	AllowWildcards bool
 	// MaxCertificateDuration: the longest issued validity any issuer may allow.
 	MaxCertificateDuration time.Duration
-	// MaxCADuration: the longest CA certificate validity any issuer may ask for.
-	MaxCADuration time.Duration
 }
 
-// NewAccess builds an Access. Namespaces, key IDs and permitted domains are all
-// required. Aliases are refused as keys: they can be re-pointed at another key.
-func NewAccess(namespaces, keyIDs []string, ceilings Ceilings) (*Access, error) {
+// NewAccess builds an Access. Namespaces, key IDs, permitted domains and the root
+// are all required. Aliases are refused as keys: they can be re-pointed at another
+// key. The root must be a valid root for this CA (self-signed, path length 1, name
+// constrained).
+func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, root *x509.Certificate, now time.Time) (*Access, error) {
 	a := &Access{namespaces: map[string]bool{}, keyIDs: map[string]bool{}}
 	for _, ns := range namespaces {
 		if ns = strings.TrimSpace(ns); ns != "" {
@@ -67,16 +71,26 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings) (*Access, error) 
 	if len(a.ceilings.PermittedDNSDomains) == 0 {
 		return nil, fmt.Errorf("at least one permitted DNS domain is required")
 	}
-	if ceilings.MaxCertificateDuration < time.Hour {
-		return nil, fmt.Errorf("the maximum certificate duration must be at least 1h")
+	if ceilings.MaxCertificateDuration < time.Hour || ceilings.MaxCertificateDuration%time.Second != 0 {
+		return nil, fmt.Errorf("the maximum certificate duration must be whole seconds and at least 1h")
 	}
-	if ceilings.MaxCADuration < minCertDuration {
-		return nil, fmt.Errorf("the maximum CA duration must be at least %s", minCertDuration)
+	if err := kmsca.ValidateRoot(root, now); err != nil {
+		return nil, fmt.Errorf("root certificate: %w", err)
 	}
 	a.ceilings.AllowWildcards = ceilings.AllowWildcards
 	a.ceilings.MaxCertificateDuration = ceilings.MaxCertificateDuration
-	a.ceilings.MaxCADuration = ceilings.MaxCADuration
+	a.root = root
 	return a, nil
+}
+
+// Root is the pinned root certificate.
+func (a *Access) Root() *x509.Certificate {
+	return a.root
+}
+
+// AllowedDomains are the operator's permitted DNS domains.
+func (a *Access) AllowedDomains() []string {
+	return a.ceilings.PermittedDNSDomains
 }
 
 // Check returns an error unless a KMSIssuer in namespace may use keyID.
@@ -112,9 +126,6 @@ func (a *Access) CheckIssuer(issuer *kmsiapi.KMSIssuer, s settings) error {
 	}
 	if s.maxCertificateDuration > a.ceilings.MaxCertificateDuration {
 		return fmt.Errorf("maxCertificateDuration %s is longer than the operator's %s", s.maxCertificateDuration, a.ceilings.MaxCertificateDuration)
-	}
-	if s.duration > a.ceilings.MaxCADuration {
-		return fmt.Errorf("duration %s is longer than the operator's %s", s.duration, a.ceilings.MaxCADuration)
 	}
 	return nil
 }

@@ -17,9 +17,9 @@ limitations under the License.
 package certmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"time"
@@ -39,22 +39,17 @@ import (
 )
 
 const (
-	// defaultCertDuration is the default validity of the CA certificate.
-	defaultCertDuration = time.Hour * 24 * 365 * 10
-	// defaultRenewBefore is how long before expiry a new CA certificate is made.
-	defaultRenewBefore = time.Hour * 24 * 365
-	// minCertDuration is the shortest CA certificate validity accepted.
-	minCertDuration = 24 * time.Hour
 	// defaultMaxCertificateDuration is the default longest issued validity.
 	defaultMaxCertificateDuration = time.Hour * 24 * 90
 	// maxRequeue bounds how long the issuer goes unchecked.
 	maxRequeue = 12 * time.Hour
-	// minReissueInterval is the least time between two CA certificates for one
-	// issuer: whatever the cause, the controller never re-signs in a tight loop.
-	minReissueInterval = 10 * time.Minute
+	// expiryWarning is how long before the intermediate expires the issuer starts
+	// warning that a new one is needed.
+	expiryWarning = 90 * 24 * time.Hour
 
-	eventCAIssued = "CACertificateIssued"
-	eventKMSError = "KMSError"
+	eventIntermediateAccepted = "IntermediateAccepted"
+	eventIntermediateExpiring = "IntermediateExpiringSoon"
+	eventKMSError             = "KMSError"
 )
 
 // KMSIssuerReconciler reconciles a KMSIssuer object.
@@ -89,45 +84,20 @@ func NewKMSIssuerReconciler(mgr manager.Manager, ca *kmsca.KMSCA, access *Access
 
 // settings is an issuer's spec with defaults applied.
 type settings struct {
-	duration               time.Duration
-	renewBefore            time.Duration
 	maxCertificateDuration time.Duration
 }
 
 func issuerSettings(issuer *kmsiapi.KMSIssuer) settings {
-	s := settings{
-		duration:               defaultCertDuration,
-		renewBefore:            defaultRenewBefore,
-		maxCertificateDuration: defaultMaxCertificateDuration,
-	}
-	if d := issuer.Spec.Duration; d != nil && d.Duration != 0 {
-		s.duration = d.Duration
-	}
-	if d := issuer.Spec.RenewBefore; d != nil {
-		s.renewBefore = d.Duration
-	}
+	s := settings{maxCertificateDuration: defaultMaxCertificateDuration}
 	if d := issuer.Spec.MaxCertificateDuration; d != nil && d.Duration != 0 {
 		s.maxCertificateDuration = d.Duration
 	}
 	return s
 }
 
-// validate refuses settings that could not produce a stable CA certificate:
-// certificate times have one-second precision, and renewal must not be due the
-// moment a certificate is made (its notBefore is backdated).
 func (s settings) validate() error {
-	for name, d := range map[string]time.Duration{
-		"duration": s.duration, "renewBefore": s.renewBefore, "maxCertificateDuration": s.maxCertificateDuration,
-	} {
-		if d%time.Second != 0 {
-			return fmt.Errorf("%s %s is not a whole number of seconds", name, d)
-		}
-	}
-	if s.duration < minCertDuration {
-		return fmt.Errorf("duration %s is shorter than %s", s.duration, minCertDuration)
-	}
-	if s.renewBefore < 0 || s.renewBefore > s.duration/2 {
-		return fmt.Errorf("renewBefore %s must be between 0 and half of duration (%s)", s.renewBefore, s.duration/2)
+	if s.maxCertificateDuration%time.Second != 0 {
+		return fmt.Errorf("maxCertificateDuration %s is not a whole number of seconds", s.maxCertificateDuration)
 	}
 	if s.maxCertificateDuration < time.Hour {
 		return fmt.Errorf("maxCertificateDuration %s is shorter than 1h", s.maxCertificateDuration)
@@ -135,12 +105,52 @@ func (s settings) validate() error {
 	return nil
 }
 
+// errKMS marks a failure to reach KMS, as opposed to an issuer that is wrong.
+type errKMS struct{ error }
+
+func (e errKMS) Unwrap() error { return e.error }
+
+// verifyIssuer returns the issuer's intermediate when the issuer may sign: allowed
+// namespace and key, settings within the ceilings, and an intermediate that is for
+// the issuer's KMS key, signed by the pinned root, constrained within the ceilings
+// and covering the issuer's domains, and valid now. Errors wrapping errKMS are
+// KMS failures (retry); others are the issuer's configuration.
+func verifyIssuer(ctx context.Context, ca *kmsca.KMSCA, access *Access, issuer *kmsiapi.KMSIssuer, now time.Time) (*x509.Certificate, error) {
+	s := issuerSettings(issuer)
+	if err := s.validate(); err != nil {
+		return nil, fmt.Errorf("invalid issuer settings: %w", err)
+	}
+	if err := access.CheckIssuer(issuer, s); err != nil {
+		return nil, err
+	}
+	intermediate, err := kmsca.ParseCertificatePEM([]byte(issuer.Spec.IntermediateCertificate))
+	if err != nil {
+		return nil, fmt.Errorf("intermediateCertificate: %w", err)
+	}
+	pub, err := ca.PublicKey(ctx, issuer.Spec.KeyID)
+	if err != nil {
+		return intermediate, errKMS{fmt.Errorf("reading the KMS key's public key: %w", err)}
+	}
+	if err := kmsca.ValidateIntermediate(intermediate, kmsca.ExpectedIntermediate{
+		Root: access.Root(), PublicKey: pub, AllowedDomains: access.AllowedDomains(), Now: now,
+	}); err != nil {
+		return nil, fmt.Errorf("intermediateCertificate: %w", err)
+	}
+	for _, d := range issuer.Spec.PermittedDNSDomains {
+		if !kmsca.WithinDomains(d, intermediate.PermittedDNSDomains) {
+			return nil, fmt.Errorf("permitted DNS domain %q is outside the intermediate's name constraints %v", d, intermediate.PermittedDNSDomains)
+		}
+	}
+	return intermediate, nil
+}
+
 // Reconcile KMSIssuer resources.
 //
-// Configuration problems (outside the operator's ceilings, invalid settings) mark
-// the issuer not ready and wait for the spec to change. KMS errors are returned so
-// the work queue retries with backoff; while the stored CA certificate is still
-// valid, the issuer stays ready through them, so a KMS blip never stops issuance.
+// An issuer that is wrong (outside the operator's ceilings, or naming an
+// intermediate that doesn't verify) is marked not ready until its spec changes. KMS
+// errors are returned so the work queue retries with backoff; while the issuer's
+// intermediate is still valid it stays ready through them, so a KMS blip never
+// stops issuance.
 func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("kms-issuer", req.NamespacedName)
 
@@ -154,61 +164,39 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	s := issuerSettings(issuer)
-	if err := s.validate(); err != nil {
-		return ctrl.Result{}, r.setNotReady(ctx, issuer, "Invalid issuer settings", err)
-	}
-	if err := r.Access.CheckIssuer(issuer, s); err != nil {
+	now := r.Clock.Now()
+	intermediate, err := verifyIssuer(ctx, r.KMSCA, r.Access, issuer, now)
+	var kmsErr errKMS
+	switch {
+	case errors.As(err, &kmsErr):
+		r.Recorder.Event(issuer, core.EventTypeWarning, eventKMSError, err.Error())
+		if issuer.Status.IsReady() && intermediate != nil && now.Before(intermediate.NotAfter) {
+			log.Error(err, "KMS error; staying ready with the current intermediate")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, errors.Join(err, r.setNotReady(ctx, issuer, "KMS error", err))
+	case err != nil:
 		return ctrl.Result{}, r.setNotReady(ctx, issuer, "This KMSIssuer may not issue", err)
 	}
 
-	now := r.Clock.Now()
-	actual, _ := kmsca.ParseCertificatePEM(issuer.Status.Certificate)
-
-	pub, err := r.KMSCA.PublicKey(ctx, issuer.Spec.KeyID)
-	if err != nil {
-		return ctrl.Result{}, r.kmsError(ctx, issuer, actual, "Failed to read the KMS key's public key", err, now)
-	}
-	expected := kmsca.ExpectedCA{
-		PublicKey: pub, CommonName: issuer.Spec.CommonName,
-		PermittedDNSDomains: issuer.Spec.PermittedDNSDomains, Now: now,
-	}
-
-	if reason := needsNewCA(actual, s, expected); reason != "" {
-		if actual != nil {
-			if since := now.Sub(actual.NotBefore.Add(5 * time.Minute)); since < minReissueInterval {
-				log.Info("a new CA certificate is needed, but the last one is too recent; waiting", "reason", reason)
-				return ctrl.Result{RequeueAfter: minReissueInterval - since}, nil
-			}
-		}
-		log.Info("making a new CA certificate", "reason", reason)
-		cert, err := r.KMSCA.GenerateAndSignCertificateAuthorityCertificate(ctx, &kmsca.GenerateCertificateAuthorityCertificateInput{
-			KeyID:               issuer.Spec.KeyID,
-			Subject:             pkix.Name{CommonName: issuer.Spec.CommonName},
-			Duration:            s.duration,
-			PermittedDNSDomains: issuer.Spec.PermittedDNSDomains,
-			Now:                 now,
-		})
-		if err != nil {
-			return ctrl.Result{}, r.kmsError(ctx, issuer, actual, "Failed to make the CA certificate", err, now)
-		}
-		if len(issuer.Status.Certificate) > 0 {
-			issuer.Status.PreviousCertificate = issuer.Status.Certificate
-		}
-		issuer.Status.Certificate = kmsca.EncodeCertificatePEM(cert)
+	encoded := kmsca.EncodeCertificatePEM(intermediate)
+	if !bytes.Equal(issuer.Status.Certificate, encoded) {
+		issuer.Status.Certificate = encoded
 		if err := r.patchIssuerStatus(ctx, issuer); err != nil {
 			return ctrl.Result{}, err
 		}
-		message := fmt.Sprintf("New CA certificate %s, valid %s to %s (%s): devices that trust this CA need this copy before the old one expires",
-			cert.SerialNumber.Text(16), cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339), reason)
-		log.Info("made a new CA certificate", "serial", cert.SerialNumber.Text(16), "notBefore", cert.NotBefore, "notAfter", cert.NotAfter, "reason", reason)
-		r.Recorder.Event(issuer, core.EventTypeNormal, eventCAIssued, message)
-		caIssued.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
-		actual = cert
+		r.Recorder.Event(issuer, core.EventTypeNormal, eventIntermediateAccepted, fmt.Sprintf(
+			"Signing under intermediate %s, valid until %s", intermediate.SerialNumber.Text(16), intermediate.NotAfter.Format(time.RFC3339)))
+		log.Info("intermediate accepted", "serial", intermediate.SerialNumber.Text(16), "notAfter", intermediate.NotAfter)
 	}
-	caNotAfter.WithLabelValues(issuer.Namespace, issuer.Name).Set(float64(actual.NotAfter.Unix()))
+	caNotAfter.WithLabelValues(issuer.Namespace, issuer.Name).Set(float64(intermediate.NotAfter.Unix()))
+	if left := intermediate.NotAfter.Sub(now); left < expiryWarning {
+		r.Recorder.Event(issuer, core.EventTypeWarning, eventIntermediateExpiring, fmt.Sprintf(
+			"The intermediate expires %s (in %s): make a new one with `kms-ca intermediate` and update intermediateCertificate",
+			intermediate.NotAfter.Format(time.RFC3339), left.Round(time.Hour)))
+	}
 
-	requeue := actual.NotAfter.Add(-s.renewBefore).Sub(now)
+	requeue := intermediate.NotAfter.Sub(now)
 	if requeue > maxRequeue {
 		requeue = maxRequeue
 	}
@@ -216,36 +204,6 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		requeue = time.Minute
 	}
 	return ctrl.Result{RequeueAfter: requeue}, r.setReady(ctx, issuer)
-}
-
-// needsNewCA returns why a new CA certificate is needed, or "" when the stored one
-// is exactly what this controller would make now and renewal isn't due.
-func needsNewCA(actual *x509.Certificate, s settings, expected kmsca.ExpectedCA) string {
-	if actual == nil {
-		return "no valid CA certificate stored"
-	}
-	if err := kmsca.ValidateCA(actual, expected); err != nil {
-		return fmt.Sprintf("the stored CA certificate is not acceptable: %v", err)
-	}
-	if actual.NotAfter.Sub(actual.NotBefore) != s.duration {
-		return "the duration changed"
-	}
-	if !expected.Now.Before(actual.NotAfter.Add(-s.renewBefore)) {
-		return "renewal is due"
-	}
-	return ""
-}
-
-// kmsError handles a KMS failure: the error goes back to the work queue (retry with
-// backoff). The issuer stays ready if its stored CA certificate is still usable;
-// otherwise it is marked not ready.
-func (r *KMSIssuerReconciler) kmsError(ctx context.Context, issuer *kmsiapi.KMSIssuer, actual *x509.Certificate, message string, err error, now time.Time) error {
-	r.Recorder.Event(issuer, core.EventTypeWarning, eventKMSError, fmt.Sprintf("%s: %v", message, err))
-	if issuer.Status.IsReady() && actual != nil && actual.IsCA && now.Before(actual.NotAfter) {
-		r.Log.Error(err, message+"; keeping the current CA certificate", "kms-issuer", client.ObjectKeyFromObject(issuer))
-		return err
-	}
-	return errors.Join(err, r.setNotReady(ctx, issuer, message, err))
 }
 
 // patchIssuerStatus updates the kmsiapi.KMSIssuer using a MergeFrom strategy

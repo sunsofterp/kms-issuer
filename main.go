@@ -65,10 +65,10 @@ func main() {
 	var (
 		metricsAddr, probeAddr, localAWSEndpoint string
 		allowedNamespaces, allowedKeyIDs         string
-		permittedDomains                         string
+		permittedDomains, rootCertificateFile    string
 		enableLeaderElection, secureMetrics      bool
 		enableKMSKeyController, allowWildcards   bool
-		maxCertificateDuration, maxCADuration    time.Duration
+		maxCertificateDuration                   time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to. \"0\" disables it.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true, "Serve metrics over HTTPS, to authenticated and authorized callers only.")
@@ -86,8 +86,8 @@ func main() {
 		"Let KMSIssuers allow wildcard names (allowWildcards). Off by default.")
 	flag.DurationVar(&maxCertificateDuration, "max-certificate-duration", 90*24*time.Hour,
 		"The longest issued validity any KMSIssuer may allow (maxCertificateDuration).")
-	flag.DurationVar(&maxCADuration, "max-ca-duration", 10*365*24*time.Hour,
-		"The longest CA certificate validity any KMSIssuer may ask for (duration).")
+	flag.StringVar(&rootCertificateFile, "root-certificate", "",
+		"Required. File holding the PEM root CA certificate (made with `kms-ca root`) every KMSIssuer's intermediate must chain to.")
 	flag.BoolVar(&enableKMSKeyController, "enable-kmskey-controller", false,
 		"Run the KMSKey controller, which creates and deletes KMS keys. Off by default: create keys outside the cluster.")
 	flag.StringVar(&localAWSEndpoint, "local-aws-endpoint", "", "Test only: a local KMS endpoint, with static test credentials.")
@@ -98,17 +98,28 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
+	rootPEM, err := os.ReadFile(rootCertificateFile)
+	if err != nil {
+		setupLog.Error(err, "reading --root-certificate")
+		os.Exit(1)
+	}
+	root, err := kmsca.ParseCertificatePEM(rootPEM)
+	if err != nil {
+		setupLog.Error(err, "parsing --root-certificate")
+		os.Exit(1)
+	}
 	namespaces := splitList(allowedNamespaces)
 	access, err := certmanager.NewAccess(namespaces, splitList(allowedKeyIDs), certmanager.Ceilings{
 		PermittedDNSDomains:    splitList(permittedDomains),
 		AllowWildcards:         allowWildcards,
 		MaxCertificateDuration: maxCertificateDuration,
-		MaxCADuration:          maxCADuration,
-	})
+	}, root, time.Now())
 	if err != nil {
 		setupLog.Error(err, "invalid access flags")
 		os.Exit(1)
 	}
+	certmanager.RecordRoot(access)
+	setupLog.Info("pinned root", "subject", root.Subject.String(), "notAfter", root.NotAfter, "permittedDNSDomains", root.PermittedDNSDomains)
 	// Watch and cache namespaced objects (KMSIssuers, CertificateRequests) in the
 	// allowed namespaces only: nothing elsewhere is read, let alone written.
 	defaultNamespaces := map[string]cache.Config{}

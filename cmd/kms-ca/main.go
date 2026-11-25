@@ -1,0 +1,256 @@
+// Command kms-ca makes the two CA certificates of a kms-issuer CA, by hand, with
+// administrator credentials. Both private keys stay in KMS: the tool only asks KMS
+// to sign.
+//
+//	kms-ca root --key-id <root key> --common-name <name> --domains <d1,d2> --out root.pem
+//	kms-ca intermediate --root-key-id <root key> --root-certificate root.pem \
+//	    --key-id <issuing key> --common-name <name> --domains <d1,d2> --out intermediate.pem
+//	kms-ca show <file.pem>
+//
+// The root (path length 1, name-constrained, default 20 years) is what devices
+// trust; give it to the controller as --root-certificate. The intermediate (path
+// length 0, name-constrained inside the root's, default 2 years) is for the
+// issuer's KMS key; put it in the KMSIssuer's intermediateCertificate. Neither
+// command overwrites an existing file.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+
+	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
+)
+
+const usage = `usage:
+  kms-ca root --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 175200h]
+  kms-ca intermediate --root-key-id ID --root-certificate FILE --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 17520h]
+  kms-ca show FILE
+`
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "kms-ca:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return errors.New(usage)
+	}
+	switch args[0] {
+	case "root":
+		return root(args[1:], out)
+	case "intermediate":
+		return intermediate(args[1:], out)
+	case "show":
+		if len(args) != 2 {
+			return errors.New(usage)
+		}
+		cert, err := readCertificate(args[1])
+		if err != nil {
+			return err
+		}
+		describe(out, cert)
+		return nil
+	}
+	return errors.New(usage)
+}
+
+// common are the flags both signing commands take.
+type common struct {
+	keyID, commonName, domains, outFile, region, endpoint string
+	duration                                              time.Duration
+}
+
+func (c *common) register(fs *flag.FlagSet, defaultDuration time.Duration) {
+	fs.StringVar(&c.keyID, "key-id", "", "Required. The KMS key the certificate is for (key ID or ARN).")
+	fs.StringVar(&c.commonName, "common-name", "", "Required. The certificate's common name.")
+	fs.StringVar(&c.domains, "domains", "", "Required. Comma-separated DNS domains: the name constraints.")
+	fs.StringVar(&c.outFile, "out", "", "Required. Where to write the PEM certificate (must not exist).")
+	fs.DurationVar(&c.duration, "duration", defaultDuration, "Validity.")
+	fs.StringVar(&c.region, "region", "", "AWS region (default: the AWS configuration's).")
+	fs.StringVar(&c.endpoint, "aws-endpoint", "", "Test only: a local KMS endpoint, with static test credentials.")
+}
+
+func (c *common) check() error {
+	if c.keyID == "" || c.commonName == "" || c.domains == "" || c.outFile == "" {
+		return errors.New("--key-id, --common-name, --domains and --out are required\n" + usage)
+	}
+	if _, err := os.Stat(c.outFile); err == nil {
+		return fmt.Errorf("%s exists; not overwriting it", c.outFile)
+	}
+	return nil
+}
+
+func (c *common) input() *kmsca.CAInput {
+	return &kmsca.CAInput{
+		Subject:             pkix.Name{CommonName: c.commonName},
+		PermittedDNSDomains: splitList(c.domains),
+		Duration:            c.duration,
+		Now:                 time.Now(),
+	}
+}
+
+// newCA connects to KMS; tests replace it with a mock.
+var newCA = func(ctx context.Context, c *common) (*kmsca.KMSCA, error) { return c.connect(ctx) }
+
+func (c *common) ca(ctx context.Context) (*kmsca.KMSCA, error) {
+	return newCA(ctx, c)
+}
+
+func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, error) {
+	var opts []func(*awsconfig.LoadOptions) error
+	if c.region != "" {
+		opts = append(opts, awsconfig.WithRegion(c.region))
+	}
+	if c.endpoint != "" {
+		opts = append(opts,
+			awsconfig.WithBaseEndpoint(c.endpoint),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")))
+		if c.region == "" {
+			opts = append(opts, awsconfig.WithRegion("eu-west-1"))
+		}
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Region == "" {
+		return nil, errors.New("no AWS region: set --region or AWS_REGION")
+	}
+	return kmsca.NewKMSCA(&cfg), nil
+}
+
+func root(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("root", flag.ContinueOnError)
+	var c common
+	c.register(fs, 20*365*24*time.Hour)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := c.check(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ca, err := c.ca(ctx)
+	if err != nil {
+		return err
+	}
+	cert, err := ca.MakeRoot(ctx, c.keyID, c.input())
+	if err != nil {
+		return err
+	}
+	return write(out, c.outFile, cert)
+}
+
+func intermediate(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("intermediate", flag.ContinueOnError)
+	var c common
+	var rootKeyID, rootFile string
+	c.register(fs, 2*365*24*time.Hour)
+	fs.StringVar(&rootKeyID, "root-key-id", "", "Required. The root's KMS key (key ID or ARN).")
+	fs.StringVar(&rootFile, "root-certificate", "", "Required. The root certificate (PEM) made with `kms-ca root`.")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := c.check(); err != nil {
+		return err
+	}
+	if rootKeyID == "" || rootFile == "" {
+		return errors.New("--root-key-id and --root-certificate are required\n" + usage)
+	}
+	rootCert, err := readCertificate(rootFile)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ca, err := c.ca(ctx)
+	if err != nil {
+		return err
+	}
+	cert, err := ca.MakeIntermediate(ctx, rootKeyID, rootCert, c.keyID, c.input())
+	if err != nil {
+		return err
+	}
+	pub, err := ca.PublicKey(ctx, c.keyID)
+	if err != nil {
+		return err
+	}
+	// Check it exactly as the controller will before handing it over.
+	if err := kmsca.ValidateIntermediate(cert, kmsca.ExpectedIntermediate{
+		Root: rootCert, PublicKey: pub, AllowedDomains: rootCert.PermittedDNSDomains, Now: time.Now(),
+	}); err != nil {
+		return fmt.Errorf("the new intermediate does not validate: %w", err)
+	}
+	return write(out, c.outFile, cert)
+}
+
+func readCertificate(file string) (*x509.Certificate, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := kmsca.ParseCertificatePEM(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", file, err)
+	}
+	return cert, nil
+}
+
+func write(out io.Writer, file string, cert *x509.Certificate) error {
+	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(kmsca.EncodeCertificatePEM(cert)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "wrote %s\n", file)
+	describe(out, cert)
+	return nil
+}
+
+func describe(out io.Writer, cert *x509.Certificate) {
+	sum := sha256.Sum256(cert.Raw)
+	pathLen := "unlimited"
+	if cert.MaxPathLen > 0 || cert.MaxPathLenZero {
+		pathLen = fmt.Sprint(cert.MaxPathLen)
+	}
+	fmt.Fprintf(out, "  subject:      %s\n", cert.Subject)
+	fmt.Fprintf(out, "  issuer:       %s\n", cert.Issuer)
+	fmt.Fprintf(out, "  serial:       %s\n", cert.SerialNumber.Text(16))
+	fmt.Fprintf(out, "  valid:        %s to %s\n", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339))
+	fmt.Fprintf(out, "  CA:           %t, path length %s\n", cert.IsCA, pathLen)
+	fmt.Fprintf(out, "  constraints:  %s (critical: %t)\n", strings.Join(cert.PermittedDNSDomains, ", "), cert.PermittedDNSDomainsCritical)
+	fmt.Fprintf(out, "  sha256:       %s\n", hex.EncodeToString(sum[:]))
+}
+
+func splitList(s string) []string {
+	var list []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			list = append(list, item)
+		}
+	}
+	return list
+}

@@ -20,6 +20,11 @@ fullnameOverride: ""
 # -- Required. The AWS region of the KMS key.
 awsRegion: ""
 
+# -- Required. The root CA certificate (PEM), made with `kms-ca root` on a KMS key
+# the controller cannot use. Every KMSIssuer's intermediate must chain to it, and it
+# is the `ca.crt` handed out with each certificate: what clients trust.
+rootCertificate: ""
+
 args:
   # -- Required. Namespaces a KMSIssuer may live in; KMSIssuers anywhere else sign
   # nothing. Keep these namespaces to platform administrators.
@@ -33,8 +38,6 @@ args:
   allowWildcards: false
   # -- The longest issued validity any KMSIssuer may allow.
   maxCertificateDuration: 2160h
-  # -- The longest CA certificate validity any KMSIssuer may ask for.
-  maxCADuration: 87600h
   # -- Run the KMSKey controller, which creates and deletes KMS keys. Off: create
   # keys outside the cluster and grant the controller only kms:Sign and
   # kms:GetPublicKey on them.

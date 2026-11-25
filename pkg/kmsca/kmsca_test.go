@@ -44,13 +44,35 @@ func newKey(client *kmsca.KMSCA, alias string) string {
 	return keyID
 }
 
-func newCA(client *kmsca.KMSCA, keyID string, now time.Time) *x509.Certificate {
-	ca, err := client.GenerateAndSignCertificateAuthorityCertificate(context.TODO(), &kmsca.GenerateCertificateAuthorityCertificateInput{
-		KeyID: keyID, Subject: pkix.Name{CommonName: "Test CA"}, Duration: 24 * time.Hour,
-		PermittedDNSDomains: []string{"example.internal"}, Now: now,
-	})
+func caInput(name string, duration time.Duration, now time.Time, domains ...string) *kmsca.CAInput {
+	if len(domains) == 0 {
+		domains = []string{"example.internal"}
+	}
+	return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: domains, Duration: duration, Now: now}
+}
+
+// twoTier makes a root and an intermediate on separate keys.
+type twoTier struct {
+	client                  *kmsca.KMSCA
+	rootKeyID, issuingKeyID string
+	root, intermediate      *x509.Certificate
+	now                     time.Time
+	expectedForIntermediate kmsca.ExpectedIntermediate
+}
+
+func newTwoTier() *twoTier {
+	t := &twoTier{client: mockKMSCA(), now: time.Now()}
+	t.rootKeyID = newKey(t.client, "alias/root")
+	t.issuingKeyID = newKey(t.client, "alias/issuing")
+	var err error
+	t.root, err = t.client.MakeRoot(context.TODO(), t.rootKeyID, caInput("Test Root", 20*365*24*time.Hour, t.now))
 	Expect(err).To(BeNil())
-	return ca
+	t.intermediate, err = t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.issuingKeyID, caInput("Test Issuing", 2*365*24*time.Hour, t.now))
+	Expect(err).To(BeNil())
+	pub, err := t.client.PublicKey(context.TODO(), t.issuingKeyID)
+	Expect(err).To(BeNil())
+	t.expectedForIntermediate = kmsca.ExpectedIntermediate{Root: t.root, PublicKey: pub, AllowedDomains: []string{"example.internal"}, Now: t.now}
+	return t
 }
 
 var _ = Context("KMSCA", func() {
@@ -143,95 +165,139 @@ var _ = Context("KMSCA", func() {
 		})
 	})
 
-	Describe("the CA certificate", func() {
-		It("is a path-length-0 root, name-constrained to its domains, with a random short serial", func() {
-			client := mockKMSCA()
-			keyID := newKey(client, "alias/test-key")
-			now := time.Now()
-			ca := newCA(client, keyID, now)
-			Expect(ca.IsCA).To(BeTrue())
-			Expect(ca.MaxPathLenZero).To(BeTrue())
-			Expect(ca.MaxPathLen).To(Equal(0))
-			Expect(ca.PermittedDNSDomainsCritical).To(BeTrue())
-			Expect(ca.PermittedDNSDomains).To(Equal([]string{"example.internal"}))
-			Expect(ca.ExcludedIPRanges).To(HaveLen(2))
-			Expect(ca.ExtKeyUsage).To(BeEmpty())
-			Expect(ca.KeyUsage).To(Equal(x509.KeyUsageCertSign | x509.KeyUsageCRLSign))
-			Expect(ca.NotAfter.Sub(ca.NotBefore)).To(Equal(24 * time.Hour))
-			Expect(ca.NotBefore.Before(now)).To(BeTrue())
-			Expect(ca.SerialNumber.Sign()).To(Equal(1))
-			Expect(len(ca.SerialNumber.Bytes())).To(BeNumerically("<=", 16))
-			Expect(newCA(client, keyID, now).SerialNumber).NotTo(Equal(ca.SerialNumber))
+	Describe("the two tiers", func() {
+		It("makes a constrained path-length-1 root and a constrained path-length-0 intermediate on another key", func() {
+			t := newTwoTier()
+			Expect(kmsca.ValidateRoot(t.root, t.now)).To(Succeed())
+			Expect(t.root.MaxPathLen).To(Equal(1))
+			Expect(t.root.PermittedDNSDomainsCritical).To(BeTrue())
+			Expect(t.root.ExcludedIPRanges).To(HaveLen(2))
 
-			roots := x509.NewCertPool()
-			roots.AddCert(ca)
-			_, err := ca.Verify(x509.VerifyOptions{Roots: roots})
-			Expect(err).To(BeNil())
+			Expect(t.intermediate.IsCA).To(BeTrue())
+			Expect(t.intermediate.MaxPathLenZero).To(BeTrue())
+			Expect(t.intermediate.PermittedDNSDomains).To(Equal([]string{"example.internal"}))
+			Expect(t.intermediate.ExtKeyUsage).To(BeEmpty())
+			Expect(t.intermediate.KeyUsage).To(Equal(x509.KeyUsageCertSign | x509.KeyUsageCRLSign))
+			Expect(t.intermediate.Issuer.CommonName).To(Equal("Test Root"))
+			Expect(t.intermediate.PublicKey).NotTo(Equal(t.root.PublicKey))
+			Expect(kmsca.ValidateIntermediate(t.intermediate, t.expectedForIntermediate)).To(Succeed())
+			Expect(len(t.intermediate.SerialNumber.Bytes())).To(BeNumerically("<=", 16))
 		})
 
-		It("needs a permitted domain", func() {
-			_, err := kmsca.CertificateAuthorityTemplate(&kmsca.GenerateCertificateAuthorityCertificateInput{Duration: time.Hour, Now: time.Now()})
+		It("never lets the intermediate outlive the root", func() {
+			client := mockKMSCA()
+			rootKey, issuingKey := newKey(client, "alias/r"), newKey(client, "alias/i")
+			now := time.Now()
+			root, err := client.MakeRoot(context.TODO(), rootKey, caInput("Root", 48*time.Hour, now))
+			Expect(err).To(BeNil())
+			inter, err := client.MakeIntermediate(context.TODO(), rootKey, root, issuingKey, caInput("Issuing", 365*24*time.Hour, now))
+			Expect(err).To(BeNil())
+			Expect(inter.NotAfter).To(Equal(root.NotAfter))
+		})
+
+		It("refuses an intermediate wider than the root, on the root key, or with the wrong root key", func() {
+			t := newTwoTier()
+			_, err := t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.issuingKeyID, caInput("Wide", 48*time.Hour, t.now, "com"))
+			Expect(err).NotTo(BeNil())
+			_, err = t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.rootKeyID, caInput("Same", 48*time.Hour, t.now))
+			Expect(err).NotTo(BeNil())
+			_, err = t.client.MakeIntermediate(context.TODO(), t.issuingKeyID, t.root, newKey(t.client, "alias/x"), caInput("Wrong root key", 48*time.Hour, t.now))
+			Expect(err).NotTo(BeNil())
+		})
+
+		It("leaves under the intermediate chain to the root and honor its constraints", func() {
+			t := newTwoTier()
+			key, _ := rsa.GenerateKey(rand.Reader, 2048)
+			leaf := func(name string) *x509.Certificate {
+				return &x509.Certificate{
+					SerialNumber: big.NewInt(1658), Subject: pkix.Name{CommonName: name}, DNSNames: []string{name},
+					NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+					ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, KeyUsage: x509.KeyUsageDigitalSignature,
+				}
+			}
+			roots, inters := x509.NewCertPool(), x509.NewCertPool()
+			roots.AddCert(t.root)
+			inters.AddCert(t.intermediate)
+
+			signed, err := t.client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
+				KeyID: t.issuingKeyID, Cert: leaf("svc.example.internal"), Parent: t.intermediate, PublicKey: key.Public(),
+			})
+			Expect(err).To(BeNil())
+			_, err = signed.Verify(x509.VerifyOptions{Roots: roots, Intermediates: inters, DNSName: "svc.example.internal"})
+			Expect(err).To(BeNil())
+
+			By("checking a name outside the constraints fails verification even if signed")
+			outside, err := t.client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
+				KeyID: t.issuingKeyID, Cert: leaf("accounts.google.com"), Parent: t.intermediate, PublicKey: key.Public(),
+			})
+			Expect(err).To(BeNil())
+			_, err = outside.Verify(x509.VerifyOptions{Roots: roots, Intermediates: inters, DNSName: "accounts.google.com"})
+			Expect(err).NotTo(BeNil())
+
+			By("refusing to sign under the intermediate with the root key")
+			_, err = t.client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
+				KeyID: t.rootKeyID, Cert: leaf("svc.example.internal"), Parent: t.intermediate, PublicKey: key.Public(),
+			})
 			Expect(err).NotTo(BeNil())
 		})
 	})
 
-	Describe("ValidateCA", func() {
-		var (
-			client   *kmsca.KMSCA
-			keyID    string
-			ca       *x509.Certificate
-			expected kmsca.ExpectedCA
-		)
-		BeforeEach(func() {
-			client = mockKMSCA()
-			keyID = newKey(client, "alias/test-key")
-			now := time.Now()
-			ca = newCA(client, keyID, now)
-			pub, err := client.PublicKey(context.TODO(), keyID)
+	Describe("ValidateIntermediate", func() {
+		It("refuses an intermediate from another root with the same name", func() {
+			t := newTwoTier()
+			otherRootKey := newKey(t.client, "alias/other-root")
+			otherRoot, err := t.client.MakeRoot(context.TODO(), otherRootKey, caInput("Test Root", 20*365*24*time.Hour, t.now))
 			Expect(err).To(BeNil())
-			expected = kmsca.ExpectedCA{PublicKey: pub, CommonName: "Test CA", PermittedDNSDomains: []string{"example.internal"}, Now: now}
+			forged, err := t.client.MakeIntermediate(context.TODO(), otherRootKey, otherRoot, t.issuingKeyID, caInput("Test Issuing", 48*time.Hour, t.now))
+			Expect(err).To(BeNil())
+			Expect(kmsca.ValidateIntermediate(forged, t.expectedForIntermediate)).NotTo(Succeed())
 		})
 
-		It("accepts the certificate it made", func() {
-			Expect(kmsca.ValidateCA(ca, expected)).To(Succeed())
-		})
+		It("refuses constraints outside the allowed domains, another key, or an expired intermediate", func() {
+			t := newTwoTier()
+			other := t.expectedForIntermediate
+			other.AllowedDomains = []string{"other.internal"}
+			Expect(kmsca.ValidateIntermediate(t.intermediate, other)).NotTo(Succeed())
 
-		It("refuses a certificate with the KMS public key but signed by another key", func() {
-			// An attacker's own "root" with the same name signs a certificate carrying
-			// the KMS public key and every expected field.
+			other = t.expectedForIntermediate
+			other.Now = t.intermediate.NotAfter.Add(time.Second)
+			Expect(kmsca.ValidateIntermediate(t.intermediate, other)).NotTo(Succeed())
+
 			otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-			attackerRoot := *ca
-			attackerRoot.PublicKey = otherKey.Public()
-			tmpl := *ca
-			der, err := x509.CreateCertificate(rand.Reader, &tmpl, &attackerRoot, ca.PublicKey, otherKey)
-			Expect(err).To(BeNil())
-			planted, err := x509.ParseCertificate(der)
-			Expect(err).To(BeNil())
-			Expect(kmsca.ValidateCA(planted, expected)).NotTo(Succeed())
-		})
-
-		It("refuses other domains, names, or an expired certificate", func() {
-			other := expected
-			other.PermittedDNSDomains = []string{"other.internal"}
-			Expect(kmsca.ValidateCA(ca, other)).NotTo(Succeed())
-			other = expected
-			other.CommonName = "Another CA"
-			Expect(kmsca.ValidateCA(ca, other)).NotTo(Succeed())
-			other = expected
-			other.Now = ca.NotAfter.Add(time.Second)
-			Expect(kmsca.ValidateCA(ca, other)).NotTo(Succeed())
-			otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-			other = expected
+			other = t.expectedForIntermediate
 			other.PublicKey = otherKey.Public()
-			Expect(kmsca.ValidateCA(ca, other)).NotTo(Succeed())
+			Expect(kmsca.ValidateIntermediate(t.intermediate, other)).NotTo(Succeed())
+
+			By("refusing the root itself as an intermediate")
+			rootPub, _ := t.client.PublicKey(context.TODO(), t.rootKeyID)
+			other = t.expectedForIntermediate
+			other.PublicKey = rootPub
+			Expect(kmsca.ValidateIntermediate(t.root, other)).NotTo(Succeed())
+		})
+
+		It("refuses an unconstrained intermediate signed by the root key", func() {
+			t := newTwoTier()
+			rootSignerCA := t.client
+			tmpl, err := kmsca.CATemplate(caInput("Unconstrained", 48*time.Hour, t.now), 0)
+			Expect(err).To(BeNil())
+			tmpl.PermittedDNSDomains = nil
+			tmpl.PermittedURIDomains = nil
+			tmpl.PermittedEmailAddresses = nil
+			tmpl.ExcludedIPRanges = nil
+			tmpl.PermittedDNSDomainsCritical = false
+			pub, _ := rootSignerCA.PublicKey(context.TODO(), t.issuingKeyID)
+			unconstrained, err := rootSignerCA.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
+				KeyID: t.rootKeyID, Cert: tmpl, Parent: t.root, PublicKey: pub,
+			})
+			Expect(err).To(BeNil())
+			Expect(kmsca.ValidateIntermediate(unconstrained, t.expectedForIntermediate)).NotTo(Succeed())
 		})
 	})
 
 	Describe("ParseCertificatePEM", func() {
 		It("accepts exactly one certificate and nothing else", func() {
-			client := mockKMSCA()
-			ca := newCA(client, newKey(client, "alias/test-key"), time.Now())
-			one := kmsca.EncodeCertificatePEM(ca)
+			t := newTwoTier()
+			one := kmsca.EncodeCertificatePEM(t.root)
 			_, err := kmsca.ParseCertificatePEM(one)
 			Expect(err).To(BeNil())
 			_, err = kmsca.ParseCertificatePEM(append(append([]byte{}, one...), one...))
@@ -239,72 +305,6 @@ var _ = Context("KMSCA", func() {
 			_, err = kmsca.ParseCertificatePEM(append([]byte("junk\n"), one...))
 			Expect(err).NotTo(BeNil())
 			_, err = kmsca.ParseCertificatePEM([]byte("not a certificate"))
-			Expect(err).NotTo(BeNil())
-		})
-	})
-
-	Describe("when calling SignCertificate", func() {
-		var (
-			client *kmsca.KMSCA
-			keyID  string
-			parent *x509.Certificate
-		)
-		BeforeEach(func() {
-			client = mockKMSCA()
-			keyID = newKey(client, "alias/test-key")
-			parent = newCA(client, keyID, time.Now())
-		})
-
-		leaf := func(name string) *x509.Certificate {
-			return &x509.Certificate{
-				SerialNumber: big.NewInt(1658),
-				Subject:      pkix.Name{CommonName: name},
-				DNSNames:     []string{name},
-				NotBefore:    time.Now().Add(-time.Minute),
-				NotAfter:     time.Now().Add(time.Hour),
-				ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-				KeyUsage:     x509.KeyUsageDigitalSignature,
-			}
-		}
-
-		It("should sign a leaf that chains to the CA and honors its constraints", func() {
-			key, _ := rsa.GenerateKey(rand.Reader, 2048)
-			signed, err := client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
-				KeyID: keyID, Cert: leaf("svc.example.internal"), Parent: parent, PublicKey: key.Public(),
-			})
-			Expect(err).To(BeNil())
-			roots := x509.NewCertPool()
-			roots.AddCert(parent)
-			_, err = signed.Verify(x509.VerifyOptions{Roots: roots, DNSName: "svc.example.internal"})
-			Expect(err).To(BeNil())
-
-			By("checking a name outside the constraints fails verification even if signed")
-			outside, err := client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
-				KeyID: keyID, Cert: leaf("accounts.google.com"), Parent: parent, PublicKey: key.Public(),
-			})
-			Expect(err).To(BeNil())
-			_, err = outside.Verify(x509.VerifyOptions{Roots: roots, DNSName: "accounts.google.com"})
-			Expect(err).NotTo(BeNil())
-		})
-
-		It("should refuse a parent certificate that is not for the KMS key", func() {
-			otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-			forged := *parent
-			forged.PublicKey = otherKey.Public()
-			key, _ := rsa.GenerateKey(rand.Reader, 2048)
-			_, err := client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
-				KeyID: keyID, Cert: leaf("svc.example.internal"), Parent: &forged, PublicKey: key.Public(),
-			})
-			Expect(err).NotTo(BeNil())
-		})
-
-		It("should refuse a parent that is not a CA", func() {
-			notCA := *parent
-			notCA.IsCA = false
-			key, _ := rsa.GenerateKey(rand.Reader, 2048)
-			_, err := client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
-				KeyID: keyID, Cert: leaf("svc.example.internal"), Parent: &notCA, PublicKey: key.Public(),
-			})
 			Expect(err).NotTo(BeNil())
 		})
 	})

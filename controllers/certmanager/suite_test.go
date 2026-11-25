@@ -18,6 +18,8 @@ package certmanager
 
 import (
 	"context"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,14 +57,45 @@ var (
 	// "default" the only namespace; otherKeyID exists in KMS but is not allowed.
 	allowedKeyID string
 	otherKeyID   string
+	// testRoot is the pinned root (on its own key, rootKeyID); allowedIntermediate
+	// and otherIntermediate are intermediates it signed for the two issuing keys.
+	rootKeyID           string
+	testRoot            *x509.Certificate
+	allowedIntermediate string
+	otherIntermediate   string
 	// testCeilings are the operator ceilings under test: example.internal only,
-	// no wildcards, 90-day certificates, 10-year CA certificates.
+	// no wildcards, 90-day certificates.
 	testCeilings = Ceilings{
 		PermittedDNSDomains:    []string{"example.internal"},
 		MaxCertificateDuration: 90 * 24 * time.Hour,
-		MaxCADuration:          10 * 365 * 24 * time.Hour,
 	}
 )
+
+// intermediateFor returns the test intermediate for an issuing key.
+func intermediateFor(keyID string) string {
+	if keyID == otherKeyID {
+		return otherIntermediate
+	}
+	return allowedIntermediate
+}
+
+// makeTwoTier makes the suite's root and its intermediates in the mock.
+func makeTwoTier(ca *kmsca.KMSCA) {
+	var err error
+	rootKeyID, err = ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/root", OwnerUID: "suite"})
+	Expect(err).NotTo(HaveOccurred())
+	now := time.Now()
+	input := func(name string, d time.Duration) *kmsca.CAInput {
+		return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: []string{"example.internal"}, Duration: d, Now: now}
+	}
+	testRoot, err = ca.MakeRoot(context.TODO(), rootKeyID, input("Test Root", 20*365*24*time.Hour))
+	Expect(err).NotTo(HaveOccurred())
+	for keyID, out := range map[string]*string{allowedKeyID: &allowedIntermediate, otherKeyID: &otherIntermediate} {
+		cert, err := ca.MakeIntermediate(context.TODO(), rootKeyID, testRoot, keyID, input("Test Issuing", 365*24*time.Hour))
+		Expect(err).NotTo(HaveOccurred())
+		*out = string(kmsca.EncodeCertificatePEM(cert))
+	}
+}
 
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -108,7 +141,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other", OwnerUID: "suite"})
 	Expect(err).NotTo(HaveOccurred())
-	access, err := NewAccess([]string{"default"}, []string{allowedKeyID}, testCeilings)
+	makeTwoTier(&ca)
+	access, err := NewAccess([]string{"default"}, []string{allowedKeyID}, testCeilings, testRoot, time.Now())
 	Expect(err).NotTo(HaveOccurred())
 
 	err = (&CertificateRequestReconciler{

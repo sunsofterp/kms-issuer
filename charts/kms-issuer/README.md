@@ -16,7 +16,6 @@ A Helm chart to install kms-issuer
 | args.healthProbeBindAddress | string | `":8081"` | The address the probe endpoint binds to |
 | args.leaderElect | bool | `true` | Enable leader election for controller manager. |
 | args.localAwsEndpoint | string | `""` | Test only: a local KMS endpoint, used with static test credentials. |
-| args.maxCADuration | string | `"87600h"` | The longest CA certificate validity any KMSIssuer may ask for. |
 | args.maxCertificateDuration | string | `"2160h"` | The longest issued validity any KMSIssuer may allow. |
 | args.metricsBindAddress | string | `":8443"` | The address the metrics endpoint binds to ("0" disables it). |
 | args.metricsSecure | bool | `true` | Serve metrics over HTTPS to authenticated, authorized callers only. |
@@ -47,6 +46,7 @@ A Helm chart to install kms-issuer
 | resources.limits.memory | string | `"128Mi"` |  |
 | resources.requests.cpu | string | `"10m"` |  |
 | resources.requests.memory | string | `"64Mi"` |  |
+| rootCertificate | string | `""` | Required. The root CA certificate (PEM), made with `kms-ca root` on a KMS key the controller cannot use. Every KMSIssuer's intermediate must chain to it, and it is the `ca.crt` handed out with each certificate: what clients trust. |
 | securityContext.allowPrivilegeEscalation | bool | `false` |  |
 | securityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | securityContext.readOnlyRootFilesystem | bool | `true` |  |
