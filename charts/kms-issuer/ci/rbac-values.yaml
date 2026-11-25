@@ -1,6 +1,13 @@
 # Keep in sync with the IMG variable in .github/workflows/helm.yml
 image:
-  repository: skyscanner/kms-issuer
-  tag: dev
+  repository: kms-issuer
+  tag: ci
+  pullPolicy: Never
 
-enableMetricsRbacProxy: true
+awsRegion: eu-west-1
+args:
+  allowedIssuerNamespaces: [default, other]
+  allowedKeyIds: [00000000-0000-0000-0000-000000000000]
+  enableKMSKeyController: true
+  metricsSecure: false
+  metricsBindAddress: ":8080"

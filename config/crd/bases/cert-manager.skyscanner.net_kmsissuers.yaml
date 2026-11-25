@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.17.0
+    controller-gen.kubebuilder.io/version: v0.23.0
   name: kmsissuers.cert-manager.skyscanner.net
 spec:
   group: cert-manager.skyscanner.net
@@ -37,31 +37,73 @@ spec:
           metadata:
             type: object
           spec:
-            description: KMSIssuerSpec defines the desired state of KMSIssuer
+            description: KMSIssuerSpec defines the desired state of KMSIssuer.
             properties:
+              allowWildcards:
+                description: |-
+                  AllowWildcards lets a request include wildcard names (*.example.internal).
+                  Off by default.
+                type: boolean
               commonName:
                 description: |-
-                  CommonName is a common name to be used on the Certificate.
-                  The CommonName should have a length of 64 characters or fewer to avoid
-                  generating invalid CSRs.
-                  This value is ignored by TLS clients when any subject alt name is set.
-                  This is x509 behaviour: https://tools.ietf.org/html/rfc6125#section-6.4.4
+                  CommonName is the CA certificate's subject common name. Immutable: devices that
+                  trust the CA identify it by subject and key.
+                maxLength: 64
+                minLength: 1
                 type: string
+                x-kubernetes-validations:
+                - message: commonName is immutable
+                  rule: self == oldSelf
               duration:
-                description: Certificate default Duration
+                description: |-
+                  Duration is the CA certificate's validity. Defaults to 87600h (10 years);
+                  at least 24h.
                 type: string
               keyId:
                 description: |-
-                  KeyID is the unique identifier for the customer master key (CMK)
-                  deletion. When unspecified, a RSA 2048 key is created and managed by
-                  the operator.
+                  KeyID is the KMS key that signs: a key ID or key ARN, never an alias (an alias
+                  can be re-pointed at another key by anyone allowed to update it). The key must
+                  be an asymmetric SIGN_VERIFY key, and the controller must be started with it in
+                  --allowed-key-ids. Immutable: a different key is a different CA.
+                pattern: ^(arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/)?(mrk-)?[0-9a-fA-F-]{32,36}$
                 type: string
+                x-kubernetes-validations:
+                - message: keyId is immutable
+                  rule: self == oldSelf
+              maxCertificateDuration:
+                description: |-
+                  MaxCertificateDuration is the longest validity a request may ask for. Requests
+                  asking for longer are refused, not shortened. Issued certificates also never
+                  outlive the CA certificate. Defaults to 2160h (90 days, cert-manager's default).
+                type: string
+              permittedDNSDomains:
+                description: |-
+                  PermittedDNSDomains are the DNS domains this CA may ever certify. They are
+                  written into the CA certificate as critical name constraints (so clients reject
+                  any certificate under it for another name, however it was issued), and every
+                  request must name only these domains or their subdomains.
+                items:
+                  maxLength: 253
+                  pattern: ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$
+                  type: string
+                minItems: 1
+                type: array
               renewBefore:
                 description: |-
-                  RenewBefore is the amount of time before the currently issued certificate’s notAfter time that the issuer will begin to attempt to renew the certificate.
-                  If this value is greater than the total duration of the certificate (i.e. notAfter - notBefore), it will be automatically renewed 2/3rds of the way through the certificate’s duration.
+                  RenewBefore is how long before the CA certificate's notAfter a new CA
+                  certificate (same key, same subject) is made. Certificates issued before and
+                  after chain to either, so devices holding the older copy keep working until that
+                  copy expires. Defaults to 8760h (1 year); must be shorter than duration.
                 type: string
+            required:
+            - commonName
+            - keyId
+            - permittedDNSDomains
             type: object
+            x-kubernetes-validations:
+            - message: renewBefore must be shorter than duration
+              rule: '!has(self.duration) || !has(self.renewBefore) || duration(self.renewBefore)
+                < duration(self.duration)'
           status:
             description: KMSIssuerStatus defines the observed state of KMSIssuer
             properties:
@@ -91,17 +133,12 @@ spec:
                         transition.
                       type: string
                     status:
-                      allOf:
-                      - enum:
-                        - "True"
-                        - "False"
-                        - Unknown
-                      - enum:
-                        - "True"
-                        - "False"
-                        - Unknown
                       description: Status of the condition, one of ('True', 'False',
                         'Unknown').
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
                       type: string
                     type:
                       description: Type of the condition, currently ('Ready').

@@ -32,11 +32,12 @@ const (
 
 // KMSKeySpec defines the desired state of KMSKey
 type KMSKeySpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
 	// AliasName Specifies the alias name for the kms key. This value must begin with alias/ followed by a
-	// name, such as alias/ExampleAlias.
+	// name, such as alias/ExampleAlias. An alias that already points at a key this
+	// KMSKey did not create is refused, never adopted. Immutable.
+	// +kubebuilder:validation:Pattern=`^alias/[a-zA-Z0-9/_-]+$`
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('alias/aws/')",message="aliases under alias/aws/ are reserved by AWS"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="aliasName is immutable"
 	AliasName string `json:"aliasName"`
 	// Description for the key
 	Description string `json:"description,omitempty"`
@@ -52,6 +53,9 @@ type KMSKeySpec struct {
 	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 	// This value is optional. If you include a value, it must be between 7 and
 	// 30, inclusive. If you do not include a value, it defaults to 30.
+	// +kubebuilder:validation:Minimum=7
+	// +kubebuilder:validation:Maximum=30
+	// +optional
 	DeletionPendingWindowInDays int `json:"deletionPendingWindowInDays,omitempty"`
 }
 

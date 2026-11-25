@@ -3,7 +3,7 @@ layout:
 - go.kubebuilder.io/v3
 multigroup: true
 projectName: kms-issuer
-repo: github.com/Skyscanner/kms-issuer
+repo: github.com/sunsofterp/kms-issuer/v5
 resources:
 - api:
     crdVersion: v1
@@ -12,7 +12,7 @@ resources:
   domain: skyscanner.net
   group: cert-manager.skyscanner.net
   kind: KMSIssuer
-  path: github.com/Skyscanner/kms-issuer/apis/certmanager/v1alpha1
+  path: github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1
   version: v1alpha1
 - api:
     crdVersion: v1
@@ -21,6 +21,6 @@ resources:
   domain: skyscanner.net
   group: cert-manager.skyscanner.net
   kind: KMSKey
-  path: github.com/Skyscanner/kms-issuer/apis/certmanager/v1alpha1
+  path: github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1
   version: v1alpha1
 version: "3"

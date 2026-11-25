@@ -18,71 +18,69 @@ package certmanager
 
 import (
 	"context"
-	"fmt"
-
 	"encoding/pem"
+	"errors"
+	"fmt"
 
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	pkiutil "github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/go-logr/logr"
 	core "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	kmsiapi "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
-	kmsca "github.com/Skyscanner/kms-issuer/v4/pkg/kmsca"
+	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	kmsca "github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/policy"
 )
 
 const (
 	levelDebug = 4
+	// issuerKind is the only issuerRef kind this controller serves.
+	issuerKind = "KMSIssuer"
 )
 
-// CertificateRequestReconciler reconciles a StepIssuer object.
+// CertificateRequestReconciler signs approved cert-manager CertificateRequests that
+// name a KMSIssuer, within the issuer's policy.
 type CertificateRequestReconciler struct {
 	client.Client
 	Log      logr.Logger
 	Recorder record.EventRecorder
 	KMSCA    *kmsca.KMSCA
-
-	Clock                  clock.Clock
-	CheckApprovedCondition bool
+	Access   *Access
+	Clock    clock.Clock
 }
 
 // Annotation for generating RBAC role for writing Events
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-// +kubebuilder:rbac:groups=cert-manager.io,resources=certificaterequests,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificaterequests,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificaterequests/status,verbs=get;update;patch
 
-// Reconcile will read and validate a KMSIssuer resource associated to the
-// CertificateRequest resource, and it will sign the CertificateRequest with the
-// provisioner in the KMSIssuer.
+// Reconcile signs one CertificateRequest, if it is ours, approved, and within policy.
 func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("certificaterequests", req.NamespacedName)
+	log := r.Log.WithValues("certificaterequest", req.NamespacedName)
 
-	// Fetch the CertificateRequest resource being reconciled.
-	// Just ignore the request if the certificate request has been deleted.
 	cr := new(cmapi.CertificateRequest)
 	if err := r.Get(ctx, req.NamespacedName, cr); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-
 		log.Error(err, "failed to retrieve CertificateRequest resource")
 		return ctrl.Result{}, err
 	}
 
-	// Check the CertificateRequest's issuerRef and if it does not match the api
-	// group name, log a message at a debug level and stop processing.
-	if cr.Spec.IssuerRef.Group != "" && cr.Spec.IssuerRef.Group != kmsiapi.GroupVersion.Group {
-		log.V(4).Info("resource does not specify an issuerRef group name that we are responsible for", "group", cr.Spec.IssuerRef.Group)
+	// Only requests naming our group exactly are ours. An empty group means
+	// cert-manager.io (cert-manager's own issuers), never this one.
+	if cr.Spec.IssuerRef.Group != kmsiapi.GroupVersion.Group {
+		log.V(levelDebug).Info("issuerRef group is not ours", "group", cr.Spec.IssuerRef.Group)
 		return ctrl.Result{}, nil
 	}
 
@@ -91,68 +89,118 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// If the certificate data is already set then we skip this request as it
-	// has already been completed in the past.
 	if len(cr.Status.Certificate) > 0 {
-		log.V(4).Info("existing certificate data found in status, skipping already completed CertificateRequest")
+		log.V(levelDebug).Info("existing certificate data found in status, skipping already completed CertificateRequest")
 		return ctrl.Result{}, nil
 	}
 
-	// TODO: Do we allow signing intermediate CAs?
-	// if cr.Spec.IsCA {
-	// 	log.Info("step certificate does not support online signing of CA certificates")
-	// 	return ctrl.Result{}, nil
-	// }
+	if cr.Spec.IssuerRef.Kind != issuerKind {
+		return ctrl.Result{}, r.fail(ctx, cr, "issuerRef kind %q is not %s", cr.Spec.IssuerRef.Kind, issuerKind)
+	}
 
-	// Fetch the KMSIssuer resource
 	issuer := kmsiapi.KMSIssuer{}
-	issNamespaceName := types.NamespacedName{
-		Namespace: req.Namespace,
-		Name:      cr.Spec.IssuerRef.Name,
-	}
-	if err = r.Get(ctx, issNamespaceName, &issuer); err != nil {
-		log.Error(err, "failed to retrieve KMSIssuer resource", "namespace", req.Namespace, "name", cr.Spec.IssuerRef.Name)
-		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to retrieve KMSIssuer resource %s: %v", issNamespaceName, err)
+	issuerName := types.NamespacedName{Namespace: req.Namespace, Name: cr.Spec.IssuerRef.Name}
+	if err = r.Get(ctx, issuerName, &issuer); err != nil {
+		log.Error(err, "failed to retrieve KMSIssuer resource", "issuer", issuerName)
+		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to retrieve KMSIssuer resource %s: %v", issuerName, err)
 		return ctrl.Result{}, err
 	}
-
-	// Check if the KMSIssuer resource has been marked Ready
+	if err := r.Access.Check(issuer.Namespace, issuer.Spec.KeyID); err != nil {
+		return ctrl.Result{}, r.fail(ctx, cr, "KMSIssuer %s may not issue: %v", issuerName, err)
+	}
 	if !issuer.Status.IsReady() {
-		err = fmt.Errorf("resource %s is not ready", issNamespaceName)
-		log.Error(err, "failed to retrieve StepIssuer resource", "namespace", req.Namespace, "name", cr.Spec.IssuerRef.Name)
-		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "StepIssuer resource %s is not Ready", issNamespaceName)
+		err = fmt.Errorf("KMSIssuer %s is not ready", issuerName)
+		log.Error(err, "issuer not ready")
+		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "KMSIssuer %s is not Ready", issuerName)
 		return ctrl.Result{}, err
 	}
 
-	// Sign CertificateRequest
-	cert, err := pkiutil.CertificateTemplateFromCertificateRequest(cr)
+	parent, err := ParseCertificate(issuer.Status.Certificate)
 	if err != nil {
-		log.Error(err, "failed to decode certificate request")
-		return ctrl.Result{}, r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonFailed, "Failed to decode certificate request: %v", err)
+		return ctrl.Result{}, r.fail(ctx, cr, "Failed to decode the issuer's CA certificate: %v", err)
 	}
-	parent, err := pkiutil.DecodeX509CertificateBytes(issuer.Status.Certificate)
+	serial, err := kmsca.RandomSerial()
 	if err != nil {
-		log.Error(err, "failed to decode issuer public certificate")
-		return ctrl.Result{}, r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonFailed, "Failed to decode issuer public certificate: %v", err)
+		return ctrl.Result{}, err
 	}
-
-	signed, err := r.KMSCA.SignCertificate(
-		ctx,
-		&kmsca.IssueCertificateInput{
-			KeyID:     issuer.Spec.KeyID,
-			Parent:    parent,
-			Cert:      cert,
-			PublicKey: cert.PublicKey,
+	var duration metav1.Duration
+	if cr.Spec.Duration != nil {
+		duration = *cr.Spec.Duration
+	}
+	usages := make([]string, 0, len(cr.Spec.Usages))
+	for _, u := range cr.Spec.Usages {
+		usages = append(usages, string(u))
+	}
+	settings := issuerSettings(&issuer)
+	template, publicKey, err := policy.Template(
+		&policy.Request{
+			CSR:             cr.Spec.Request,
+			IsCA:            cr.Spec.IsCA,
+			Usages:          usages,
+			Duration:        duration.Duration,
+			DefaultDuration: cmapi.DefaultCertificateDuration,
 		},
+		&policy.Issuer{
+			PermittedDNSDomains: issuer.Spec.PermittedDNSDomains,
+			AllowWildcards:      issuer.Spec.AllowWildcards,
+			MaxDuration:         settings.maxCertificateDuration,
+		},
+		parent, serial, r.Clock.Now(),
 	)
 	if err != nil {
-		log.Error(err, "failed to sign certificate request")
-		return ctrl.Result{}, r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonFailed, "Failed to sign certificate request: %v", err)
+		if errors.Is(err, policy.ErrDenied) {
+			log.Info("request refused", "reason", err.Error(), "requester", cr.Spec.Username)
+			return ctrl.Result{}, r.fail(ctx, cr, "%v", err)
+		}
+		return ctrl.Result{}, err
 	}
-	cr.Status.Certificate = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signed.Raw})
-	cr.Status.CA = issuer.Status.Certificate
-	log.Info(string(cr.Status.Certificate))
-	return ctrl.Result{}, r.setStatus(ctx, cr, cmmeta.ConditionTrue, cmapi.CertificateRequestReasonIssued, "Certificate issued")
+
+	signed, err := r.KMSCA.SignCertificate(ctx, &kmsca.IssueCertificateInput{
+		KeyID:     issuer.Spec.KeyID,
+		Parent:    parent,
+		Cert:      template,
+		PublicKey: publicKey,
+	})
+	if err != nil {
+		log.Error(err, "failed to sign certificate request")
+		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to sign the certificate (will retry): %v", err)
+		return ctrl.Result{}, err
+	}
+
+	// The audit record of every issuance.
+	log.Info("issued certificate",
+		"serial", signed.SerialNumber.Text(16),
+		"dnsNames", signed.DNSNames,
+		"notBefore", signed.NotBefore,
+		"notAfter", signed.NotAfter,
+		"issuer", issuerName.String(),
+		"keyId", issuer.Spec.KeyID,
+		"requester", cr.Spec.Username,
+		"requesterGroups", cr.Spec.Groups,
+	)
+
+	// Record the certificate. A conflicting write is retried with the certificate
+	// already signed: signing again would issue a second certificate.
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signed.Raw})
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := new(cmapi.CertificateRequest)
+		if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
+			return err
+		}
+		if len(latest.Status.Certificate) > 0 {
+			return nil
+		}
+		latest.Status.Certificate = certPEM
+		latest.Status.CA = issuer.Status.Certificate
+		apiutil.SetCertificateRequestCondition(latest, cmapi.CertificateRequestConditionReady, cmmeta.ConditionTrue, cmapi.CertificateRequestReasonIssued, "Certificate issued")
+		return r.Status().Update(ctx, latest)
+	})
+	if err != nil {
+		log.Error(err, "failed to record the issued certificate", "serial", signed.SerialNumber.Text(16))
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Event(cr, core.EventTypeNormal, cmapi.CertificateRequestReasonIssued, "Certificate issued")
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager initialises the CertificateRequest controller into the
@@ -163,28 +211,12 @@ func (r *CertificateRequestReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Complete(r)
 }
 
-// stepIssuerHasCondition will return true if the given StepIssuer resource has
-// a condition matching the provided StepIssuerCondition. Only the Type and
-// Status field will be used in the comparison, meaning that this function will
-// return 'true' even if the Reason, Message and LastTransitionTime fields do
-// not match.
-// func stepIssuerHasCondition(iss api.StepIssuer, c api.StepIssuerCondition) bool {
-// 	existingConditions := iss.Status.Conditions
-// 	for _, cond := range existingConditions {
-// 		if c.Type == cond.Type && c.Status == cond.Status {
-// 			return true
-// 		}
-// 	}
-// 	return false
-// }
-
-// requestShouldBeProcessed will return false if the conditions on the request
-// mean that it should not be processed. If the request has been denied, it
-// will set the request failure time and add a Ready=False condition.
+// requestShouldBeProcessed returns false when the request is finished, denied, or
+// not yet approved. Approval is always required. A denied request gets a
+// Ready=False condition and a failure time.
 func (r *CertificateRequestReconciler) requestShouldBeProcessed(ctx context.Context, log logr.Logger, cr *cmapi.CertificateRequest) (bool, error) {
 	dbg := log.V(levelDebug)
 
-	// Ignore CertificateRequest if it is already Ready
 	if apiutil.CertificateRequestHasCondition(cr, cmapi.CertificateRequestCondition{
 		Type:   cmapi.CertificateRequestConditionReady,
 		Status: cmmeta.ConditionTrue,
@@ -192,7 +224,6 @@ func (r *CertificateRequestReconciler) requestShouldBeProcessed(ctx context.Cont
 		dbg.Info("CertificateRequest is Ready. Ignoring.")
 		return false, nil
 	}
-	// Ignore CertificateRequest if it is already Failed
 	if apiutil.CertificateRequestHasCondition(cr, cmapi.CertificateRequestCondition{
 		Type:   cmapi.CertificateRequestConditionReady,
 		Status: cmmeta.ConditionFalse,
@@ -201,7 +232,6 @@ func (r *CertificateRequestReconciler) requestShouldBeProcessed(ctx context.Cont
 		dbg.Info("CertificateRequest is Failed. Ignoring.")
 		return false, nil
 	}
-	// Ignore CertificateRequest if it already has a Denied Ready Reason
 	if apiutil.CertificateRequestHasCondition(cr, cmapi.CertificateRequestCondition{
 		Type:   cmapi.CertificateRequestConditionReady,
 		Status: cmmeta.ConditionFalse,
@@ -211,35 +241,35 @@ func (r *CertificateRequestReconciler) requestShouldBeProcessed(ctx context.Cont
 		return false, nil
 	}
 
-	// If CertificateRequest has been denied, mark the CertificateRequest as
-	// Ready=Denied and set FailureTime if not already.
 	if apiutil.CertificateRequestIsDenied(cr) {
 		dbg.Info("CertificateRequest has been denied. Marking as failed.")
-
 		if cr.Status.FailureTime == nil {
 			nowTime := metav1.NewTime(r.Clock.Now())
 			cr.Status.FailureTime = &nowTime
 		}
-
 		return false, r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonDenied, "The CertificateRequest was denied by an approval controller")
 	}
 
-	if r.CheckApprovedCondition {
-		// If CertificateRequest has not been approved, exit early.
-		if !apiutil.CertificateRequestIsApproved(cr) {
-			dbg.Info("certificate request has not been approved")
-			return false, nil
-		}
+	if !apiutil.CertificateRequestIsApproved(cr) {
+		dbg.Info("certificate request has not been approved")
+		return false, nil
 	}
-
 	return true, nil
 }
 
-func (r *CertificateRequestReconciler) setStatus(ctx context.Context, cr *cmapi.CertificateRequest, status cmmeta.ConditionStatus, reason, message string, args ...interface{}) error {
+// fail marks the request failed for good.
+func (r *CertificateRequestReconciler) fail(ctx context.Context, cr *cmapi.CertificateRequest, message string, args ...any) error {
+	if cr.Status.FailureTime == nil {
+		nowTime := metav1.NewTime(r.Clock.Now())
+		cr.Status.FailureTime = &nowTime
+	}
+	return r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonFailed, message, args...)
+}
+
+func (r *CertificateRequestReconciler) setStatus(ctx context.Context, cr *cmapi.CertificateRequest, status cmmeta.ConditionStatus, reason, message string, args ...any) error {
 	completeMessage := fmt.Sprintf(message, args...)
 	apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionReady, status, reason, completeMessage)
 
-	// Fire an Event to additionally inform users of the change
 	eventType := core.EventTypeNormal
 	if status == cmmeta.ConditionFalse {
 		eventType = core.EventTypeWarning

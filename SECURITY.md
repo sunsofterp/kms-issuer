@@ -2,12 +2,10 @@
 
 ## Supported Versions
 
-This project is under active development and we do our best to support the latest versions.
-
-| Version | Supported          |
-| ------- | ------------------ |
-| Latest  | :white_check_mark: |
+Only the latest release is supported.
 
 ## Reporting a Vulnerability
 
-If you find a security issue please create a Github Issue and label it "security", we will review it with top priority. If you prefer you can send us an email to security_AT_skyscanner.net.
+Please report security issues privately through GitHub's
+[private vulnerability reporting](https://github.com/sunsofterp/kms-issuer/security/advisories/new),
+not in a public issue.

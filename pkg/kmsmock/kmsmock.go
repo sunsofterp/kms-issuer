@@ -30,7 +30,7 @@ import (
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/google/uuid"
 
-	"github.com/Skyscanner/kms-issuer/v4/pkg/interfaces"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/interfaces"
 )
 
 var (
@@ -169,15 +169,34 @@ func (m *KMSMock) GetPublicKey(_ context.Context, input *kms.GetPublicKeyInput, 
 	return nil, &kmstypes.NotFoundException{}
 }
 
-// Sign mocks of the KMS Sign method.
+// Sign mocks of the KMS Sign method: RSA PKCS#1 v1.5 over a digest, like KMS, for
+// the three hashes KMS offers; anything else is refused.
 func (m *KMSMock) Sign(_ context.Context, input *kms.SignInput, _ ...func(*kms.Options)) (*kms.SignOutput, error) {
-	if _, ok := m.keys[aws.ToString(input.KeyId)]; ok {
-		block, _ := pem.Decode(privateKey)
-		signer, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
-		signature, _ := rsa.SignPKCS1v15(rand.Reader, signer, crypto.SHA256, input.Message)
-		return &kms.SignOutput{
-			Signature: signature,
-		}, nil
+	if _, ok := m.keys[aws.ToString(input.KeyId)]; !ok {
+		return nil, &kmstypes.NotFoundException{}
 	}
-	return nil, &kmstypes.NotFoundException{}
+	if input.MessageType != kmstypes.MessageTypeDigest {
+		return nil, &kmstypes.InvalidKeyUsageException{Message: aws.String("mock signs digests only")}
+	}
+	var hash crypto.Hash
+	switch input.SigningAlgorithm {
+	case kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha256:
+		hash = crypto.SHA256
+	case kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha384:
+		hash = crypto.SHA384
+	case kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha512:
+		hash = crypto.SHA512
+	default:
+		return nil, &kmstypes.InvalidKeyUsageException{Message: aws.String("mock does not support " + string(input.SigningAlgorithm))}
+	}
+	block, _ := pem.Decode(privateKey)
+	signer, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	signature, err := rsa.SignPKCS1v15(rand.Reader, signer, hash, input.Message)
+	if err != nil {
+		return nil, err
+	}
+	return &kms.SignOutput{Signature: signature}, nil
 }

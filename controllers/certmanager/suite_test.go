@@ -32,12 +32,12 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	kmsca "github.com/Skyscanner/kms-issuer/v4/pkg/kmsca"
-	mocks "github.com/Skyscanner/kms-issuer/v4/pkg/kmsmock"
+	kmsca "github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
+	mocks "github.com/sunsofterp/kms-issuer/v5/pkg/kmsmock"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
-	certmanagerv1alpha1 "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
+	certmanagerv1alpha1 "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -50,6 +50,10 @@ var (
 	ctx       context.Context
 	cancel    context.CancelFunc
 	ca        kmsca.KMSCA
+	// allowedKeyID is the only key the controllers under test may sign with, and
+	// "default" the only namespace; otherKeyID exists in KMS but is not allowed.
+	allowedKeyID string
+	otherKeyID   string
 )
 
 func TestAPIs(t *testing.T) {
@@ -92,18 +96,24 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	ca.Client = mocks.New()
+	allowedKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/allowed"})
+	Expect(err).NotTo(HaveOccurred())
+	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other"})
+	Expect(err).NotTo(HaveOccurred())
+	access, err := NewAccess([]string{"default"}, []string{allowedKeyID})
+	Expect(err).NotTo(HaveOccurred())
 
 	err = (&CertificateRequestReconciler{
-		Client:                 k8sManager.GetClient(),
-		Log:                    logf.Log,
-		Recorder:               k8sManager.GetEventRecorderFor("certificaterequests-controller"),
-		KMSCA:                  &ca,
-		CheckApprovedCondition: true,
-		Clock:                  clock.RealClock{},
+		Client:   k8sManager.GetClient(),
+		Log:      logf.Log,
+		Recorder: k8sManager.GetEventRecorderFor("certificaterequests-controller"),
+		KMSCA:    &ca,
+		Access:   access,
+		Clock:    clock.RealClock{},
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred(), "failed to setup the CertificateRequestReconciler controller")
 
-	err = NewKMSIssuerReconciler(k8sManager, &ca).SetupWithManager(k8sManager)
+	err = NewKMSIssuerReconciler(k8sManager, &ca, access).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred(), "failed to setup the KMSIssuerReconciler controller")
 
 	err = NewKMSKeyReconciler(k8sManager, &ca).SetupWithManager(k8sManager)

@@ -27,8 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	kmsiapi "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
-	kmsca "github.com/Skyscanner/kms-issuer/v4/pkg/kmsca"
+	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	kmsca "github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 )
 
 // NewKMSKeyReconciler Initialise a new NewKMSKeyReconciler
@@ -54,7 +54,7 @@ type KMSKeyReconciler struct {
 // Annotation for generating RBAC role for writing Events
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-// +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmskeys,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmskeys,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmskeys/status,verbs=get;update;patch
 
 func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -84,6 +84,7 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				log.Info("delete KMSKey")
 				err := r.KMSCA.DeleteKey(ctx, &kmsca.DeleteKeyInput{
 					AliasName:           kmsKey.Spec.AliasName,
+					OwnedKeyID:          kmsKey.Status.KeyID,
 					PendingWindowInDays: kmsKey.Spec.DeletionPendingWindowInDays,
 				})
 				if err != nil {
@@ -102,6 +103,7 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Create the KMS key
 	keyID, err := r.KMSCA.CreateKey(ctx, &kmsca.CreateKeyInput{
 		AliasName:             kmsKey.Spec.AliasName,
+		OwnedKeyID:            kmsKey.Status.KeyID,
 		Description:           kmsKey.Spec.Description,
 		CustomerMasterKeySpec: kmsKey.Spec.CustomerMasterKeySpec,
 		Policy:                kmsKey.Spec.Policy,

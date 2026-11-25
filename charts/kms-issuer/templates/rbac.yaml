@@ -1,4 +1,7 @@
 ---
+# What the controller needs, and no more: read KMSIssuers, KMSKeys and
+# CertificateRequests; write their status; update KMSKeys (their finalizer) only when
+# the KMSKey controller runs. It can never create or delete any of them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -18,7 +21,6 @@ rules:
   verbs:
   - get
   - list
-  - update
   - watch
 - apiGroups:
   - cert-manager.io
@@ -33,12 +35,8 @@ rules:
   resources:
   - kmsissuers
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - cert-manager.skyscanner.net
@@ -48,18 +46,16 @@ rules:
   - get
   - patch
   - update
+{{- if .Values.args.enableKMSKeyController }}
 - apiGroups:
   - cert-manager.skyscanner.net
   resources:
   - kmskeys
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
+  - update
 - apiGroups:
   - cert-manager.skyscanner.net
   resources:
@@ -68,6 +64,22 @@ rules:
   - get
   - patch
   - update
+{{- end }}
+{{- if .Values.args.metricsSecure }}
+# The metrics endpoint checks each caller's token and its right to get /metrics.
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -89,18 +101,6 @@ metadata:
   name: {{ include "kms-issuer.fullname" . }}-leader-election-role
   namespace: {{ .Release.Namespace }}
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - configmaps
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -164,8 +164,9 @@ subjects:
   name: {{ .Values.certManagerApprovalRBAC.serviceAccountName }}
   namespace: {{ .Values.certManagerApprovalRBAC.namespace }}
 {{- end }}
-{{- if .Values.enableMetricsRbacProxy }}
+{{- if .Values.args.metricsSecure }}
 ---
+# Bind this to whatever scrapes the metrics (e.g. Prometheus' service account).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -175,35 +176,4 @@ rules:
   - /metrics
   verbs:
   - get
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-proxy-role
-rules:
-- apiGroups:
-  - authentication.k8s.io
-  resources:
-  - tokenreviews
-  verbs:
-  - create
-- apiGroups:
-  - authorization.k8s.io
-  resources:
-  - subjectaccessreviews
-  verbs:
-  - create
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-proxy-role
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "kms-issuer.fullname" . }}-proxy-role
-subjects:
-- kind: ServiceAccount
-  name: {{ include "kms-issuer.serviceAccountName" . }}
-  namespace: {{ .Release.Namespace }}
 {{- end }}

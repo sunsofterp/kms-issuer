@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	kmsiapi "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
+	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
 )
 
 func WaitForKMSKeyReady(key client.ObjectKey) *kmsiapi.KMSKey {
@@ -104,7 +104,7 @@ var _ = Context("KMSKey", func() {
 					Namespace: key.Namespace,
 				},
 				Spec: kmsiapi.KMSKeySpec{
-					AliasName:      "alias/kms-issuer-test-key",
+					AliasName:      "alias/kms-issuer-test-key-to-delete",
 					DeletionPolicy: "Delete",
 				},
 			}

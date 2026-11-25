@@ -1,3 +1,6 @@
+{{- $namespaces := required "args.allowedIssuerNamespaces is required" .Values.args.allowedIssuerNamespaces }}
+{{- $keys := required "args.allowedKeyIds is required" .Values.args.allowedKeyIds }}
+{{- $region := required "awsRegion is required" .Values.awsRegion }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -21,37 +24,39 @@ spec:
       labels:
         control-plane: {{ include "kms-issuer.fullname" . }}-controller-manager
     spec:
-      containers:
-      {{- if .Values.enableMetricsRbacProxy }}
-      - args:
-        - --secure-listen-address=0.0.0.0:8443
-        - --upstream=http://127.0.0.1:8080/
-        - --logtostderr=true
-        - --v=10
-        image: gcr.io/kubebuilder/kube-rbac-proxy:v0.8.0
-        name: kube-rbac-proxy
-        ports:
-        - containerPort: 8443
-          name: https
-          protocol: TCP
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
+      containers:
       - command:
         - /manager
+        - --allowed-issuer-namespaces={{ join "," $namespaces }}
+        - --allowed-key-ids={{ join "," $keys }}
+        - --enable-kmskey-controller={{ .Values.args.enableKMSKeyController }}
         - --health-probe-bind-address={{ .Values.args.healthProbeBindAddress }}
         - --metrics-bind-address={{ .Values.args.metricsBindAddress }}
-        {{- if .Values.args.leaderElect }}
-        - --leader-elect=true
+        - --metrics-secure={{ .Values.args.metricsSecure }}
+        - --leader-elect={{ .Values.args.leaderElect }}
+        {{- with .Values.args.localAwsEndpoint }}
+        - --local-aws-endpoint={{ . }}
         {{- end }}
-        {{- if .Values.args.enableApprovedCheck }}
-        - --enable-approved-check=true
-        {{- end }}
-        - --local-aws-endpoint={{ .Values.args.localAwsEndpoit }}
+        {{- if .Values.image.digest }}
+        image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+        {{- else }}
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-        {{- with .Values.env }}
-        env:
-          {{- toYaml . | nindent 10 }}
         {{- end }}
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+        - name: AWS_REGION
+          value: {{ $region | quote }}
+        {{- with .Values.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        ports:
+        - containerPort: {{ (split ":" .Values.args.metricsBindAddress)._1 | default 8443 }}
+          name: https
+          protocol: TCP
         livenessProbe:
           httpGet:
             path: /healthz
@@ -66,13 +71,22 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 10
         resources:
-          {{- toYaml .Values.resources | nindent 12 }}
+          {{- toYaml .Values.resources | nindent 10 }}
         securityContext:
-          allowPrivilegeEscalation: false
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        volumeMounts:
+        # Writable scratch space with a read-only root filesystem (the metrics
+        # server writes its self-signed certificate here).
+        - name: tmp
+          mountPath: /tmp
       securityContext:
-        runAsNonRoot: true
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       serviceAccountName: {{ include "kms-issuer.serviceAccountName" . }}
       terminationGracePeriodSeconds: 10
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 16Mi
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

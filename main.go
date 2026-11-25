@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -32,96 +33,112 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
-	certmanagerskyscannernetv1alpha1 "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
-	"github.com/Skyscanner/kms-issuer/v4/controllers/certmanager"
-	"github.com/Skyscanner/kms-issuer/v4/pkg/kmsca"
+	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	"github.com/sunsofterp/kms-issuer/v5/controllers/certmanager"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 	//+kubebuilder:scaffold:imports
 )
 
 var scheme = runtime.NewScheme()
 
-const webhookPort = 9943
-
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(cmapi.AddToScheme(scheme))
-	utilruntime.Must(certmanagerskyscannernetv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(kmsiapi.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
+// The metrics endpoint authenticates callers with TokenReview and authorizes them
+// with SubjectAccessReview (get on the /metrics non-resource URL).
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+
 func main() {
-	var metricsAddr string
-	var enableLeaderElection, enableApprovedCheck bool
-	var probeAddr string
-	var localAWSEndpoint string
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	var (
+		metricsAddr, probeAddr, localAWSEndpoint string
+		allowedNamespaces, allowedKeyIDs         string
+		enableLeaderElection, secureMetrics      bool
+		enableKMSKeyController                   bool
+	)
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to. \"0\" disables it.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", true, "Serve metrics over HTTPS, to authenticated and authorized callers only.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&enableApprovedCheck, "enable-approved-check", true,
-		"Enable waiting for CertificateRequests to have an approved condition before signing.")
-	flag.StringVar(&localAWSEndpoint, "local-aws-endpoint", "", "local-kms endpoint for testing")
-	opts := zap.Options{Development: true}
+	flag.StringVar(&allowedNamespaces, "allowed-issuer-namespaces", "",
+		"Required. Comma-separated namespaces a KMSIssuer may live in; KMSIssuers anywhere else sign nothing.")
+	flag.StringVar(&allowedKeyIDs, "allowed-key-ids", "",
+		"Required. Comma-separated KMS key IDs or ARNs (not aliases) a KMSIssuer may sign with.")
+	flag.BoolVar(&enableKMSKeyController, "enable-kmskey-controller", false,
+		"Run the KMSKey controller, which creates and deletes KMS keys. Off by default: create keys outside the cluster.")
+	flag.StringVar(&localAWSEndpoint, "local-aws-endpoint", "", "Test only: a local KMS endpoint, with static test credentials.")
+	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	// Set up logging and set up logger (use in this function only)
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
+	access, err := certmanager.NewAccess(splitList(allowedNamespaces), splitList(allowedKeyIDs))
+	if err != nil {
+		setupLog.Error(err, "invalid --allowed-issuer-namespaces / --allowed-key-ids")
+		os.Exit(1)
+	}
+
+	metricsOptions := metricsserver.Options{
+		BindAddress:   metricsAddr,
+		SecureServing: secureMetrics,
+	}
+	if secureMetrics {
+		metricsOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
-		WebhookServer:          webhook.NewServer(webhook.Options{Port: webhookPort}),
+		Metrics:                metricsOptions,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "dcb53387.skyscanner.net",
+		LeaderElectionID:       "kms-issuer.cert-manager.skyscanner.net",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	// If using a local endpoint we create a custom endpoint resolver, hard code
-	// the region and test credentials.
-	// Otherwise we leave the config loading to the default aws order (env vars,
-	// EC2 IMDS, etc.)
+	// Default AWS configuration (environment, Pod Identity, IMDS...), unless a local
+	// test endpoint is given.
 	awsLoadConfigOpts := []func(*config.LoadOptions) error{}
 	if localAWSEndpoint != "" {
-		setupLog.Info("Using custom AWS Endpoint", "endpoint", localAWSEndpoint)
-		awsEndpointsResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) { //nolint:staticcheck // SA1019: deprecated but functional, migration to per-service resolver deferred
-			return aws.Endpoint{PartitionID: "aws", URL: localAWSEndpoint, SigningRegion: "eu-west-1"}, nil //nolint:staticcheck // SA1019: deprecated but functional, migration to per-service resolver deferred
-		})
+		setupLog.Info("Using a local AWS endpoint with test credentials", "endpoint", localAWSEndpoint)
 		awsLoadConfigOpts = append(
 			awsLoadConfigOpts,
-			config.WithEndpointResolverWithOptions(awsEndpointsResolver), //nolint:staticcheck // SA1019: deprecated but functional, migration to per-service resolver deferred
+			config.WithBaseEndpoint(localAWSEndpoint),
 			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
 			config.WithRegion("eu-west-1"),
 		)
-	} else {
-		setupLog.Info("Using default AWS endpoint")
 	}
-
-	// Load the config with the given options and create a new KMSCA
 	cfg, err := config.LoadDefaultConfig(context.Background(), awsLoadConfigOpts...)
 	if err != nil {
 		setupLog.Error(err, "Error loading default aws config")
 		os.Exit(1)
 	}
+	if cfg.Region == "" {
+		setupLog.Error(nil, "no AWS region: set AWS_REGION")
+		os.Exit(1)
+	}
 	setupLog.Info("Using region", "region", cfg.Region)
 	ca := kmsca.NewKMSCA(&cfg)
 
-	if err = (certmanager.NewKMSIssuerReconciler(mgr, ca)).SetupWithManager(mgr); err != nil {
+	if err = certmanager.NewKMSIssuerReconciler(mgr, ca, access).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KMSIssuer")
 		os.Exit(1)
 	}
@@ -131,17 +148,20 @@ func main() {
 		Log:      ctrl.Log.WithName("controllers").WithName("CertificateRequest"),
 		Recorder: mgr.GetEventRecorderFor("certificaterequests-controller"),
 		KMSCA:    ca,
-
-		Clock:                  clock.RealClock{},
-		CheckApprovedCondition: enableApprovedCheck,
+		Access:   access,
+		Clock:    clock.RealClock{},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CertificateRequest")
 		os.Exit(1)
 	}
 
-	if err = (certmanager.NewKMSKeyReconciler(mgr, ca)).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "KMSKey")
-		os.Exit(1)
+	if enableKMSKeyController {
+		if err = (certmanager.NewKMSKeyReconciler(mgr, ca)).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "KMSKey")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("KMSKey controller disabled (--enable-kmskey-controller=false)")
 	}
 	//+kubebuilder:scaffold:builder
 
@@ -159,4 +179,14 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }

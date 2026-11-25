@@ -9,3 +9,8 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+  # The Dockerfile's base images (Go, distroless), pinned by digest
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "daily"

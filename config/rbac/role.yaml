@@ -12,13 +12,24 @@ rules:
   - create
   - patch
 - apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+- apiGroups:
   - cert-manager.io
   resources:
   - certificaterequests
   verbs:
   - get
   - list
-  - update
   - watch
 - apiGroups:
   - cert-manager.io
@@ -32,14 +43,9 @@ rules:
   - cert-manager.skyscanner.net
   resources:
   - kmsissuers
-  - kmskeys
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - cert-manager.skyscanner.net
@@ -50,3 +56,12 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - cert-manager.skyscanner.net
+  resources:
+  - kmskeys
+  verbs:
+  - get
+  - list
+  - update
+  - watch

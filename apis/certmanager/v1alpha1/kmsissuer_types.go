@@ -20,9 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialised.
-
 // Condition reasons
 const (
 	KMSIssuerReasonPending = "Pending"
@@ -30,28 +27,57 @@ const (
 	KMSIssuerReasonIssued  = "Issued"
 )
 
-// KMSIssuerSpec defines the desired state of KMSIssuer
+// KMSIssuerSpec defines the desired state of KMSIssuer.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.duration) || !has(self.renewBefore) || duration(self.renewBefore) < duration(self.duration)",message="renewBefore must be shorter than duration"
 type KMSIssuerSpec struct {
+	// KeyID is the KMS key that signs: a key ID or key ARN, never an alias (an alias
+	// can be re-pointed at another key by anyone allowed to update it). The key must
+	// be an asymmetric SIGN_VERIFY key, and the controller must be started with it in
+	// --allowed-key-ids. Immutable: a different key is a different CA.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^(arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/)?(mrk-)?[0-9a-fA-F-]{32,36}$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="keyId is immutable"
+	KeyID string `json:"keyId"`
 
-	// KeyID is the unique identifier for the customer master key (CMK)
-	// deletion. When unspecified, a RSA 2048 key is created and managed by
-	// the operator.
+	// CommonName is the CA certificate's subject common name. Immutable: devices that
+	// trust the CA identify it by subject and key.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="commonName is immutable"
+	CommonName string `json:"commonName"`
+
+	// PermittedDNSDomains are the DNS domains this CA may ever certify. They are
+	// written into the CA certificate as critical name constraints (so clients reject
+	// any certificate under it for another name, however it was issued), and every
+	// request must name only these domains or their subdomains.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`
+	// +kubebuilder:validation:items:MaxLength=253
+	PermittedDNSDomains []string `json:"permittedDNSDomains"`
+
+	// AllowWildcards lets a request include wildcard names (*.example.internal).
+	// Off by default.
 	// +optional
-	KeyID string `json:"keyId,omitempty"`
+	AllowWildcards bool `json:"allowWildcards,omitempty"`
 
-	// CommonName is a common name to be used on the Certificate.
-	// The CommonName should have a length of 64 characters or fewer to avoid
-	// generating invalid CSRs.
-	// This value is ignored by TLS clients when any subject alt name is set.
-	// This is x509 behaviour: https://tools.ietf.org/html/rfc6125#section-6.4.4
-	CommonName string `json:"commonName,omitempty"`
+	// MaxCertificateDuration is the longest validity a request may ask for. Requests
+	// asking for longer are refused, not shortened. Issued certificates also never
+	// outlive the CA certificate. Defaults to 2160h (90 days, cert-manager's default).
+	// +optional
+	MaxCertificateDuration *metav1.Duration `json:"maxCertificateDuration,omitempty"`
 
-	// Certificate default Duration
+	// Duration is the CA certificate's validity. Defaults to 87600h (10 years);
+	// at least 24h.
 	// +optional
 	Duration *metav1.Duration `json:"duration,omitempty"`
 
-	// RenewBefore is the amount of time before the currently issued certificate’s notAfter time that the issuer will begin to attempt to renew the certificate.
-	// If this value is greater than the total duration of the certificate (i.e. notAfter - notBefore), it will be automatically renewed 2/3rds of the way through the certificate’s duration.
+	// RenewBefore is how long before the CA certificate's notAfter a new CA
+	// certificate (same key, same subject) is made. Certificates issued before and
+	// after chain to either, so devices holding the older copy keep working until that
+	// copy expires. Defaults to 8760h (1 year); must be shorter than duration.
 	// +optional
 	RenewBefore *metav1.Duration `json:"renewBefore,omitempty"`
 }
