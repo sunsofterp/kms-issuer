@@ -140,7 +140,13 @@ func listener(t *testing.T) (string, *atomic.Int32) {
 // The container credential provider (ECS, EKS Pod Identity) builds its own HTTP
 // client unless told otherwise: it must not go through the proxy either. The
 // credential URI is a .invalid name, so the fetch fails at name resolution
-// without the proxy and reaches nothing.
+// without the proxy and reaches nothing. The SDK makes three attempts with that
+// provider whatever AWS_MAX_ATTEMPTS says, so a regression shows as three proxy
+// connections and the test can take a few seconds under load.
+//
+// Go reads the proxy variables once per process: this test can only see a
+// regression if nothing earlier in the process made a request with the
+// environment's proxy settings (true of this package; run it with -count=1).
 func TestContainerCredentialsIgnoreProxy(t *testing.T) {
 	isolate(t)
 	proxy, hits := listener(t)

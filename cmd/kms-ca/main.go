@@ -155,8 +155,10 @@ func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, string, error) {
 // SSL_CERT_* variable and no service endpoint override (refused). Where
 // credentials come from (a profile, credential_process, the instance or
 // container metadata endpoint) is left to the configuration; the identity they
-// give is printed. Nothing is called: the defaults mode is pinned to standard,
-// whose "auto" would ask the instance metadata service while loading.
+// give is printed. Loading makes no request: the defaults mode is pinned to
+// standard, whose "auto" would ask the instance metadata service. (An http://
+// AWS_CONTAINER_CREDENTIALS_FULL_URI with a host name is looked up in DNS while
+// loading, to check it is a loopback or container address; nothing is sent.)
 func (c *common) loadConfig(ctx context.Context) (aws.Config, error) {
 	var opts []func(*awsconfig.LoadOptions) error
 	if c.region != "" {

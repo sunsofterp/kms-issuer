@@ -66,8 +66,10 @@ key and requester.
 
 A certificate signed but not yet recorded (a failed status write) is kept, with its chain, and recorded on
 the next attempt rather than signed again, unless the issuer as it is by then would not sign it (under an
-hour left, a name outside its domains, longer than its maximum): then it is dropped and a new one signed.
-That holds within one controller process: if the controller
+hour left, a name outside its domains, longer than its maximum, a wildcard it no longer allows) or its chain
+is no longer current (the issuer now uses another key, the intermediate that signed it has expired, or its
+root is no longer a pinned root valid now): then it is dropped and a new one signed. That holds within one
+controller process: if the controller
 restarts or loses leadership between signing and recording, the request is signed a second time. Both
 certificates are in the issuance log; only the recorded one is handed out.
 
@@ -98,8 +100,8 @@ root, or on the root key. It creates the output file before asking KMS to sign a
 overwrites one, checks a new intermediate exactly as the controller will, and prints what it made: subject,
 validity, path length, usages, every constraint, the public key and certificate SHA-256 fingerprints, which
 keys signed, and the AWS identity and KMS endpoint it used. The root key is only ever used through AWS's own
-endpoints: `kms-ca` ignores proxy settings (`HTTPS_PROXY` and the like) for every AWS call, credential
-fetches included, and refuses to run with any `AWS_ENDPOINT_URL*` variable, an `endpoint_url` or `services`
+endpoints: `kms-ca` ignores proxy settings (`HTTPS_PROXY` and the like) for every AWS call it makes,
+credential fetches included (a `credential_process` program is its own), and refuses to run with any `AWS_ENDPOINT_URL*` variable, an `endpoint_url` or `services`
 section in the AWS profile, a custom CA bundle (`AWS_CA_BUNDLE`, `ca_bundle`), or `SSL_CERT_FILE` /
 `SSL_CERT_DIR`. Where credentials come from (a profile, `credential_process`, the instance or container
 metadata endpoint) is left to your AWS configuration; the identity they give is printed. Run it from a
