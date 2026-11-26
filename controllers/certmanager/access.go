@@ -21,16 +21,17 @@ type Access struct {
 	namespaces map[string]bool
 	keyIDs     map[string]bool
 	ceilings   Ceilings
-	roots      []*x509.Certificate
-	skipped    []SkippedRoot
+	roots      []*x509.Certificate // every pinned root, structurally checked
+	skipped    []SkippedRoot       // those not valid at startup, for the log
 }
 
-// SkippedRoot is a pinned root left out because it is not valid now (expired, or
-// not yet valid). Nothing chains to it; it should be removed from the pin.
+// SkippedRoot is a pinned root not valid at startup: expired (remove it from the
+// pin) or not yet valid (it is used from its notBefore, no restart needed).
 type SkippedRoot struct {
-	Index  int // 1-based position in --root-certificate
-	Root   *x509.Certificate
-	Reason error
+	Index   int // 1-based position in --root-certificate
+	Root    *x509.Certificate
+	Reason  error
+	Expired bool
 }
 
 // Ceilings are the operator's upper bounds on every KMSIssuer.
@@ -54,8 +55,10 @@ type Ceilings struct {
 // name constraint inside the operator's domains; any that fails is fatal. More than
 // one root is pinned only while replacing one: intermediates may chain to either. A
 // root that is structurally sound but not valid now (an old root that expired
-// before it was removed from the pin) is skipped and reported (Skipped), not fatal,
-// as long as one valid root is left.
+// before it was removed from the pin, or a new one not valid yet) is reported
+// (Skipped), not fatal, as long as one root is valid now; at signing time only the
+// roots valid then are chained to (RootsAt), and every pinned root's key is refused
+// as an issuing key.
 func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Certificate, now time.Time) (*Access, error) {
 	a := &Access{namespaces: map[string]bool{}, keyIDs: map[string]bool{}}
 	for _, ns := range namespaces {
@@ -96,9 +99,9 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Cer
 		return nil, fmt.Errorf("the maximum certificate duration must be whole seconds and at least 1h")
 	}
 	// Issuers warn from twice the leaf maximum before their intermediate expires: a
-	// fresh intermediate must start outside that window, or leaves are cut short
-	// and the warning never clears.
-	if 2*ceilings.MaxCertificateDuration >= ceilings.MaxIntermediateDuration {
+	// full-length intermediate must start outside that window. (Compared without
+	// doubling, which could overflow.)
+	if ceilings.MaxCertificateDuration >= ceilings.MaxIntermediateDuration/2 {
 		return nil, fmt.Errorf("the maximum certificate duration %s must be less than half the maximum intermediate duration %s",
 			ceilings.MaxCertificateDuration, ceilings.MaxIntermediateDuration)
 	}
@@ -114,13 +117,12 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Cer
 				return nil, fmt.Errorf("root certificate %d permits %q, outside the permitted DNS domains %v", i+1, d, a.ceilings.PermittedDNSDomains)
 			}
 		}
-		if err := kmsca.ValidateRoot(root, now); err != nil {
-			a.skipped = append(a.skipped, SkippedRoot{Index: i + 1, Root: root, Reason: err})
-			continue
-		}
 		a.roots = append(a.roots, root)
+		if err := kmsca.ValidateRoot(root, now); err != nil {
+			a.skipped = append(a.skipped, SkippedRoot{Index: i + 1, Root: root, Reason: err, Expired: !now.Before(root.NotAfter)})
+		}
 	}
-	if len(a.roots) == 0 {
+	if len(a.RootsAt(now)) == 0 {
 		return nil, fmt.Errorf("no pinned root certificate is valid now: %v", a.skipped[0].Reason)
 	}
 	a.ceilings.AllowWildcards = ceilings.AllowWildcards
@@ -129,10 +131,21 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Cer
 	return a, nil
 }
 
-// Roots are the pinned root certificates valid at startup: intermediates must
-// chain to one of them.
+// Roots are all the pinned root certificates, valid now or not.
 func (a *Access) Roots() []*x509.Certificate {
 	return a.roots
+}
+
+// RootsAt are the pinned roots valid at now: the only ones an intermediate may
+// chain to then.
+func (a *Access) RootsAt(now time.Time) []*x509.Certificate {
+	var valid []*x509.Certificate
+	for _, r := range a.roots {
+		if !now.Before(r.NotBefore) && now.Before(r.NotAfter) {
+			valid = append(valid, r)
+		}
+	}
+	return valid
 }
 
 // Skipped are pinned roots left out at startup because they were not valid then.
@@ -174,6 +187,12 @@ func (a *Access) CheckIssuer(issuer *kmsiapi.KMSIssuer, s settings) error {
 		return fmt.Errorf("permittedDNSDomains is required")
 	}
 	for _, d := range issuer.Spec.PermittedDNSDomains {
+		// A lower-case domain of two labels or more: anything else (a wildcard, a
+		// leading dot, upper case) would match no request, so it is refused here
+		// rather than showing Ready and signing nothing.
+		if err := kmsca.ValidConstraintDomain(d); err != nil {
+			return fmt.Errorf("permitted DNS domain: %w", err)
+		}
 		if !domains.Within(d, a.ceilings.PermittedDNSDomains) {
 			return fmt.Errorf("permitted DNS domain %q is outside the operator's %v", d, a.ceilings.PermittedDNSDomains)
 		}

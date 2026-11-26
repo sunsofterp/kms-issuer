@@ -22,7 +22,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -39,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/domains"
 	kmsca "github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 	"github.com/sunsofterp/kms-issuer/v5/pkg/policy"
 )
@@ -72,6 +75,7 @@ type CertificateRequestReconciler struct {
 // intermediate that signed it.
 type signedCertificate struct {
 	uid     types.UID
+	leaf    *x509.Certificate
 	serial  string
 	certPEM []byte // the leaf, then the intermediate that signed it
 	rootPEM []byte // the pinned root that intermediate chains to
@@ -82,6 +86,7 @@ type signedCertificate struct {
 func newSignedCertificate(uid types.UID, leaf *x509.Certificate, verified verifiedIssuer) signedCertificate {
 	return signedCertificate{
 		uid:     uid,
+		leaf:    leaf,
 		serial:  leaf.SerialNumber.Text(16),
 		certPEM: append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}), kmsca.EncodeCertificatePEM(verified.intermediate)...),
 		rootPEM: kmsca.EncodeCertificatePEM(verified.root),
@@ -179,10 +184,17 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// A certificate already signed for this request, whose recording failed, is
-	// recorded now instead of signing a second one.
+	// recorded now instead of signing a second one, if the issuer as it is now
+	// would still sign it: at least an hour left, its names inside the issuer's
+	// domains (wildcards only if allowed), no longer than the issuer's maximum.
 	if pending, ok := r.signed.Load(req.NamespacedName); ok {
-		if p := pending.(signedCertificate); p.uid == cr.UID {
-			return r.record(ctx, log, req, &issuer, p)
+		p := pending.(signedCertificate)
+		if p.uid == cr.UID {
+			why := stillAcceptable(p.leaf, &issuer, settings, r.Clock.Now())
+			if why == "" {
+				return r.record(ctx, log, req, &issuer, p)
+			}
+			log.Info("kept certificate no longer acceptable, signing a new one", "serial", p.serial, "reason", why)
 		}
 		r.signed.Delete(req.NamespacedName)
 	}
@@ -253,6 +265,30 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	p := newSignedCertificate(cr.UID, signed, verified)
 	r.signed.Store(req.NamespacedName, p)
 	return r.record(ctx, log, req, &issuer, p)
+}
+
+// stillAcceptable returns why a kept leaf may no longer be handed out by the
+// issuer as it is now, or "" if it may.
+func stillAcceptable(leaf *x509.Certificate, issuer *kmsiapi.KMSIssuer, s settings, now time.Time) string {
+	if leaf.NotAfter.Sub(now) < time.Hour {
+		return "less than an hour of validity left"
+	}
+	if leaf.NotAfter.Sub(leaf.NotBefore) > s.maxCertificateDuration {
+		return "longer than the issuer's maximum"
+	}
+	for _, name := range leaf.DNSNames {
+		host := name
+		if strings.HasPrefix(name, "*.") {
+			if !issuer.Spec.AllowWildcards {
+				return "wildcards are no longer allowed"
+			}
+			host = name[2:]
+		}
+		if !domains.Within(host, issuer.Spec.PermittedDNSDomains) {
+			return fmt.Sprintf("%q is outside the issuer's domains", name)
+		}
+	}
+	return ""
 }
 
 // record writes a signed certificate into the request's status. A conflicting

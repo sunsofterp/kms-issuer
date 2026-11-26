@@ -146,7 +146,7 @@ func verifyIssuer(ctx context.Context, ca *kmsca.KMSCA, access *Access, issuer *
 		return verifiedIssuer{intermediate: intermediate}, errKMS{fmt.Errorf("reading the KMS key's public key: %w", err)}
 	}
 	root, err := kmsca.ValidateIntermediate(intermediate, kmsca.ExpectedIntermediate{
-		Roots: access.Roots(), PublicKey: pub, AllowedDomains: access.AllowedDomains(),
+		Roots: access.RootsAt(now), OtherRoots: access.Roots(), PublicKey: pub, AllowedDomains: access.AllowedDomains(),
 		MaxDuration: access.MaxIntermediateDuration(), Now: now,
 	})
 	if err != nil {

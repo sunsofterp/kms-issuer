@@ -119,8 +119,12 @@ func RootConstraintDomains(root *x509.Certificate) []string {
 
 // ExpectedIntermediate is what an issuer's intermediate must match.
 type ExpectedIntermediate struct {
-	// Roots are the operator's pinned roots: the intermediate must chain to one.
+	// Roots are the operator's pinned roots valid now: the intermediate must chain
+	// to one.
 	Roots []*x509.Certificate
+	// OtherRoots are pinned roots not valid now (expired, or not yet valid): never
+	// chained to, but, like Roots, their keys are refused as the issuing key.
+	OtherRoots []*x509.Certificate
 	// PublicKey is the issuer's KMS key.
 	PublicKey crypto.PublicKey
 	// AllowedDomains bound the intermediate's name constraints (the operator's
@@ -147,6 +151,11 @@ func ValidateIntermediate(cert *x509.Certificate, expected ExpectedIntermediate)
 	}
 	if !publicKeysEqual(cert.PublicKey, expected.PublicKey) {
 		return nil, errors.New("not for the issuer's KMS key")
+	}
+	for _, r := range expected.OtherRoots {
+		if publicKeysEqual(cert.PublicKey, r.PublicKey) {
+			return nil, errors.New("the issuing key is a root key")
+		}
 	}
 	var root *x509.Certificate
 	for _, r := range expected.Roots {

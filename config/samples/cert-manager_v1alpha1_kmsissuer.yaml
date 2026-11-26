@@ -11,7 +11,7 @@ spec:
   # and the controller's --permitted-dns-domains.
   permittedDNSDomains:
     - example.internal
-  maxCertificateDuration: 2160h # 90 days
+  maxCertificateDuration: 720h # 30 days: at most the controller's --max-certificate-duration (default 720h)
   # Made by hand with `kms-ca intermediate`, signed by the root the controller pins
   # (--root-certificate). Replace it to renew.
   intermediateCertificate: |

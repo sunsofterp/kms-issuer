@@ -125,11 +125,17 @@ func main() {
 	}
 	certmanager.RecordRoots(access)
 	for _, root := range access.Roots() {
-		setupLog.Info("pinned root", "subject", root.Subject.String(), "notAfter", root.NotAfter, "permittedDNSDomains", root.PermittedDNSDomains)
+		setupLog.Info("pinned root", "subject", root.Subject.String(), "notBefore", root.NotBefore, "notAfter", root.NotAfter,
+			"permittedDNSDomains", root.PermittedDNSDomains)
 	}
 	for _, s := range access.Skipped() {
-		setupLog.Error(s.Reason, "PINNED ROOT SKIPPED: not valid now, nothing can chain to it; remove it from --root-certificate",
-			"index", s.Index, "subject", s.Root.Subject.String(), "notBefore", s.Root.NotBefore, "notAfter", s.Root.NotAfter)
+		if s.Expired {
+			setupLog.Error(s.Reason, "PINNED ROOT EXPIRED: nothing can chain to it; remove it from --root-certificate",
+				"index", s.Index, "subject", s.Root.Subject.String(), "notAfter", s.Root.NotAfter)
+			continue
+		}
+		setupLog.Info("pinned root not valid yet: intermediates may chain to it from its notBefore",
+			"index", s.Index, "subject", s.Root.Subject.String(), "notBefore", s.Root.NotBefore)
 	}
 	// Watch and cache namespaced objects (KMSIssuers, CertificateRequests) in the
 	// allowed namespaces only: nothing elsewhere is read, let alone written.

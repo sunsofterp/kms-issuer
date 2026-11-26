@@ -239,7 +239,6 @@ func checkDNSNames(requested []string, iss *Issuer) ([]string, error) {
 	return names, nil
 }
 
-// permitted reports whether host equals a domain or is a subdomain of one.
 // validHostname accepts letters, digits and hyphens in labels of 1-63 characters,
 // no leading or trailing hyphen, no empty label, no trailing dot.
 func validHostname(host string) bool {

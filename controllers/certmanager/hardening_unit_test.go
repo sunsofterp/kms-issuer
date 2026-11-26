@@ -61,6 +61,13 @@ func unitCeilings(domains ...string) Ceilings {
 // makeRoot makes another root on a new key, valid from notBefore for d.
 func makeRoot(t *testing.T, u *unitCA, alias, name string, notBefore time.Time, d time.Duration) *x509.Certificate {
 	t.Helper()
+	root, _ := makeRootKey(t, u, alias, name, notBefore, d)
+	return root
+}
+
+// makeRootKey is makeRoot, also returning the new root's key.
+func makeRootKey(t *testing.T, u *unitCA, alias, name string, notBefore time.Time, d time.Duration) (*x509.Certificate, string) {
+	t.Helper()
 	key, err := u.ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: alias, OwnerUID: "t"})
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +78,7 @@ func makeRoot(t *testing.T, u *unitCA, alias, name string, notBefore time.Time, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return root
+	return root, key
 }
 
 // selfSign signs a root template, after mutate, with the unit CA's root key.
@@ -96,8 +103,9 @@ func selfSign(t *testing.T, u *unitCA, mutate func(*x509.Certificate)) *x509.Cer
 	return cert
 }
 
-// An expired root left in the pin during a root replacement is skipped, not
-// fatal; with no valid root left, startup fails. Structural faults stay fatal.
+// An expired root left in the pin during a root replacement, or a new one not valid
+// yet, is reported, not fatal; with no valid root, startup fails. Structural
+// faults stay fatal.
 func TestNewAccessRoots(t *testing.T) {
 	u := newUnitCA(t)
 	old := makeRoot(t, u, "alias/old-root", "Old Root", unitNow.Add(-2*365*24*time.Hour), 365*24*time.Hour)
@@ -107,11 +115,14 @@ func TestNewAccessRoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an expired and a not-yet-valid root beside a valid one: %v", err)
 	}
-	if len(a.Roots()) != 1 || !a.Roots()[0].Equal(u.root) {
-		t.Errorf("roots in use: %d, want only the valid one", len(a.Roots()))
+	if now := a.RootsAt(unitNow); len(now) != 1 || !now[0].Equal(u.root) {
+		t.Errorf("roots valid now: %d, want only the current one", len(now))
 	}
-	if s := a.Skipped(); len(s) != 2 || s[0].Index != 1 || s[1].Index != 3 {
-		t.Errorf("skipped: %+v, want roots 1 and 3", s)
+	if later := a.RootsAt(unitNow.Add(48 * time.Hour)); len(later) != 2 {
+		t.Errorf("roots valid once the new one starts: %d, want 2", len(later))
+	}
+	if s := a.Skipped(); len(s) != 2 || s[0].Index != 1 || !s[0].Expired || s[1].Index != 3 || s[1].Expired {
+		t.Errorf("skipped: %+v, want root 1 expired and root 3 not yet valid", s)
 	}
 
 	if _, err := NewAccess([]string{"default"}, []string{u.issuingKey}, unitCeilings(), []*x509.Certificate{old}, unitNow); err == nil {
@@ -136,6 +147,70 @@ func TestNewAccessRoots(t *testing.T) {
 	}
 }
 
+// At signing time an intermediate chains only to a root valid then: never to an
+// expired one, and to a new one from its notBefore with no new Access (no
+// restart). An expired root's key is still refused as an issuing key.
+func TestIntermediatesUnderSkippedRoots(t *testing.T) {
+	u := newUnitCA(t)
+	old, oldKey := makeRootKey(t, u, "alias/old-root", "Old Root", unitNow.Add(-365*24*time.Hour), 365*24*time.Hour+time.Hour)
+	future, futureKey := makeRootKey(t, u, "alias/future-root", "Future Root", unitNow.Add(24*time.Hour), 365*24*time.Hour)
+	in := func(name string, from time.Time) *kmsca.CAInput {
+		return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: []string{"example.internal"}, Duration: 48 * time.Hour, Now: from}
+	}
+	// Hand-signed under the old root, outliving it (kms-ca refuses to make this),
+	// so that only the root's expiry can refuse it.
+	tmpl, err := kmsca.CATemplate(in("Under Old", unitNow.Add(-time.Hour)), kmsca.Intermediate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuingPub, err := u.ca.PublicKey(context.TODO(), u.issuingKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	underOld, err := u.ca.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{KeyID: oldKey, Cert: tmpl, Parent: old, PublicKey: issuingPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !underOld.NotAfter.After(old.NotAfter.Add(time.Minute)) {
+		t.Fatal("test setup: the intermediate must outlive the old root")
+	}
+	underFuture, err := u.ca.MakeIntermediate(context.TODO(), futureKey, future, u.issuingKey, in("Under Future", unitNow.Add(25*time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := NewAccess([]string{"default"}, []string{u.issuingKey, oldKey}, unitCeilings(), []*x509.Certificate{old, u.root, future}, unitNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer := func(keyID string, inter *x509.Certificate) *kmsiapi.KMSIssuer {
+		return &kmsiapi.KMSIssuer{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "i"},
+			Spec: kmsiapi.KMSIssuerSpec{KeyID: keyID, IntermediateCertificate: string(encodeForTest(inter.Raw)),
+				PermittedDNSDomains: []string{"example.internal"}},
+		}
+	}
+	afterOldExpired := old.NotAfter.Add(time.Minute)
+	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underOld), afterOldExpired); err == nil {
+		t.Error("an intermediate under an expired root verified")
+	}
+	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underFuture), unitNow.Add(25*time.Hour+time.Minute)); err != nil {
+		t.Errorf("an intermediate under a root that became valid after startup: %v", err)
+	}
+	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underFuture), unitNow.Add(time.Hour)); err == nil {
+		t.Error("an intermediate under a root not valid yet verified")
+	}
+
+	// The expired old root's key as an issuing key, under the current root.
+	onOldKey, err := u.ca.MakeIntermediate(context.TODO(), u.rootKey, u.root, oldKey, in("On Old Root Key", unitNow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = verifyIssuer(context.TODO(), u.ca, a, issuer(oldKey, onOldKey), afterOldExpired)
+	if err == nil || !strings.Contains(err.Error(), "root key") {
+		t.Errorf("an expired root's key as the issuing key: %v", err)
+	}
+}
+
 // Permitted domains and the duration ceilings are checked at startup.
 func TestNewAccessCeilings(t *testing.T) {
 	u := newUnitCA(t)
@@ -156,6 +231,10 @@ func TestNewAccessCeilings(t *testing.T) {
 	c.MaxCertificateDuration = kmsca.MaxIntermediateDuration / 2
 	if _, err := NewAccess([]string{"default"}, []string{u.issuingKey}, c, roots, unitNow); err == nil {
 		t.Error("a leaf maximum of half the intermediate maximum accepted")
+	}
+	c.MaxCertificateDuration = 1401600 * time.Hour // doubled, this overflows
+	if _, err := NewAccess([]string{"default"}, []string{u.issuingKey}, c, roots, unitNow); err == nil {
+		t.Error("a leaf maximum that overflows when doubled accepted")
 	}
 	c.MaxCertificateDuration = kmsca.MaxIntermediateDuration/2 - time.Second
 	if _, err := NewAccess([]string{"default"}, []string{u.issuingKey}, c, roots, unitNow); err != nil {
@@ -303,6 +382,60 @@ func TestSignedOnceKeepsItsChain(t *testing.T) {
 	inter.AddCert(chain[1])
 	if _, err := chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, CurrentTime: unitNow.Add(2 * time.Hour)}); err != nil {
 		t.Errorf("the chain handed out does not verify to the root: %v", err)
+	}
+}
+
+// A kept certificate the issuer would no longer sign (narrowed before the retry)
+// is dropped and a new one signed under the issuer as it is now.
+func TestKeptCertificateDroppedWhenIssuerNarrowed(t *testing.T) {
+	h := newRequestHarness(t, unitNow.Add(time.Hour))
+	h.failNext = func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+		return errors.New("injected: status write failed")
+	}
+	if err := h.reconcile(); err == nil {
+		t.Fatal("the failed write was not reported")
+	}
+	issuer := &kmsiapi.KMSIssuer{}
+	if err := h.fc.Get(context.TODO(), client.ObjectKeyFromObject(h.issuer), issuer); err != nil {
+		t.Fatal(err)
+	}
+	issuer.Spec.MaxCertificateDuration = &metav1.Duration{Duration: 12 * time.Hour} // the kept leaf is 24h
+	if err := h.fc.Update(context.TODO(), issuer); err != nil {
+		t.Fatal(err)
+	}
+	// The request still asks for 24h, which the narrowed issuer refuses: it fails,
+	// and the kept 24h certificate is never handed out.
+	_ = h.reconcile()
+	if n := h.kms.count(h.u.issuingKey); n != 1 {
+		t.Errorf("signed %d times, want once", n)
+	}
+	if cr := h.request(t); len(cr.Status.Certificate) != 0 {
+		t.Error("the kept certificate was recorded after the issuer was narrowed")
+	}
+	if h.kept() {
+		t.Error("the unacceptable certificate is still kept")
+	}
+}
+
+func TestStillAcceptable(t *testing.T) {
+	leaf := &x509.Certificate{DNSNames: []string{"svc.example.internal"}, NotBefore: unitNow, NotAfter: unitNow.Add(24 * time.Hour)}
+	wild := &x509.Certificate{DNSNames: []string{"*.example.internal"}, NotBefore: unitNow, NotAfter: unitNow.Add(24 * time.Hour)}
+	issuer := func(domains []string, wildcards bool) *kmsiapi.KMSIssuer {
+		return &kmsiapi.KMSIssuer{Spec: kmsiapi.KMSIssuerSpec{PermittedDNSDomains: domains, AllowWildcards: wildcards}}
+	}
+	day := settings{maxCertificateDuration: 24 * time.Hour}
+	if why := stillAcceptable(leaf, issuer([]string{"example.internal"}, false), day, unitNow.Add(time.Hour)); why != "" {
+		t.Errorf("acceptable leaf refused: %s", why)
+	}
+	for name, why := range map[string]string{
+		"under an hour left": stillAcceptable(leaf, issuer([]string{"example.internal"}, false), day, unitNow.Add(23*time.Hour+time.Minute)),
+		"longer than now":    stillAcceptable(leaf, issuer([]string{"example.internal"}, false), settings{maxCertificateDuration: 12 * time.Hour}, unitNow),
+		"a name now outside": stillAcceptable(leaf, issuer([]string{"other.internal"}, false), day, unitNow),
+		"wildcards now off":  stillAcceptable(wild, issuer([]string{"example.internal"}, false), day, unitNow),
+	} {
+		if why == "" {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }
 

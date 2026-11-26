@@ -107,6 +107,9 @@ func TestCheckIssuerCeilings(t *testing.T) {
 	}
 	refused := map[string]func(*kmsiapi.KMSIssuer){
 		"a TLD":           func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{"com"} },
+		"a wildcard":      func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{"*.fleet.internal"} },
+		"a leading dot":   func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{".fleet.internal"} },
+		"upper case":      func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{"SSO.fleet.internal"} },
 		"a parent domain": func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{"internal"} },
 		"a suffix trick":  func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{"evilfleet.internal"} },
 		"one outside":     func(i *kmsiapi.KMSIssuer) { i.Spec.PermittedDNSDomains = []string{"fleet.internal", "example.com"} },

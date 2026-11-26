@@ -6,8 +6,8 @@ metadata:
   namespace: default
 spec:
   secretName: example-internal-tls
-  duration: 2160h # 90 days, the issuer's default maximum
-  renewBefore: 360h # 15d
+  duration: 720h # 30 days, within the controller's default --max-certificate-duration
+  renewBefore: 240h # 10d
   isCA: false
   privateKey:
     algorithm: ECDSA
