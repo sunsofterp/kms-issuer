@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,8 +47,12 @@ import (
 const usage = `usage:
   kms-ca root --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 175200h]
   kms-ca intermediate --root-key-id ID --root-certificate FILE --key-id ID --common-name NAME --domains D[,D...] --out FILE [--duration 4392h]
-  kms-ca show FILE
-`
+  kms-ca show FILE`
+
+// The subcommands.
+const (
+	cmdRoot = "root"
+)
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
@@ -61,7 +66,7 @@ func run(args []string, out io.Writer) error {
 		return errors.New(usage)
 	}
 	switch args[0] {
-	case "root":
+	case cmdRoot:
 		return root(args[1:], out)
 	case "intermediate":
 		return intermediate(args[1:], out)
@@ -73,8 +78,7 @@ func run(args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		describe(out, cert)
-		return nil
+		return describe(out, cert)
 	}
 	return errors.New(usage)
 }
@@ -138,7 +142,7 @@ func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, string, error) {
 	if c.endpoint != "" {
 		return kmsca.NewKMSCA(&cfg), "(test endpoint " + c.endpoint + ")", nil
 	}
-	endpoint, err := resolvedKMSEndpoint(ctx, cfg)
+	endpoint, err := resolvedKMSEndpoint(ctx, &cfg)
 	if err != nil {
 		return nil, "", err
 	}
@@ -194,7 +198,7 @@ func (c *common) loadConfig(ctx context.Context) (aws.Config, error) {
 	if c.endpoint != "" {
 		return cfg, nil
 	}
-	if err := refuseRedirects(cfg, os.Environ()); err != nil {
+	if err := refuseRedirects(&cfg, os.Environ()); err != nil {
 		return aws.Config{}, err
 	}
 	return cfg, nil
@@ -213,7 +217,7 @@ func proxyless() *awshttp.BuildableClient {
 // the profile, a custom CA bundle (AWS_CA_BUNDLE or ca_bundle), SSL_CERT_FILE or
 // SSL_CERT_DIR, and, as the SDK resolves them, the KMS and STS clients'
 // endpoints. The root key must only ever be used through AWS.
-func refuseRedirects(cfg aws.Config, environ []string) error {
+func refuseRedirects(cfg *aws.Config, environ []string) error {
 	const fix = "kms-ca only talks to AWS's own endpoints with the system's trusted CAs; run it from a clean environment"
 	for _, kv := range environ {
 		name, value, _ := strings.Cut(kv, "=")
@@ -240,8 +244,8 @@ func refuseRedirects(cfg aws.Config, environ []string) error {
 		}
 	}
 	for service, ep := range map[string]*string{
-		"KMS": kms.NewFromConfig(cfg).Options().BaseEndpoint,
-		"STS": sts.NewFromConfig(cfg).Options().BaseEndpoint,
+		"KMS": kms.NewFromConfig(*cfg).Options().BaseEndpoint,
+		"STS": sts.NewFromConfig(*cfg).Options().BaseEndpoint,
 	} {
 		if ep != nil {
 			return fmt.Errorf("the AWS configuration overrides the %s endpoint (%s): %s", service, aws.ToString(ep), fix)
@@ -252,8 +256,8 @@ func refuseRedirects(cfg aws.Config, environ []string) error {
 
 // resolvedKMSEndpoint is the endpoint the KMS client resolves for this
 // configuration, with its FIPS and dual-stack settings.
-func resolvedKMSEndpoint(ctx context.Context, cfg aws.Config) (string, error) {
-	o := kms.NewFromConfig(cfg).Options()
+func resolvedKMSEndpoint(ctx context.Context, cfg *aws.Config) (string, error) {
+	o := kms.NewFromConfig(*cfg).Options()
 	ep, err := o.EndpointResolverV2.ResolveEndpoint(ctx, kms.EndpointParameters{
 		Region:       aws.String(o.Region),
 		UseFIPS:      aws.Bool(o.EndpointOptions.UseFIPSEndpoint == aws.FIPSEndpointStateEnabled),
@@ -266,7 +270,7 @@ func resolvedKMSEndpoint(ctx context.Context, cfg aws.Config) (string, error) {
 }
 
 func root(args []string, out io.Writer) error {
-	fs := flag.NewFlagSet("root", flag.ContinueOnError)
+	fs := flag.NewFlagSet(cmdRoot, flag.ContinueOnError)
 	var c common
 	c.register(fs, 20*365*24*time.Hour)
 	if err := fs.Parse(args); err != nil {
@@ -292,9 +296,10 @@ func root(args []string, out io.Writer) error {
 	if err := finish(f, cert); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "wrote %s\n  signed by:    %s (root key)\n  as:           %s\n", c.outFile, c.keyID, identity)
-	describe(out, cert)
-	return nil
+	if _, err := fmt.Fprintf(out, "wrote %s\n  signed by:    %s (root key)\n  as:           %s\n", c.outFile, c.keyID, identity); err != nil {
+		return err
+	}
+	return describe(out, cert)
 }
 
 func intermediate(args []string, out io.Writer) error {
@@ -339,7 +344,7 @@ func intermediate(args []string, out io.Writer) error {
 		return discard(f, err)
 	}
 	// Check it exactly as the controller will before handing it over.
-	if _, err := kmsca.ValidateIntermediate(cert, kmsca.ExpectedIntermediate{
+	if _, err := kmsca.ValidateIntermediate(cert, &kmsca.ExpectedIntermediate{
 		Roots: []*x509.Certificate{rootCert}, PublicKey: pub, AllowedDomains: rootCert.PermittedDNSDomains, Now: time.Now(),
 	}); err != nil {
 		return discard(f, fmt.Errorf("the new intermediate does not validate: %w", err))
@@ -347,22 +352,22 @@ func intermediate(args []string, out io.Writer) error {
 	if err := finish(f, cert); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "wrote %s\n  for key:      %s (issuing key)\n  signed by:    %s (root key)\n  as:           %s\n",
-		c.outFile, c.keyID, rootKeyID, identity)
-	describe(out, cert)
-	return nil
+	if _, err := fmt.Fprintf(out, "wrote %s\n  for key:      %s (issuing key)\n  signed by:    %s (root key)\n  as:           %s\n",
+		c.outFile, c.keyID, rootKeyID, identity); err != nil {
+		return err
+	}
+	return describe(out, cert)
 }
 
 // create makes the output file, failing if it exists, before anything is signed.
 func create(file string) (*os.File, error) {
-	return os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	return os.OpenFile(filepath.Clean(file), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
-// discard removes an output file left empty by a failure.
+// discard removes an output file left empty by a failure, reporting a file it
+// couldn't close or remove beside the failure.
 func discard(f *os.File, err error) error {
-	f.Close()
-	os.Remove(f.Name())
-	return err
+	return errors.Join(err, f.Close(), os.Remove(f.Name()))
 }
 
 func finish(f *os.File, cert *x509.Certificate) error {
@@ -373,7 +378,7 @@ func finish(f *os.File, cert *x509.Certificate) error {
 }
 
 func readCertificate(file string) (*x509.Certificate, error) {
-	data, err := os.ReadFile(file)
+	data, err := os.ReadFile(filepath.Clean(file))
 	if err != nil {
 		return nil, err
 	}
@@ -384,7 +389,7 @@ func readCertificate(file string) (*x509.Certificate, error) {
 	return cert, nil
 }
 
-func describe(out io.Writer, cert *x509.Certificate) {
+func describe(out io.Writer, cert *x509.Certificate) error {
 	sum := sha256.Sum256(cert.Raw)
 	spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 	pathLen := "unlimited"
@@ -397,26 +402,29 @@ func describe(out io.Writer, cert *x509.Certificate) {
 		case x509.ExtKeyUsageServerAuth:
 			ekus = append(ekus, "server auth")
 		default:
-			ekus = append(ekus, fmt.Sprint(e))
+			ekus = append(ekus, e.String())
 		}
 	}
 	var excludedIPs []string
 	for _, r := range cert.ExcludedIPRanges {
 		excludedIPs = append(excludedIPs, r.String())
 	}
-	fmt.Fprintf(out, "  subject:          %s\n", cert.Subject)
-	fmt.Fprintf(out, "  issuer:           %s\n", cert.Issuer)
-	fmt.Fprintf(out, "  serial:           %s\n", cert.SerialNumber.Text(16))
-	fmt.Fprintf(out, "  valid:            %s to %s (%s)\n", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339), cert.NotAfter.Sub(cert.NotBefore))
-	fmt.Fprintf(out, "  CA:               %t, path length %s\n", cert.IsCA, pathLen)
-	fmt.Fprintf(out, "  key usage:        cert sign %t, CRL sign %t\n", cert.KeyUsage&x509.KeyUsageCertSign != 0, cert.KeyUsage&x509.KeyUsageCRLSign != 0)
-	fmt.Fprintf(out, "  extended usage:   %s\n", orNone(ekus))
-	fmt.Fprintf(out, "  DNS constraints:  %s (critical: %t)\n", orNone(cert.PermittedDNSDomains), cert.PermittedDNSDomainsCritical)
-	fmt.Fprintf(out, "  URI constraints:  %s\n", orNone(cert.PermittedURIDomains))
-	fmt.Fprintf(out, "  email constraints: %s\n", orNone(cert.PermittedEmailAddresses))
-	fmt.Fprintf(out, "  excluded IPs:     %s\n", orNone(excludedIPs))
-	fmt.Fprintf(out, "  public key sha256: %s\n", hex.EncodeToString(spki[:]))
-	fmt.Fprintf(out, "  certificate sha256: %s\n", hex.EncodeToString(sum[:]))
+	var b strings.Builder
+	fmt.Fprintf(&b, "  subject:          %s\n", cert.Subject)
+	fmt.Fprintf(&b, "  issuer:           %s\n", cert.Issuer)
+	fmt.Fprintf(&b, "  serial:           %s\n", cert.SerialNumber.Text(16))
+	fmt.Fprintf(&b, "  valid:            %s to %s (%s)\n", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339), cert.NotAfter.Sub(cert.NotBefore))
+	fmt.Fprintf(&b, "  CA:               %t, path length %s\n", cert.IsCA, pathLen)
+	fmt.Fprintf(&b, "  key usage:        cert sign %t, CRL sign %t\n", cert.KeyUsage&x509.KeyUsageCertSign != 0, cert.KeyUsage&x509.KeyUsageCRLSign != 0)
+	fmt.Fprintf(&b, "  extended usage:   %s\n", orNone(ekus))
+	fmt.Fprintf(&b, "  DNS constraints:  %s (critical: %t)\n", orNone(cert.PermittedDNSDomains), cert.PermittedDNSDomainsCritical)
+	fmt.Fprintf(&b, "  URI constraints:  %s\n", orNone(cert.PermittedURIDomains))
+	fmt.Fprintf(&b, "  email constraints: %s\n", orNone(cert.PermittedEmailAddresses))
+	fmt.Fprintf(&b, "  excluded IPs:     %s\n", orNone(excludedIPs))
+	fmt.Fprintf(&b, "  public key sha256: %s\n", hex.EncodeToString(spki[:]))
+	fmt.Fprintf(&b, "  certificate sha256: %s\n", hex.EncodeToString(sum[:]))
+	_, err := io.WriteString(out, b.String())
+	return err
 }
 
 func orNone(list []string) string {

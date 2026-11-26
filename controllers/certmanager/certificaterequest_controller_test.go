@@ -36,7 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	fakeclock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -49,7 +49,7 @@ var _ = Context("CertificateRequestReconciler", func() {
 	var issuerKey client.ObjectKey
 
 	BeforeEach(func() {
-		issuerKey = client.ObjectKey{Name: "cr-issuer", Namespace: "default"}
+		issuerKey = client.ObjectKey{Name: "cr-issuer", Namespace: testNamespace}
 		issuer := &kmsiapi.KMSIssuer{}
 		if err := k8sClient.Get(context.Background(), issuerKey, issuer); err != nil {
 			Expect(k8sClient.Create(context.Background(), newIssuer(issuerKey.Namespace, issuerKey.Name, allowedKeyID))).Should(Succeed())
@@ -67,7 +67,7 @@ var _ = Context("CertificateRequestReconciler", func() {
 		Expect(k8sClient.Create(context.Background(), cr)).Should(Succeed())
 		if approve {
 			Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cr), cr)).Should(Succeed())
-			apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionApproved, cmmeta.ConditionTrue, "Approved", "")
+			apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionApproved, cmmeta.ConditionTrue, reasonApproved, "")
 			Expect(k8sClient.Status().Update(context.Background(), cr)).Should(Succeed())
 		}
 		return client.ObjectKeyFromObject(cr)
@@ -109,7 +109,7 @@ var _ = Context("CertificateRequestReconciler", func() {
 	}
 
 	It("signs an approved request within policy", func() {
-		key := create("cr-good", nil, sans("svc.example.internal"), true)
+		key := create("cr-good", nil, sans(testHost), true)
 		Eventually(func() int { return len(get(key).Status.Certificate) }, time.Second*5, time.Millisecond*100).ShouldNot(BeZero())
 
 		cr := get(key)
@@ -124,24 +124,24 @@ var _ = Context("CertificateRequestReconciler", func() {
 		Expect(err).To(BeNil())
 		Expect(intermediate.MaxPathLenZero).To(BeTrue())
 		Expect(leaf.IsCA).To(BeFalse())
-		Expect(leaf.DNSNames).To(Equal([]string{"svc.example.internal"}))
+		Expect(leaf.DNSNames).To(Equal([]string{testHost}))
 		root, err := ParseCertificate(cr.Status.CA)
 		Expect(err).To(BeNil())
 		Expect(root.Equal(testRoot)).To(BeTrue())
 		roots, inters := x509.NewCertPool(), x509.NewCertPool()
 		roots.AddCert(root)
 		inters.AddCert(intermediate)
-		_, err = leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: inters, DNSName: "svc.example.internal"})
+		_, err = leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: inters, DNSName: testHost})
 		Expect(err).To(BeNil())
 		Expect(leaf.NotAfter.After(intermediate.NotAfter)).To(BeFalse())
 	})
 
 	It("never signs an unapproved request", func() {
-		expectUntouched(create("cr-unapproved", nil, sans("svc.example.internal"), false))
+		expectUntouched(create("cr-unapproved", nil, sans(testHost), false))
 	})
 
 	It("refuses a CA request", func() {
-		expectFailed(create("cr-ca", func(cr *cmapi.CertificateRequest) { cr.Spec.IsCA = true }, sans("svc.example.internal"), true))
+		expectFailed(create("cr-ca", func(cr *cmapi.CertificateRequest) { cr.Spec.IsCA = true }, sans(testHost), true))
 	})
 
 	It("refuses a name outside the permitted domains", func() {
@@ -151,31 +151,31 @@ var _ = Context("CertificateRequestReconciler", func() {
 	It("refuses a duration over the issuer's maximum", func() {
 		expectFailed(create("cr-long", func(cr *cmapi.CertificateRequest) {
 			cr.Spec.Duration = &metav1.Duration{Duration: 20 * 365 * 24 * time.Hour}
-		}, sans("svc.example.internal"), true))
+		}, sans(testHost), true))
 	})
 
 	It("refuses a usage a server certificate doesn't need", func() {
 		expectFailed(create("cr-usage", func(cr *cmapi.CertificateRequest) {
 			cr.Spec.Usages = []cmapi.KeyUsage{cmapi.UsageCertSign}
-		}, sans("svc.example.internal"), true))
+		}, sans(testHost), true))
 	})
 
 	It("leaves requests with an empty issuerRef group alone", func() {
-		expectUntouched(create("cr-nogroup", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Group = "" }, sans("svc.example.internal"), true))
+		expectUntouched(create("cr-nogroup", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Group = "" }, sans(testHost), true))
 	})
 
 	It("leaves requests for another group alone", func() {
-		expectUntouched(create("cr-othergroup", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Group = "cert-manager.io" }, sans("svc.example.internal"), true))
+		expectUntouched(create("cr-othergroup", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Group = "cert-manager.io" }, sans(testHost), true))
 	})
 
 	It("refuses another kind in its group", func() {
-		expectFailed(create("cr-kind", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Kind = "KMSClusterIssuer" }, sans("svc.example.internal"), true))
+		expectFailed(create("cr-kind", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Kind = "KMSClusterIssuer" }, sans(testHost), true))
 	})
 
 	It("never signs for an issuer whose key is not allowed (it waits, pending)", func() {
-		otherIssuer := client.ObjectKey{Name: "cr-issuer-other-key", Namespace: "default"}
+		otherIssuer := client.ObjectKey{Name: "cr-issuer-other-key", Namespace: testNamespace}
 		Expect(k8sClient.Create(context.Background(), newIssuer(otherIssuer.Namespace, otherIssuer.Name, otherKeyID))).Should(Succeed())
-		expectNeverIssued(create("cr-other-key", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Name = otherIssuer.Name }, sans("svc.example.internal"), true))
+		expectNeverIssued(create("cr-other-key", func(cr *cmapi.CertificateRequest) { cr.Spec.IssuerRef.Name = otherIssuer.Name }, sans(testHost), true))
 	})
 })
 
@@ -217,10 +217,10 @@ func TestRequestShouldBeProcessed(t *testing.T) {
 		},
 		"if request has been denied, exit false and update ready reason with ready denied": {
 			conds: []cmapi.CertificateRequestCondition{
-				{Type: cmapi.CertificateRequestConditionDenied, Status: cmmeta.ConditionTrue, Reason: "Denied"},
+				{Type: cmapi.CertificateRequestConditionDenied, Status: cmmeta.ConditionTrue, Reason: reasonDenied},
 			},
 			expConds: []cmapi.CertificateRequestCondition{
-				{Type: cmapi.CertificateRequestConditionDenied, Status: cmmeta.ConditionTrue, Reason: "Denied"},
+				{Type: cmapi.CertificateRequestConditionDenied, Status: cmmeta.ConditionTrue, Reason: reasonDenied},
 				{
 					Type: cmapi.CertificateRequestConditionReady, Status: cmmeta.ConditionFalse, Reason: cmapi.CertificateRequestReasonDenied,
 					Message: "The CertificateRequest was denied by an approval controller", LastTransitionTime: &metav1.Time{Time: fixedTime},
@@ -235,10 +235,10 @@ func TestRequestShouldBeProcessed(t *testing.T) {
 		},
 		"if request has been approved, return true": {
 			conds: []cmapi.CertificateRequestCondition{
-				{Type: cmapi.CertificateRequestConditionApproved, Status: cmmeta.ConditionTrue, Reason: "Approved"},
+				{Type: cmapi.CertificateRequestConditionApproved, Status: cmmeta.ConditionTrue, Reason: reasonApproved},
 			},
 			expConds: []cmapi.CertificateRequestCondition{
-				{Type: cmapi.CertificateRequestConditionApproved, Status: cmmeta.ConditionTrue, Reason: "Approved"},
+				{Type: cmapi.CertificateRequestConditionApproved, Status: cmmeta.ConditionTrue, Reason: reasonApproved},
 			},
 			expShouldProcess: true,
 		},
@@ -262,7 +262,7 @@ func TestRequestShouldBeProcessed(t *testing.T) {
 				WithScheme(scheme).
 				Build()
 
-			fakeRecorder := record.NewFakeRecorder(1)
+			fakeRecorder := events.NewFakeRecorder(1)
 
 			c := CertificateRequestReconciler{
 				Client:   fclient,

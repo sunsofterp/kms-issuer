@@ -61,6 +61,21 @@ type Ceilings struct {
 // as an issuing key.
 func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Certificate, now time.Time) (*Access, error) {
 	a := &Access{namespaces: map[string]bool{}, keyIDs: map[string]bool{}}
+	if err := a.allow(namespaces, keyIDs); err != nil {
+		return nil, err
+	}
+	if err := a.setCeilings(&ceilings); err != nil {
+		return nil, err
+	}
+	if err := a.pin(roots, now); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// allow records the allowed issuer namespaces and KMS keys (never an alias); at
+// least one of each is required.
+func (a *Access) allow(namespaces, keyIDs []string) error {
 	for _, ns := range namespaces {
 		if ns = strings.TrimSpace(ns); ns != "" {
 			a.namespaces[ns] = true
@@ -72,49 +87,67 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Cer
 			continue
 		}
 		if isAlias(id) {
-			return nil, fmt.Errorf("%q is an alias; allow keys by key ID or ARN", id)
+			return fmt.Errorf("%q is an alias; allow keys by key ID or ARN", id)
 		}
 		a.keyIDs[id] = true
 	}
 	if len(a.namespaces) == 0 {
-		return nil, fmt.Errorf("at least one allowed issuer namespace is required")
+		return fmt.Errorf("at least one allowed issuer namespace is required")
 	}
 	if len(a.keyIDs) == 0 {
-		return nil, fmt.Errorf("at least one allowed KMS key is required")
+		return fmt.Errorf("at least one allowed KMS key is required")
 	}
+	return nil
+}
+
+// setCeilings records the operator's ceilings after checking them: valid
+// permitted domains (at least one), an intermediate maximum within
+// kmsca.MaxIntermediateDuration, and a leaf maximum of whole seconds, at least
+// 1h, and less than half the intermediate maximum.
+func (a *Access) setCeilings(ceilings *Ceilings) error {
 	for _, d := range ceilings.PermittedDNSDomains {
 		d = strings.TrimSpace(d)
 		if err := kmsca.ValidConstraintDomain(d); err != nil {
-			return nil, fmt.Errorf("permitted DNS domain: %w", err)
+			return fmt.Errorf("permitted DNS domain: %w", err)
 		}
 		a.ceilings.PermittedDNSDomains = append(a.ceilings.PermittedDNSDomains, d)
 	}
 	if len(a.ceilings.PermittedDNSDomains) == 0 {
-		return nil, fmt.Errorf("at least one permitted DNS domain is required")
+		return fmt.Errorf("at least one permitted DNS domain is required")
 	}
 	if ceilings.MaxIntermediateDuration <= 0 || ceilings.MaxIntermediateDuration > kmsca.MaxIntermediateDuration {
-		return nil, fmt.Errorf("the maximum intermediate duration must be above zero and at most %s", kmsca.MaxIntermediateDuration)
+		return fmt.Errorf("the maximum intermediate duration must be above zero and at most %s", kmsca.MaxIntermediateDuration)
 	}
 	if ceilings.MaxCertificateDuration < time.Hour || ceilings.MaxCertificateDuration%time.Second != 0 {
-		return nil, fmt.Errorf("the maximum certificate duration must be whole seconds and at least 1h")
+		return fmt.Errorf("the maximum certificate duration must be whole seconds and at least 1h")
 	}
 	// Issuers warn from twice the leaf maximum before their intermediate expires: a
 	// full-length intermediate must start outside that window. (Compared without
 	// doubling, which could overflow.)
 	if ceilings.MaxCertificateDuration >= ceilings.MaxIntermediateDuration/2 {
-		return nil, fmt.Errorf("the maximum certificate duration %s must be less than half the maximum intermediate duration %s",
+		return fmt.Errorf("the maximum certificate duration %s must be less than half the maximum intermediate duration %s",
 			ceilings.MaxCertificateDuration, ceilings.MaxIntermediateDuration)
 	}
+	a.ceilings.AllowWildcards = ceilings.AllowWildcards
+	a.ceilings.MaxCertificateDuration = ceilings.MaxCertificateDuration
+	a.ceilings.MaxIntermediateDuration = ceilings.MaxIntermediateDuration
+	return nil
+}
+
+// pin records the pinned roots (after the ceilings: their constraints must be
+// inside the permitted domains). Structural faults are fatal; roots not valid now
+// are kept but reported (Skipped), and at least one must be valid now.
+func (a *Access) pin(roots []*x509.Certificate, now time.Time) error {
 	if len(roots) == 0 {
-		return nil, fmt.Errorf("at least one root certificate is required")
+		return fmt.Errorf("at least one root certificate is required")
 	}
 	for i, root := range roots {
 		if err := kmsca.ValidateRootStructure(root); err != nil {
-			return nil, fmt.Errorf("root certificate %d: %w", i+1, err)
+			return fmt.Errorf("root certificate %d: %w", i+1, err)
 		}
 		for _, d := range kmsca.RootConstraintDomains(root) {
 			if !domains.Within(d, a.ceilings.PermittedDNSDomains) {
-				return nil, fmt.Errorf("root certificate %d permits %q, outside the permitted DNS domains %v", i+1, d, a.ceilings.PermittedDNSDomains)
+				return fmt.Errorf("root certificate %d permits %q, outside the permitted DNS domains %v", i+1, d, a.ceilings.PermittedDNSDomains)
 			}
 		}
 		a.roots = append(a.roots, root)
@@ -123,12 +156,9 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Cer
 		}
 	}
 	if len(a.RootsAt(now)) == 0 {
-		return nil, fmt.Errorf("no pinned root certificate is valid now: %v", a.skipped[0].Reason)
+		return fmt.Errorf("no pinned root certificate is valid now: %v", a.skipped[0].Reason)
 	}
-	a.ceilings.AllowWildcards = ceilings.AllowWildcards
-	a.ceilings.MaxCertificateDuration = ceilings.MaxCertificateDuration
-	a.ceilings.MaxIntermediateDuration = ceilings.MaxIntermediateDuration
-	return a, nil
+	return nil
 }
 
 // Roots are all the pinned root certificates, valid now or not.

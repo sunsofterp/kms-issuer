@@ -54,7 +54,7 @@ var (
 	cancel    context.CancelFunc
 	ca        kmsca.KMSCA
 	// allowedKeyID is the only key the controllers under test may sign with, and
-	// "default" the only namespace; otherKeyID exists in KMS but is not allowed.
+	// testNamespace the only namespace; otherKeyID exists in KMS but is not allowed.
 	allowedKeyID string
 	otherKeyID   string
 	// testRoot is the pinned root (on its own key, rootKeyID); allowedIntermediate
@@ -66,7 +66,7 @@ var (
 	// testCeilings are the operator ceilings under test: example.internal only,
 	// no wildcards, 90-day certificates.
 	testCeilings = Ceilings{
-		PermittedDNSDomains:    []string{"example.internal"},
+		PermittedDNSDomains:    []string{testDomain},
 		MaxCertificateDuration: 90 * 24 * time.Hour,
 		// 183 days: less than twice the 90-day leaf maximum is refused.
 		MaxIntermediateDuration: 183 * 24 * time.Hour,
@@ -84,11 +84,11 @@ func intermediateFor(keyID string) string {
 // makeTwoTier makes the suite's root and its intermediates in the mock.
 func makeTwoTier(ca *kmsca.KMSCA) {
 	var err error
-	rootKeyID, err = ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/root", OwnerUID: "suite"})
+	rootKeyID, err = ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: rootAlias, OwnerUID: suiteOwner})
 	Expect(err).NotTo(HaveOccurred())
 	now := time.Now()
 	input := func(name string, d time.Duration) *kmsca.CAInput {
-		return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: []string{"example.internal"}, Duration: d, Now: now}
+		return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: []string{testDomain}, Duration: d, Now: now}
 	}
 	testRoot, err = ca.MakeRoot(context.TODO(), rootKeyID, input("Test Root", 20*365*24*time.Hour))
 	Expect(err).NotTo(HaveOccurred())
@@ -139,19 +139,19 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	ca.Client = mocks.New()
-	allowedKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/allowed", OwnerUID: "suite"})
+	allowedKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/allowed", OwnerUID: suiteOwner})
 	Expect(err).NotTo(HaveOccurred())
-	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other", OwnerUID: "suite"})
+	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other", OwnerUID: suiteOwner})
 	Expect(err).NotTo(HaveOccurred())
 	makeTwoTier(&ca)
-	access, err := NewAccess([]string{"default"}, []string{allowedKeyID}, testCeilings, []*x509.Certificate{testRoot}, time.Now())
+	access, err := NewAccess([]string{testNamespace}, []string{allowedKeyID}, testCeilings, []*x509.Certificate{testRoot}, time.Now())
 	Expect(err).NotTo(HaveOccurred())
 
 	err = (&CertificateRequestReconciler{
 		Client:    k8sManager.GetClient(),
 		APIReader: k8sManager.GetAPIReader(),
 		Log:       logf.Log,
-		Recorder:  k8sManager.GetEventRecorderFor("certificaterequests-controller"),
+		Recorder:  k8sManager.GetEventRecorder("certificaterequests-controller"),
 		KMSCA:     &ca,
 		Access:    access,
 		Clock:     clock.RealClock{},

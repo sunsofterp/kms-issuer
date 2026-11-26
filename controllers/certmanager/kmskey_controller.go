@@ -24,7 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -39,7 +39,7 @@ func NewKMSKeyReconciler(mgr manager.Manager, ca *kmsca.KMSCA) *KMSKeyReconciler
 		Client:   mgr.GetClient(),
 		Log:      ctrl.Log.WithName("controllers").WithName("kmskey_controller"),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("kmskey_controller"),
+		Recorder: mgr.GetEventRecorder("kmskey_controller"),
 		KMSCA:    ca,
 	}
 }
@@ -49,11 +49,12 @@ type KMSKeyReconciler struct {
 	client.Client
 	Log      logr.Logger
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	KMSCA    *kmsca.KMSCA
 }
 
 // Annotation for generating RBAC role for writing Events
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmskeys,verbs=get;list;watch;update
@@ -92,7 +93,7 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				switch {
 				case errors.Is(err, kmsca.ErrNotOwned):
 					// Never delete a key this KMSKey didn't create; let the object go.
-					r.Recorder.Event(kmsKey, core.EventTypeWarning, kmsiapi.KMSKeyReasonFailed,
+					r.Recorder.Eventf(kmsKey, nil, core.EventTypeWarning, kmsiapi.KMSKeyReasonFailed, actionReconcile,
 						"The alias points at a key this KMSKey did not create; the key was not deleted")
 				case err != nil:
 					return ctrl.Result{}, r.manageFailure(ctx, log, kmsKey, err, "Failed to delete the KMS key")
@@ -151,7 +152,7 @@ func (r *KMSKeyReconciler) manageSuccess(ctx context.Context, log logr.Logger, k
 	reason := kmsiapi.KMSKeyReasonIssued
 	msg := ""
 	log.Info("successfully reconciled kms key")
-	r.Recorder.Event(kmskey, core.EventTypeNormal, reason, msg)
+	r.Recorder.Eventf(kmskey, nil, core.EventTypeNormal, reason, actionReconcile, "%s", msg)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionTrue, reason, msg)
 	kmskey.Status.SetCondition(&ready)
 	return r.patchKeyStatus(ctx, kmskey)
@@ -163,7 +164,7 @@ func (r *KMSKeyReconciler) manageFailure(ctx context.Context, log logr.Logger, k
 	reason := kmsiapi.KMSKeyReasonFailed
 	msg = fmt.Sprintf("%s: %v", msg, issue)
 	log.Error(issue, msg)
-	r.Recorder.Event(kmskey, core.EventTypeWarning, reason, msg)
+	r.Recorder.Eventf(kmskey, nil, core.EventTypeWarning, reason, actionReconcile, "%s", msg)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, msg)
 	kmskey.Status.SetCondition(&ready)
 	return errors.Join(issue, r.patchKeyStatus(ctx, kmskey))

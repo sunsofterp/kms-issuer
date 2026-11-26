@@ -15,6 +15,7 @@ metadata:
   namespace: {{ $ns }}
 rules:
 - apiGroups:
+  - events.k8s.io
   - ""
   resources:
   - events
@@ -96,6 +97,7 @@ rules:
   - patch
   - update
 - apiGroups:
+  - events.k8s.io
   - ""
   resources:
   - events

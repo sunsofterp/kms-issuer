@@ -34,7 +34,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -59,7 +59,7 @@ type CertificateRequestReconciler struct {
 	// APIReader reads uncached, for the last check before signing.
 	APIReader client.Reader
 	Log       logr.Logger
-	Recorder  record.EventRecorder
+	Recorder  events.EventRecorder
 	KMSCA     *kmsca.KMSCA
 	Access    *Access
 	Clock     clock.Clock
@@ -98,6 +98,7 @@ func newSignedCertificate(uid types.UID, leaf *x509.Certificate, verified verifi
 }
 
 // Annotation for generating RBAC role for writing Events
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificaterequests,verbs=get;list;watch
@@ -144,71 +145,115 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, r.fail(ctx, cr, "issuerRef kind %q is not %s", cr.Spec.IssuerRef.Kind, issuerKind)
 	}
 
-	// The issuer is read uncached: a just-narrowed or just-deleted issuer must never
-	// sign once more from a stale copy.
-	issuer := kmsiapi.KMSIssuer{}
-	issuerName := types.NamespacedName{Namespace: req.Namespace, Name: cr.Spec.IssuerRef.Name}
-	if err = r.reader().Get(ctx, issuerName, &issuer); err != nil {
-		log.Error(err, "failed to retrieve KMSIssuer resource", "issuer", issuerName)
-		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to retrieve KMSIssuer resource %s: %v", issuerName, err)
-		return ctrl.Result{}, err
-	}
-	settings := issuerSettings(&issuer)
-	if !issuer.Status.IsReady() {
-		err = fmt.Errorf("KMSIssuer %s is not ready", issuerName)
-		log.Error(err, "issuer not ready")
-		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "KMSIssuer %s is not Ready", issuerName)
-		return ctrl.Result{}, err
-	}
-
-	// Verify the issuer here, at signing time, from its spec: never trust the issuer
-	// controller's earlier verdict or anything in its status. It must be within the
-	// operator's ceilings, and its intermediate for the KMS key, signed by a pinned
-	// root and within the ceilings. A failure leaves the request pending (it may be
-	// fixed), never failed.
-	verified, err := verifyIssuer(ctx, r.KMSCA, r.Access, &issuer, r.Clock.Now())
-	parent := verified.intermediate
+	issuer, verified, err := r.signingIssuer(ctx, log, cr)
 	if err != nil {
-		err = fmt.Errorf("KMSIssuer %s cannot sign now: %w", issuerName, err)
-		log.Error(err, "not signing")
-		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
 		return ctrl.Result{}, err
 	}
+	limits := issuerSettings(issuer)
 
 	// The cache may lag a signing that just happened: read the request fresh, so a
 	// second certificate is never signed for it.
-	if r.APIReader != nil {
-		fresh := new(cmapi.CertificateRequest)
-		if err := r.APIReader.Get(ctx, req.NamespacedName, fresh); err != nil {
-			return ctrl.Result{}, client.IgnoreNotFound(err)
-		}
-		if len(fresh.Status.Certificate) > 0 || fresh.ResourceVersion != cr.ResourceVersion {
-			return ctrl.Result{Requeue: true}, nil
-		}
+	current, err := r.stillUnsigned(ctx, cr)
+	if err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !current {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
-	// A certificate already signed for this request, whose recording failed, is
-	// recorded now instead of signing a second one, if the issuer as it is now
-	// would still sign it: at least an hour left, its names inside the issuer's
-	// domains (wildcards only if allowed), no longer than the issuer's maximum.
-	if pending, ok := r.signed.Load(req.NamespacedName); ok {
-		p := pending.(signedCertificate)
-		if p.uid == cr.UID {
-			why := keptChainCurrent(p, verified, r.Access, r.Clock.Now())
-			if why == "" {
-				why = stillAcceptable(p.leaf, &issuer, settings, r.Clock.Now())
-			}
-			if why == "" {
-				return r.record(ctx, log, req, &issuer, p)
-			}
-			log.Info("kept certificate no longer acceptable, signing a new one", "serial", p.serial, "reason", why)
-		}
-		r.signed.Delete(req.NamespacedName)
+	if p := r.keptCertificate(log, req, cr, issuer, &verified, limits); p != nil {
+		return r.record(ctx, log, req, issuer, p)
 	}
 
+	signed, err := r.sign(ctx, log, cr, issuer, verified.intermediate, limits)
+	if err != nil || signed == nil {
+		return ctrl.Result{}, err
+	}
+	p := newSignedCertificate(cr.UID, signed, verified)
+	r.signed.Store(req.NamespacedName, p)
+	return r.record(ctx, log, req, issuer, &p)
+}
+
+// signingIssuer returns the request's issuer and its verified chain, or an error
+// (the request left pending) if it can't sign now. The issuer is read uncached:
+// a just-narrowed or just-deleted issuer must never sign once more from a stale
+// copy. It is verified here, at signing time, from its spec: never trust the
+// issuer controller's earlier verdict or anything in its status. It must be
+// within the operator's ceilings, and its intermediate for the KMS key, signed by
+// a pinned root and within the ceilings. A failure leaves the request pending (it
+// may be fixed), never failed.
+func (r *CertificateRequestReconciler) signingIssuer(ctx context.Context, log logr.Logger, cr *cmapi.CertificateRequest) (*kmsiapi.KMSIssuer, verifiedIssuer, error) {
+	issuer := &kmsiapi.KMSIssuer{}
+	issuerName := types.NamespacedName{Namespace: cr.Namespace, Name: cr.Spec.IssuerRef.Name}
+	if err := r.reader().Get(ctx, issuerName, issuer); err != nil {
+		log.Error(err, "failed to retrieve KMSIssuer resource", "issuer", issuerName)
+		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "Failed to retrieve KMSIssuer resource %s: %v", issuerName, err)
+		return nil, verifiedIssuer{}, err
+	}
+	if !issuer.Status.IsReady() {
+		err := fmt.Errorf("KMSIssuer %s is not ready", issuerName)
+		log.Error(err, "issuer not ready")
+		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "KMSIssuer %s is not Ready", issuerName)
+		return nil, verifiedIssuer{}, err
+	}
+	verified, err := verifyIssuer(ctx, r.KMSCA, r.Access, issuer, r.Clock.Now())
+	if err != nil {
+		err = fmt.Errorf("KMSIssuer %s cannot sign now: %w", issuerName, err)
+		log.Error(err, "not signing")
+		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
+		return nil, verifiedIssuer{}, err
+	}
+	return issuer, verified, nil
+}
+
+// stillUnsigned reads the request fresh (when an uncached reader is set) and
+// reports whether it is unchanged and still has no certificate.
+func (r *CertificateRequestReconciler) stillUnsigned(ctx context.Context, cr *cmapi.CertificateRequest) (bool, error) {
+	if r.APIReader == nil {
+		return true, nil
+	}
+	fresh := new(cmapi.CertificateRequest)
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(cr), fresh); err != nil {
+		return false, err
+	}
+	return len(fresh.Status.Certificate) == 0 && fresh.ResourceVersion == cr.ResourceVersion, nil
+}
+
+// keptCertificate returns a certificate already signed for this request, whose
+// recording failed, if the issuer as it is now would still hand it out: its chain
+// current (keptChainCurrent), at least an hour left, its names inside the
+// issuer's domains (wildcards only if allowed), no longer than the issuer's
+// maximum. Otherwise it drops anything kept, and the request is signed again.
+func (r *CertificateRequestReconciler) keptCertificate(log logr.Logger, req ctrl.Request, cr *cmapi.CertificateRequest,
+	issuer *kmsiapi.KMSIssuer, verified *verifiedIssuer, limits settings) *signedCertificate {
+	pending, ok := r.signed.Load(req.NamespacedName)
+	if !ok {
+		return nil
+	}
+	p := pending.(signedCertificate)
+	if p.uid == cr.UID {
+		why := keptChainCurrent(&p, verified, r.Access, r.Clock.Now())
+		if why == "" {
+			why = stillAcceptable(p.leaf, issuer, limits, r.Clock.Now())
+		}
+		if why == "" {
+			return &p
+		}
+		log.Info("kept certificate no longer acceptable, signing a new one", "serial", p.serial, "reason", why)
+	}
+	r.signed.Delete(req.NamespacedName)
+	return nil
+}
+
+// sign builds the certificate from the request under the issuer's policy and has
+// the issuer's KMS key sign it. A request the policy refuses is failed for good
+// (nil certificate, and the status write's error); one that must wait, or a
+// signing failure, is left pending with an error, to be retried.
+func (r *CertificateRequestReconciler) sign(ctx context.Context, log logr.Logger, cr *cmapi.CertificateRequest,
+	issuer *kmsiapi.KMSIssuer, parent *x509.Certificate, limits settings) (*x509.Certificate, error) {
 	serial, err := kmsca.RandomSerial()
 	if err != nil {
-		return ctrl.Result{}, err
+		return nil, err
 	}
 	var duration metav1.Duration
 	if cr.Spec.Duration != nil {
@@ -224,12 +269,12 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 			IsCA:            cr.Spec.IsCA,
 			Usages:          usages,
 			Duration:        duration.Duration,
-			DefaultDuration: min(cmapi.DefaultCertificateDuration, settings.maxCertificateDuration),
+			DefaultDuration: min(cmapi.DefaultCertificateDuration, limits.maxCertificateDuration),
 		},
 		&policy.Issuer{
 			PermittedDNSDomains: issuer.Spec.PermittedDNSDomains,
 			AllowWildcards:      issuer.Spec.AllowWildcards,
-			MaxDuration:         settings.maxCertificateDuration,
+			MaxDuration:         limits.maxCertificateDuration,
 		},
 		parent, serial, r.Clock.Now(),
 	)
@@ -237,13 +282,13 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		if errors.Is(err, policy.ErrDenied) {
 			log.Info("request refused", "reason", err.Error(), "requester", cr.Spec.Username)
 			requestsRefused.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
-			return ctrl.Result{}, r.fail(ctx, cr, "%v", err)
+			return nil, r.fail(ctx, cr, "%v", err)
 		}
 		if errors.Is(err, policy.ErrWait) {
 			log.Info("request waits", "reason", err.Error())
-			_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
+			_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
 		}
-		return ctrl.Result{}, err
+		return nil, err
 	}
 
 	signed, err := r.KMSCA.SignCertificate(ctx, &kmsca.IssueCertificateInput{
@@ -254,8 +299,8 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	})
 	if err != nil {
 		log.Error(err, "failed to sign certificate request")
-		_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "Failed to sign the certificate (will retry): %v", err)
-		return ctrl.Result{}, err
+		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "Failed to sign the certificate (will retry): %v", err)
+		return nil, err
 	}
 
 	// The audit record of every issuance.
@@ -264,14 +309,12 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		"dnsNames", signed.DNSNames,
 		"notBefore", signed.NotBefore,
 		"notAfter", signed.NotAfter,
-		"issuer", issuerName.String(),
+		"issuer", client.ObjectKeyFromObject(issuer).String(),
 		"keyId", issuer.Spec.KeyID,
 		"requester", cr.Spec.Username,
 		"requesterGroups", cr.Spec.Groups,
 	)
-	p := newSignedCertificate(cr.UID, signed, verified)
-	r.signed.Store(req.NamespacedName, p)
-	return r.record(ctx, log, req, &issuer, p)
+	return signed, nil
 }
 
 // keptChainCurrent returns why a kept certificate's chain no longer matches the
@@ -280,7 +323,7 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 // intermediate on the same key is fine, another key is not), and the chain it is
 // handed out with must still be valid: its intermediate unexpired, its root a
 // pinned root valid now.
-func keptChainCurrent(p signedCertificate, verified verifiedIssuer, access *Access, now time.Time) string {
+func keptChainCurrent(p *signedCertificate, verified *verifiedIssuer, access *Access, now time.Time) string {
 	if err := p.leaf.CheckSignatureFrom(verified.intermediate); err != nil {
 		return "not signed by the issuer's current key"
 	}
@@ -325,7 +368,7 @@ func stillAcceptable(leaf *x509.Certificate, issuer *kmsiapi.KMSIssuer, s settin
 // handed out is the leaf then the intermediate that signed it; ca.crt is the
 // pinned root that intermediate chains to, the certificate clients trust. Both were
 // fixed when the leaf was signed.
-func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logger, req ctrl.Request, issuer *kmsiapi.KMSIssuer, p signedCertificate) (ctrl.Result, error) {
+func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logger, req ctrl.Request, issuer *kmsiapi.KMSIssuer, p *signedCertificate) (ctrl.Result, error) {
 	certPEM, rootPEM := p.certPEM, p.rootPEM
 	var cr *cmapi.CertificateRequest
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -352,7 +395,7 @@ func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logg
 	}
 	r.signed.Delete(req.NamespacedName)
 	certificatesIssued.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
-	r.Recorder.Event(cr, core.EventTypeNormal, cmapi.CertificateRequestReasonIssued, "Certificate issued")
+	r.Recorder.Eventf(cr, nil, core.EventTypeNormal, cmapi.CertificateRequestReasonIssued, actionSign, "Certificate issued")
 	return ctrl.Result{}, nil
 }
 
@@ -407,7 +450,7 @@ func (r *CertificateRequestReconciler) requestShouldBeProcessed(ctx context.Cont
 			nowTime := metav1.NewTime(r.Clock.Now())
 			cr.Status.FailureTime = &nowTime
 		}
-		return false, r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonDenied, "The CertificateRequest was denied by an approval controller")
+		return false, r.setStatus(ctx, cr, cmapi.CertificateRequestReasonDenied, "The CertificateRequest was denied by an approval controller")
 	}
 
 	if !apiutil.CertificateRequestIsApproved(cr) {
@@ -423,18 +466,15 @@ func (r *CertificateRequestReconciler) fail(ctx context.Context, cr *cmapi.Certi
 		nowTime := metav1.NewTime(r.Clock.Now())
 		cr.Status.FailureTime = &nowTime
 	}
-	return r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonFailed, message, args...)
+	return r.setStatus(ctx, cr, cmapi.CertificateRequestReasonFailed, message, args...)
 }
 
-func (r *CertificateRequestReconciler) setStatus(ctx context.Context, cr *cmapi.CertificateRequest, status cmmeta.ConditionStatus, reason, message string, args ...any) error {
+// setStatus sets Ready=False with the reason and message, with a warning event:
+// every status it writes is a request not (yet) signed. An issued certificate is
+// recorded by record.
+func (r *CertificateRequestReconciler) setStatus(ctx context.Context, cr *cmapi.CertificateRequest, reason, message string, args ...any) error {
 	completeMessage := fmt.Sprintf(message, args...)
-	apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionReady, status, reason, completeMessage)
-
-	eventType := core.EventTypeNormal
-	if status == cmmeta.ConditionFalse {
-		eventType = core.EventTypeWarning
-	}
-	r.Recorder.Event(cr, eventType, reason, completeMessage)
-
+	apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionReady, cmmeta.ConditionFalse, reason, completeMessage)
+	r.Recorder.Eventf(cr, nil, core.EventTypeWarning, reason, actionSign, "%s", completeMessage)
 	return r.Status().Update(ctx, cr)
 }

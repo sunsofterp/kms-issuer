@@ -87,7 +87,3 @@ type KMSKeyList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []KMSKey `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&KMSKey{}, &KMSKeyList{})
-}

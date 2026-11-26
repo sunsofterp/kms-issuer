@@ -28,7 +28,7 @@ import (
 	core "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,6 +55,11 @@ const (
 	eventIntermediateAccepted = "IntermediateAccepted"
 	eventIntermediateExpiring = "IntermediateExpiringSoon"
 	eventKMSError             = "KMSError"
+
+	// The actions events report (events.k8s.io/v1 requires one).
+	actionSign      = "Sign"
+	actionVerify    = "Verify"
+	actionReconcile = "Reconcile"
 )
 
 // KMSIssuerReconciler reconciles a KMSIssuer object.
@@ -62,13 +67,15 @@ type KMSIssuerReconciler struct {
 	client.Client
 	Log      logr.Logger
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	KMSCA    *kmsca.KMSCA
 	Access   *Access
 	Clock    clock.Clock
 }
 
-// Annotation for generating RBAC role for writing Events
+// Annotation for generating RBAC role for writing Events (events.k8s.io/v1, and
+// core/v1 where the former is unavailable)
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmsissuers,verbs=get;list;watch
@@ -80,7 +87,7 @@ func NewKMSIssuerReconciler(mgr manager.Manager, ca *kmsca.KMSCA, access *Access
 		Client:   mgr.GetClient(),
 		Log:      ctrl.Log.WithName("controllers").WithName("kmsissuer_controller"),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("kmsissuer_controller"),
+		Recorder: mgr.GetEventRecorder("kmsissuer_controller"),
 		KMSCA:    ca,
 		Access:   access,
 		Clock:    clock.RealClock{},
@@ -145,7 +152,7 @@ func verifyIssuer(ctx context.Context, ca *kmsca.KMSCA, access *Access, issuer *
 	if err != nil {
 		return verifiedIssuer{intermediate: intermediate}, errKMS{fmt.Errorf("reading the KMS key's public key: %w", err)}
 	}
-	root, err := kmsca.ValidateIntermediate(intermediate, kmsca.ExpectedIntermediate{
+	root, err := kmsca.ValidateIntermediate(intermediate, &kmsca.ExpectedIntermediate{
 		Roots: access.RootsAt(now), OtherRoots: access.Roots(), PublicKey: pub, AllowedDomains: access.AllowedDomains(),
 		MaxDuration: access.MaxIntermediateDuration(), Now: now,
 	})
@@ -195,7 +202,7 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var kmsErr errKMS
 	switch {
 	case errors.As(err, &kmsErr):
-		r.Recorder.Event(issuer, core.EventTypeWarning, eventKMSError, err.Error())
+		r.Recorder.Eventf(issuer, nil, core.EventTypeWarning, eventKMSError, actionVerify, "%s", err.Error())
 		if issuer.Status.IsReady() && intermediate != nil && now.Before(intermediate.NotAfter) {
 			log.Error(err, "KMS error; staying ready with the current intermediate")
 			return ctrl.Result{}, err
@@ -214,8 +221,8 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.patchIssuerStatus(ctx, issuer); err != nil {
 			return ctrl.Result{}, err
 		}
-		r.Recorder.Event(issuer, core.EventTypeNormal, eventIntermediateAccepted, fmt.Sprintf(
-			"Signing under intermediate %s, valid until %s", intermediate.SerialNumber.Text(16), intermediate.NotAfter.Format(time.RFC3339)))
+		r.Recorder.Eventf(issuer, nil, core.EventTypeNormal, eventIntermediateAccepted, actionVerify,
+			"Signing under intermediate %s, valid until %s", intermediate.SerialNumber.Text(16), intermediate.NotAfter.Format(time.RFC3339))
 		log.Info("intermediate accepted", "serial", intermediate.SerialNumber.Text(16), "notAfter", intermediate.NotAfter)
 	}
 	caNotAfter.WithLabelValues(issuer.Namespace, issuer.Name).Set(float64(intermediate.NotAfter.Unix()))
@@ -226,9 +233,9 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	leavesTruncated.WithLabelValues(issuer.Namespace, issuer.Name).Set(truncating)
 	if left < expiryWarning(s) {
-		r.Recorder.Event(issuer, core.EventTypeWarning, eventIntermediateExpiring, fmt.Sprintf(
+		r.Recorder.Eventf(issuer, nil, core.EventTypeWarning, eventIntermediateExpiring, actionVerify,
 			"The intermediate expires %s (in %s; certificates are cut short from %s before): make a new one with `kms-ca intermediate` and update intermediateCertificate",
-			intermediate.NotAfter.Format(time.RFC3339), left.Round(time.Hour), s.maxCertificateDuration))
+			intermediate.NotAfter.Format(time.RFC3339), left.Round(time.Hour), s.maxCertificateDuration)
 	}
 
 	requeue := intermediate.NotAfter.Sub(now)
@@ -271,7 +278,7 @@ func (r *KMSIssuerReconciler) setReady(ctx context.Context, issuer *kmsiapi.KMSI
 	if issuer.Status.IsReady() {
 		return nil
 	}
-	r.Recorder.Event(issuer, core.EventTypeNormal, kmsiapi.KMSIssuerReasonIssued, "Ready to issue")
+	r.Recorder.Eventf(issuer, nil, core.EventTypeNormal, kmsiapi.KMSIssuerReasonIssued, actionVerify, "Ready to issue")
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionTrue, kmsiapi.KMSIssuerReasonIssued, "")
 	issuer.Status.SetCondition(&ready)
 	return r.patchIssuerStatus(ctx, issuer)
@@ -282,7 +289,7 @@ func (r *KMSIssuerReconciler) setReady(ctx context.Context, issuer *kmsiapi.KMSI
 func (r *KMSIssuerReconciler) setNotReady(ctx context.Context, issuer *kmsiapi.KMSIssuer, message string, cause error) error {
 	message = fmt.Sprintf("%s: %v", message, cause)
 	r.Log.Error(cause, message, "kms-issuer", client.ObjectKeyFromObject(issuer))
-	r.Recorder.Event(issuer, core.EventTypeWarning, kmsiapi.KMSIssuerReasonFailed, message)
+	r.Recorder.Eventf(issuer, nil, core.EventTypeWarning, kmsiapi.KMSIssuerReasonFailed, actionVerify, "%s", message)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSIssuerReasonFailed, message)
 	issuer.Status.SetCondition(&ready)
 	return r.patchIssuerStatus(ctx, issuer)

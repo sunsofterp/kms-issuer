@@ -18,11 +18,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/utils/clock"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -102,41 +105,18 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
-	rootPEM, err := os.ReadFile(rootCertificateFile)
-	if err != nil {
-		setupLog.Error(err, "reading --root-certificate")
-		os.Exit(1)
-	}
-	roots, err := kmsca.ParseCertificatesPEM(rootPEM)
-	if err != nil {
-		setupLog.Error(err, "parsing --root-certificate")
-		os.Exit(1)
-	}
 	namespaces := splitList(allowedNamespaces)
-	access, err := certmanager.NewAccess(namespaces, splitList(allowedKeyIDs), certmanager.Ceilings{
+	access, err := loadAccess(setupLog, rootCertificateFile, namespaces, splitList(allowedKeyIDs), certmanager.Ceilings{
 		PermittedDNSDomains:     splitList(permittedDomains),
 		AllowWildcards:          allowWildcards,
 		MaxCertificateDuration:  maxCertificateDuration,
 		MaxIntermediateDuration: maxIntermediateDuration,
-	}, roots, time.Now())
+	})
 	if err != nil {
-		setupLog.Error(err, "invalid access flags")
 		os.Exit(1)
 	}
 	certmanager.RecordRoots(access)
-	for _, root := range access.Roots() {
-		setupLog.Info("pinned root", "subject", root.Subject.String(), "notBefore", root.NotBefore, "notAfter", root.NotAfter,
-			"permittedDNSDomains", root.PermittedDNSDomains)
-	}
-	for _, s := range access.Skipped() {
-		if s.Expired {
-			setupLog.Error(s.Reason, "PINNED ROOT EXPIRED: nothing can chain to it; remove it from --root-certificate",
-				"index", s.Index, "subject", s.Root.Subject.String(), "notAfter", s.Root.NotAfter)
-			continue
-		}
-		setupLog.Info("pinned root not valid yet: intermediates may chain to it from its notBefore",
-			"index", s.Index, "subject", s.Root.Subject.String(), "notBefore", s.Root.NotBefore)
-	}
+	logRoots(setupLog, access)
 	// Watch and cache namespaced objects (KMSIssuers, CertificateRequests) in the
 	// allowed namespaces only: nothing elsewhere is read, let alone written.
 	defaultNamespaces := map[string]cache.Config{}
@@ -167,28 +147,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Default AWS configuration (environment, Pod Identity, IMDS...), unless a local
-	// test endpoint is given.
-	awsLoadConfigOpts := []func(*awsconfig.LoadOptions) error{}
-	if localAWSEndpoint != "" {
-		setupLog.Info("Using a local AWS endpoint with test credentials", "endpoint", localAWSEndpoint)
-		awsLoadConfigOpts = append(
-			awsLoadConfigOpts,
-			awsconfig.WithBaseEndpoint(localAWSEndpoint),
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
-			awsconfig.WithRegion("eu-west-1"),
-		)
-	}
-	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsLoadConfigOpts...)
+	cfg, err := loadAWSConfig(setupLog, localAWSEndpoint)
 	if err != nil {
-		setupLog.Error(err, "Error loading default aws config")
 		os.Exit(1)
 	}
-	if cfg.Region == "" {
-		setupLog.Error(nil, "no AWS region: set AWS_REGION")
-		os.Exit(1)
-	}
-	setupLog.Info("Using region", "region", cfg.Region)
 	ca := kmsca.NewKMSCA(&cfg)
 
 	if err = certmanager.NewKMSIssuerReconciler(mgr, ca, access).SetupWithManager(mgr); err != nil {
@@ -200,7 +162,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Log:       ctrl.Log.WithName("controllers").WithName("CertificateRequest"),
-		Recorder:  mgr.GetEventRecorderFor("certificaterequests-controller"),
+		Recorder:  mgr.GetEventRecorder("certificaterequests-controller"),
 		KMSCA:     ca,
 		Access:    access,
 		Clock:     clock.RealClock{},
@@ -233,6 +195,71 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// loadAccess reads the pinned roots from rootFile and builds the operator's access
+// rules, logging what is wrong (and returning an error) if anything is.
+func loadAccess(log logr.Logger, rootFile string, namespaces, keyIDs []string, ceilings certmanager.Ceilings) (*certmanager.Access, error) {
+	rootPEM, err := os.ReadFile(rootFile)
+	if err != nil {
+		log.Error(err, "reading --root-certificate")
+		return nil, err
+	}
+	roots, err := kmsca.ParseCertificatesPEM(rootPEM)
+	if err != nil {
+		log.Error(err, "parsing --root-certificate")
+		return nil, err
+	}
+	access, err := certmanager.NewAccess(namespaces, keyIDs, ceilings, roots, time.Now())
+	if err != nil {
+		log.Error(err, "invalid access flags")
+		return nil, err
+	}
+	return access, nil
+}
+
+// logRoots logs every pinned root, and loudly an expired one, which must be
+// removed from the pin.
+func logRoots(log logr.Logger, access *certmanager.Access) {
+	for _, root := range access.Roots() {
+		log.Info("pinned root", "subject", root.Subject.String(), "notBefore", root.NotBefore, "notAfter", root.NotAfter,
+			"permittedDNSDomains", root.PermittedDNSDomains)
+	}
+	for _, s := range access.Skipped() {
+		if s.Expired {
+			log.Error(s.Reason, "PINNED ROOT EXPIRED: nothing can chain to it; remove it from --root-certificate",
+				"index", s.Index, "subject", s.Root.Subject.String(), "notAfter", s.Root.NotAfter)
+			continue
+		}
+		log.Info("pinned root not valid yet: intermediates may chain to it from its notBefore",
+			"index", s.Index, "subject", s.Root.Subject.String(), "notBefore", s.Root.NotBefore)
+	}
+}
+
+// loadAWSConfig is the default AWS configuration (environment, Pod Identity,
+// IMDS...), unless a local test endpoint is given; it must name a region.
+func loadAWSConfig(log logr.Logger, localEndpoint string) (aws.Config, error) {
+	var opts []func(*awsconfig.LoadOptions) error
+	if localEndpoint != "" {
+		log.Info("Using a local AWS endpoint with test credentials", "endpoint", localEndpoint)
+		opts = append(opts,
+			awsconfig.WithBaseEndpoint(localEndpoint),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
+			awsconfig.WithRegion("eu-west-1"),
+		)
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), opts...)
+	if err != nil {
+		log.Error(err, "Error loading default aws config")
+		return aws.Config{}, err
+	}
+	if cfg.Region == "" {
+		err = errors.New("no AWS region: set AWS_REGION")
+		log.Error(err, "no AWS region")
+		return aws.Config{}, err
+	}
+	log.Info("Using region", "region", cfg.Region)
+	return cfg, nil
 }
 
 func splitList(s string) []string {

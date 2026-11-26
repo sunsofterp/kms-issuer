@@ -3,9 +3,10 @@ package domains
 import "testing"
 
 func TestWithin(t *testing.T) {
-	allowed := []string{"example.internal", "Other.Internal."}
+	const domain = "example.internal"
+	allowed := []string{domain, "Other.Internal."}
 	for name, want := range map[string]bool{
-		"example.internal":       true,
+		domain:                   true,
 		"sso.example.internal":   true,
 		"SSO.Example.Internal.":  true,
 		"a.other.internal":       true,

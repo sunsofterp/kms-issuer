@@ -16,7 +16,7 @@ A Helm chart to install kms-issuer
 | args.healthProbeBindAddress | string | `":8081"` | The address the probe endpoint binds to |
 | args.leaderElect | bool | `true` | Enable leader election for controller manager. |
 | args.localAwsEndpoint | string | `""` | Test only: a local KMS endpoint, used with static test credentials. |
-| args.maxCertificateDuration | string | `"720h"` | The longest issued validity any KMSIssuer may allow. Short: cert-manager renews automatically. |
+| args.maxCertificateDuration | string | `"720h"` | The longest issued validity any KMSIssuer may allow. Short: cert-manager renews automatically. Less than half maxIntermediateDuration. |
 | args.maxIntermediateDuration | string | `"4392h"` | The longest an intermediate may be valid (at most 4392h, 183 days, which kms-ca also enforces). Renewing one is a manual step with the root key. |
 | args.metricsBindAddress | string | `":8443"` | The address the metrics endpoint binds to ("0" disables it). |
 | args.metricsSecure | bool | `true` | Serve metrics over HTTPS to authenticated, authorized callers only. |

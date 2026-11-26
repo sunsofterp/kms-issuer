@@ -88,9 +88,9 @@ func (ca *KMSCA) CreateKey(ctx context.Context, input *CreateKeyInput) (string, 
 		return "", err
 	}
 	if found {
-		owned, err := ca.ownedBy(ctx, existing, input.OwnerUID)
-		if err != nil {
-			return "", err
+		owned, ownedErr := ca.ownedBy(ctx, existing, input.OwnerUID)
+		if ownedErr != nil {
+			return "", ownedErr
 		}
 		if !owned {
 			return "", ErrAliasTaken
@@ -167,7 +167,8 @@ func (ca *KMSCA) DeleteKey(ctx context.Context, input *DeleteKeyInput) error {
 		if input.PendingWindowInDays >= 7 && input.PendingWindowInDays <= 30 {
 			deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) //nolint:gosec // G115: bounded to 7-30 just above
 		}
-		if _, err := ca.Client.ScheduleKeyDeletion(ctx, deleteInput); err != nil {
+		_, err = ca.Client.ScheduleKeyDeletion(ctx, deleteInput)
+		if err != nil {
 			return err
 		}
 	}
@@ -176,7 +177,7 @@ func (ca *KMSCA) DeleteKey(ctx context.Context, input *DeleteKeyInput) error {
 }
 
 // describeAlias returns the key ID an alias points at, and whether it exists.
-func (ca *KMSCA) describeAlias(ctx context.Context, alias string) (string, bool, error) {
+func (ca *KMSCA) describeAlias(ctx context.Context, alias string) (keyID string, found bool, err error) {
 	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(alias)})
 	if err != nil {
 		var nsk *kmstypes.NotFoundException
@@ -306,16 +307,25 @@ func ValidConstraintDomain(d string) error {
 		return fmt.Errorf("%q must have at least two labels", d)
 	}
 	for _, l := range labels {
-		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+		if !validLabel(l) {
 			return fmt.Errorf("%q has an invalid label %q", d, l)
-		}
-		for _, c := range l {
-			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
-				return fmt.Errorf("%q has an invalid label %q", d, l)
-			}
 		}
 	}
 	return nil
+}
+
+// validLabel reports whether l is a DNS label: 1 to 63 lower-case letters, digits
+// and hyphens, not starting or ending with a hyphen.
+func validLabel(l string) bool {
+	if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+		return false
+	}
+	for _, c := range l {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // MakeRoot self-signs the root CA certificate with the root KMS key: path length 1

@@ -104,7 +104,3 @@ type KMSIssuerList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []KMSIssuer `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&KMSIssuer{}, &KMSIssuerList{})
-}

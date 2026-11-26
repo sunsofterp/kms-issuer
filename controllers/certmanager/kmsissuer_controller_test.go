@@ -47,7 +47,7 @@ func newIssuer(namespace, name, keyID string) *kmsiapi.KMSIssuer {
 		Spec: kmsiapi.KMSIssuerSpec{
 			KeyID:                   keyID,
 			IntermediateCertificate: intermediateFor(keyID),
-			PermittedDNSDomains:     []string{"example.internal"},
+			PermittedDNSDomains:     []string{testDomain},
 		},
 	}
 }
@@ -66,7 +66,7 @@ var _ = Context("KMSIssuer", func() {
 
 	Describe("when a new resource is created", func() {
 		It("should accept the intermediate the pinned root signed for its key", func() {
-			key := client.ObjectKey{Name: "issuer", Namespace: "default"}
+			key := client.ObjectKey{Name: testIssuer, Namespace: testNamespace}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
 
 			issuer := WaitIssuerReady(key)
@@ -77,7 +77,7 @@ var _ = Context("KMSIssuer", func() {
 		})
 
 		It("should refuse an intermediate for another key", func() {
-			key := client.ObjectKey{Name: "issuer-swapped", Namespace: "default"}
+			key := client.ObjectKey{Name: "issuer-swapped", Namespace: testNamespace}
 			issuer := newIssuer(key.Namespace, key.Name, allowedKeyID)
 			issuer.Spec.IntermediateCertificate = otherIntermediate
 			Expect(k8sClient.Create(context.Background(), issuer)).Should(Succeed())
@@ -85,7 +85,7 @@ var _ = Context("KMSIssuer", func() {
 		})
 
 		It("should refuse the root itself as the intermediate", func() {
-			key := client.ObjectKey{Name: "issuer-root", Namespace: "default"}
+			key := client.ObjectKey{Name: "issuer-root", Namespace: testNamespace}
 			issuer := newIssuer(key.Namespace, key.Name, allowedKeyID)
 			issuer.Spec.IntermediateCertificate = string(ParseableRoot())
 			Expect(k8sClient.Create(context.Background(), issuer)).Should(Succeed())
@@ -93,42 +93,42 @@ var _ = Context("KMSIssuer", func() {
 		})
 
 		It("should refuse a key that is not allowed", func() {
-			key := client.ObjectKey{Name: "issuer-other-key", Namespace: "default"}
+			key := client.ObjectKey{Name: "issuer-other-key", Namespace: testNamespace}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, otherKeyID))).Should(Succeed())
 			expectIssuerNeverReady(key)
 		})
 
 		It("should refuse a namespace that is not allowed", func() {
-			Expect(k8sClient.Create(context.Background(), &core.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "elsewhere"}})).Should(Succeed())
-			key := client.ObjectKey{Name: "issuer", Namespace: "elsewhere"}
+			Expect(k8sClient.Create(context.Background(), &core.Namespace{ObjectMeta: metav1.ObjectMeta{Name: otherNamespace}})).Should(Succeed())
+			key := client.ObjectKey{Name: testIssuer, Namespace: otherNamespace}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
 			expectIssuerNeverReady(key)
 		})
 
 		It("should refuse domains outside the operator's ceiling", func() {
-			key := client.ObjectKey{Name: "issuer-wide", Namespace: "default"}
+			key := client.ObjectKey{Name: "issuer-wide", Namespace: testNamespace}
 			issuer := newIssuer(key.Namespace, key.Name, allowedKeyID)
-			issuer.Spec.PermittedDNSDomains = []string{"com"}
+			issuer.Spec.PermittedDNSDomains = []string{tldCom}
 			Expect(k8sClient.Create(context.Background(), issuer)).Should(Succeed())
 			expectIssuerNeverReady(key)
 		})
 
 		It("should refuse an alias as keyId at the API", func() {
-			issuer := newIssuer("default", "issuer-alias", "alias/allowed")
+			issuer := newIssuer(testNamespace, "issuer-alias", "alias/allowed")
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
 		})
 
 		It("should refuse an issuer without permitted domains or an intermediate at the API", func() {
-			issuer := newIssuer("default", "issuer-no-domains", allowedKeyID)
+			issuer := newIssuer(testNamespace, "issuer-no-domains", allowedKeyID)
 			issuer.Spec.PermittedDNSDomains = nil
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
-			issuer = newIssuer("default", "issuer-no-intermediate", allowedKeyID)
+			issuer = newIssuer(testNamespace, "issuer-no-intermediate", allowedKeyID)
 			issuer.Spec.IntermediateCertificate = ""
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
 		})
 
 		It("should refuse changing keyId", func() {
-			key := client.ObjectKey{Name: "issuer-immutable", Namespace: "default"}
+			key := client.ObjectKey{Name: "issuer-immutable", Namespace: testNamespace}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
 			issuer := WaitIssuerReady(key)
 			issuer.Spec.KeyID = otherKeyID

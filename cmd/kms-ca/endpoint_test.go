@@ -32,8 +32,7 @@ func isolate(t *testing.T) string {
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
 		if upper := strings.ToUpper(name); strings.HasPrefix(name, "AWS_") || strings.HasSuffix(upper, "_PROXY") || strings.HasPrefix(upper, "SSL_CERT_") {
-			t.Setenv(name, "")
-			os.Unsetenv(name)
+			unset(t, name)
 		}
 	}
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "config"))
@@ -42,6 +41,16 @@ func isolate(t *testing.T) string {
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	return dir
+}
+
+// unset removes an environment variable for the rest of the test (t.Setenv
+// restores it afterwards).
+func unset(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv(name, "")
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Everything that could redirect a call, or make it trust another CA, is refused.
@@ -122,7 +131,7 @@ func listener(t *testing.T) (string, *atomic.Int32) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { l.Close() })
+	t.Cleanup(func() { _ = l.Close() })
 	var hits atomic.Int32
 	go func() {
 		for {
@@ -131,7 +140,7 @@ func listener(t *testing.T) (string, *atomic.Int32) {
 				return
 			}
 			hits.Add(1)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 	return "http://" + l.Addr().String(), &hits
@@ -152,8 +161,8 @@ func TestContainerCredentialsIgnoreProxy(t *testing.T) {
 	proxy, hits := listener(t)
 	t.Setenv("HTTPS_PROXY", proxy)
 	t.Setenv("HTTP_PROXY", proxy)
-	os.Unsetenv("AWS_ACCESS_KEY_ID")
-	os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+	unset(t, "AWS_ACCESS_KEY_ID")
+	unset(t, "AWS_SECRET_ACCESS_KEY")
 	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "https://creds.invalid/credentials")
 	c := &common{}
 	cfg, err := c.loadConfig(context.Background())
@@ -195,7 +204,7 @@ func TestResolvedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ep, err := resolvedKMSEndpoint(context.Background(), cfg)
+	ep, err := resolvedKMSEndpoint(context.Background(), &cfg)
 	if err != nil || ep != "https://kms.us-east-1.amazonaws.com" {
 		t.Errorf("endpoint %q, %v", ep, err)
 	}
@@ -203,7 +212,7 @@ func TestResolvedEndpoint(t *testing.T) {
 	if cfg, err = c.loadConfig(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if ep, _ = resolvedKMSEndpoint(context.Background(), cfg); !strings.Contains(ep, "kms-fips.") {
+	if ep, _ = resolvedKMSEndpoint(context.Background(), &cfg); !strings.Contains(ep, "kms-fips.") {
 		t.Errorf("FIPS endpoint %q", ep)
 	}
 }
@@ -213,8 +222,7 @@ func TestNoTestEndpointFlag(t *testing.T) {
 	if registerTestEndpoint != nil {
 		t.Skip("built with the kmsca_test_endpoint tag")
 	}
-	err := run([]string{"root", "--aws-endpoint", "http://127.0.0.1:1", "--key-id", "k", "--common-name", "R", "--domains", "fleet.internal",
-		"--out", filepath.Join(t.TempDir(), "r.pem")}, io.Discard)
+	err := run(append(rootArgs("k", "R", testDomain, filepath.Join(t.TempDir(), "r.pem")), "--aws-endpoint", "http://127.0.0.1:1"), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "aws-endpoint") {
 		t.Fatalf("--aws-endpoint accepted: %v", err)
 	}

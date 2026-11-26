@@ -184,10 +184,9 @@ func (m *KMSMock) GetPublicKey(_ context.Context, input *kms.GetPublicKeyInput, 
 		return nil, err
 	}
 	return &kms.GetPublicKeyOutput{
-		CustomerMasterKeySpec: kmstypes.CustomerMasterKeySpec(key.KeySpec),
-		KeySpec:               key.KeySpec,
-		KeyUsage:              key.KeyUsage,
-		PublicKey:             der,
+		KeySpec:   key.KeySpec,
+		KeyUsage:  key.KeyUsage,
+		PublicKey: der,
 	}, nil
 }
 

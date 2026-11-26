@@ -61,7 +61,7 @@ var _ = Context("KMSKey", func() {
 			By("Creating a KMSKey object")
 			key := client.ObjectKey{
 				Name:      "key",
-				Namespace: "default",
+				Namespace: testNamespace,
 			}
 			kmsKey := &kmsiapi.KMSKey{
 				ObjectMeta: metav1.ObjectMeta{
@@ -96,7 +96,7 @@ var _ = Context("KMSKey", func() {
 			By("Creating a KMSKey object")
 			key := client.ObjectKey{
 				Name:      "key-to-delete",
-				Namespace: "default",
+				Namespace: testNamespace,
 			}
 			kmsKey := &kmsiapi.KMSKey{
 				ObjectMeta: metav1.ObjectMeta{

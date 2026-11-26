@@ -108,35 +108,43 @@ func (s *KMSSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]
 	return resp.Signature, nil
 }
 
+// rsaScheme is an RSA signature scheme: PSS or PKCS#1 v1.5, and the hash.
+type rsaScheme struct {
+	pss  bool
+	hash crypto.Hash
+}
+
+// The KMS signing algorithms, by key type and scheme.
+var (
+	rsaAlgorithms = map[rsaScheme]kmstypes.SigningAlgorithmSpec{
+		{pss: true, hash: crypto.SHA256}:  kmstypes.SigningAlgorithmSpecRsassaPssSha256,
+		{pss: true, hash: crypto.SHA384}:  kmstypes.SigningAlgorithmSpecRsassaPssSha384,
+		{pss: true, hash: crypto.SHA512}:  kmstypes.SigningAlgorithmSpecRsassaPssSha512,
+		{pss: false, hash: crypto.SHA256}: kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha256,
+		{pss: false, hash: crypto.SHA384}: kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha384,
+		{pss: false, hash: crypto.SHA512}: kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha512,
+	}
+	ecdsaAlgorithms = map[crypto.Hash]kmstypes.SigningAlgorithmSpec{
+		crypto.SHA256: kmstypes.SigningAlgorithmSpecEcdsaSha256,
+		crypto.SHA384: kmstypes.SigningAlgorithmSpecEcdsaSha384,
+		crypto.SHA512: kmstypes.SigningAlgorithmSpecEcdsaSha512,
+	}
+)
+
 // signingAlgorithm maps a public key type and signer options to a KMS algorithm.
 func signingAlgorithm(pub crypto.PublicKey, opts crypto.SignerOpts) (kmstypes.SigningAlgorithmSpec, error) {
 	_, pss := opts.(*rsa.PSSOptions)
 	hash := opts.HashFunc()
+	var alg kmstypes.SigningAlgorithmSpec
+	var ok bool
 	switch pub.(type) {
 	case *rsa.PublicKey:
-		switch {
-		case pss && hash == crypto.SHA256:
-			return kmstypes.SigningAlgorithmSpecRsassaPssSha256, nil
-		case pss && hash == crypto.SHA384:
-			return kmstypes.SigningAlgorithmSpecRsassaPssSha384, nil
-		case pss && hash == crypto.SHA512:
-			return kmstypes.SigningAlgorithmSpecRsassaPssSha512, nil
-		case !pss && hash == crypto.SHA256:
-			return kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha256, nil
-		case !pss && hash == crypto.SHA384:
-			return kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha384, nil
-		case !pss && hash == crypto.SHA512:
-			return kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha512, nil
-		}
+		alg, ok = rsaAlgorithms[rsaScheme{pss: pss, hash: hash}]
 	case *ecdsa.PublicKey:
-		switch hash {
-		case crypto.SHA256:
-			return kmstypes.SigningAlgorithmSpecEcdsaSha256, nil
-		case crypto.SHA384:
-			return kmstypes.SigningAlgorithmSpecEcdsaSha384, nil
-		case crypto.SHA512:
-			return kmstypes.SigningAlgorithmSpecEcdsaSha512, nil
-		}
+		alg, ok = ecdsaAlgorithms[hash]
 	}
-	return "", fmt.Errorf("no KMS signing algorithm for a %T key with %s (PSS: %t)", pub, hash, pss)
+	if !ok {
+		return "", fmt.Errorf("no KMS signing algorithm for a %T key with %s (PSS: %t)", pub, hash, pss)
+	}
+	return alg, nil
 }

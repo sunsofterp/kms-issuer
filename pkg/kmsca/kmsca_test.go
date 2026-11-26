@@ -35,7 +35,13 @@ import (
 	mocks "github.com/sunsofterp/kms-issuer/v5/pkg/kmsmock"
 )
 
-const owner = "0d3c5e1e-0000-4000-8000-000000000001"
+const (
+	owner      = "0d3c5e1e-0000-4000-8000-000000000001"
+	otherOwner = "another-owner"
+	testAlias  = "alias/test-key"
+	otherAlias = "alias/x"
+	testDomain = "example.internal"
+)
 
 // newKey creates a key owned by owner.
 func newKey(client *kmsca.KMSCA, alias string) string {
@@ -46,7 +52,7 @@ func newKey(client *kmsca.KMSCA, alias string) string {
 
 func caInput(name string, duration time.Duration, now time.Time, domains ...string) *kmsca.CAInput {
 	if len(domains) == 0 {
-		domains = []string{"example.internal"}
+		domains = []string{testDomain}
 	}
 	return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: domains, Duration: duration, Now: now}
 }
@@ -71,12 +77,12 @@ func newTwoTier() *twoTier {
 	Expect(err).To(BeNil())
 	pub, err := t.client.PublicKey(context.TODO(), t.issuingKeyID)
 	Expect(err).To(BeNil())
-	t.expectedForIntermediate = kmsca.ExpectedIntermediate{Roots: []*x509.Certificate{t.root}, PublicKey: pub, AllowedDomains: []string{"example.internal"}, Now: t.now}
+	t.expectedForIntermediate = kmsca.ExpectedIntermediate{Roots: []*x509.Certificate{t.root}, PublicKey: pub, AllowedDomains: []string{testDomain}, Now: t.now}
 	return t
 }
 
 // validateErr is ValidateIntermediate's error alone.
-func validateErr(cert *x509.Certificate, expected kmsca.ExpectedIntermediate) error {
+func validateErr(cert *x509.Certificate, expected *kmsca.ExpectedIntermediate) error {
 	_, err := kmsca.ValidateIntermediate(cert, expected)
 	return err
 }
@@ -87,7 +93,7 @@ var _ = Context("KMSCA", func() {
 		It("should create a key tagged with its owner, and an alias", func() {
 			client := mockKMSCA()
 			keyID, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{
-				AliasName:             "alias/test-key",
+				AliasName:             testAlias,
 				OwnerUID:              owner,
 				Tags:                  map[string]string{"Project": "k8s", kmsca.OwnerTag: "forged"},
 				Description:           "My test key",
@@ -107,20 +113,20 @@ var _ = Context("KMSCA", func() {
 
 		It("should return the key it created before", func() {
 			client := mockKMSCA()
-			keyID := newKey(client, "alias/test-key")
-			Expect(newKey(client, "alias/test-key")).To(Equal(keyID))
+			keyID := newKey(client, testAlias)
+			Expect(newKey(client, testAlias)).To(Equal(keyID))
 		})
 
 		It("should refuse to adopt a key it did not create", func() {
 			client := mockKMSCA()
 			newKey(client, "alias/someone-elses")
-			_, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/someone-elses", OwnerUID: "another-owner"})
+			_, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/someone-elses", OwnerUID: otherOwner})
 			Expect(err).To(MatchError(kmsca.ErrAliasTaken))
 		})
 
 		It("should refuse without an owner, or with a key ID in place of an alias", func() {
 			client := mockKMSCA()
-			_, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/x"})
+			_, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: otherAlias})
 			Expect(err).NotTo(BeNil())
 			_, err = client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "arn:aws:kms:us-east-1:111122223333:key/abc", OwnerUID: owner})
 			Expect(err).NotTo(BeNil())
@@ -130,7 +136,7 @@ var _ = Context("KMSCA", func() {
 			mock := mocks.New()
 			mock.FailCreateAlias = true
 			client := &kmsca.KMSCA{Client: mock}
-			_, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/x", OwnerUID: owner})
+			_, err := client.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: otherAlias, OwnerUID: owner})
 			Expect(err).NotTo(BeNil())
 			keyIDs := mock.KeyIDs()
 			Expect(keyIDs).To(HaveLen(1))
@@ -142,30 +148,30 @@ var _ = Context("KMSCA", func() {
 		It("should delete the key it created and its alias", func() {
 			mock := mocks.New()
 			client := &kmsca.KMSCA{Client: mock}
-			keyID := newKey(client, "alias/test-key")
-			Expect(client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: "alias/test-key", OwnerUID: owner})).To(Succeed())
+			keyID := newKey(client, testAlias)
+			Expect(client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: testAlias, OwnerUID: owner})).To(Succeed())
 			Expect(mock.PendingDeletion(keyID)).To(BeTrue())
-			_, err := client.Client.DescribeKey(context.TODO(), &kms.DescribeKeyInput{KeyId: aws.String("alias/test-key")})
+			_, err := client.Client.DescribeKey(context.TODO(), &kms.DescribeKeyInput{KeyId: aws.String(testAlias)})
 			Expect(err).To(BeAssignableToTypeOf(&kmstypes.NotFoundException{}))
 
 			By("treating a missing alias as nothing left to delete")
-			Expect(client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: "alias/test-key", OwnerUID: owner})).To(Succeed())
+			Expect(client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: testAlias, OwnerUID: owner})).To(Succeed())
 		})
 
 		It("should finish a deletion whose alias removal failed before", func() {
 			mock := mocks.New()
 			client := &kmsca.KMSCA{Client: mock}
-			keyID := newKey(client, "alias/test-key")
+			keyID := newKey(client, testAlias)
 			_, err := mock.ScheduleKeyDeletion(context.TODO(), &kms.ScheduleKeyDeletionInput{KeyId: aws.String(keyID)})
 			Expect(err).To(BeNil())
-			Expect(client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: "alias/test-key", OwnerUID: owner})).To(Succeed())
+			Expect(client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: testAlias, OwnerUID: owner})).To(Succeed())
 		})
 
 		It("should refuse to delete a key it did not create", func() {
 			mock := mocks.New()
 			client := &kmsca.KMSCA{Client: mock}
-			keyID := newKey(client, "alias/test-key")
-			err := client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: "alias/test-key", OwnerUID: "another-owner"})
+			keyID := newKey(client, testAlias)
+			err := client.DeleteKey(context.TODO(), &kmsca.DeleteKeyInput{AliasName: testAlias, OwnerUID: otherOwner})
 			Expect(err).To(MatchError(kmsca.ErrNotOwned))
 			Expect(mock.PendingDeletion(keyID)).To(BeFalse())
 		})
@@ -181,13 +187,13 @@ var _ = Context("KMSCA", func() {
 
 			Expect(t.intermediate.IsCA).To(BeTrue())
 			Expect(t.intermediate.MaxPathLenZero).To(BeTrue())
-			Expect(t.intermediate.PermittedDNSDomains).To(Equal([]string{"example.internal"}))
+			Expect(t.intermediate.PermittedDNSDomains).To(Equal([]string{testDomain}))
 			Expect(t.intermediate.ExtKeyUsage).To(Equal([]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
 			Expect(t.root.ExtKeyUsage).To(BeEmpty())
 			Expect(t.intermediate.KeyUsage).To(Equal(x509.KeyUsageCertSign | x509.KeyUsageCRLSign))
 			Expect(t.intermediate.Issuer.CommonName).To(Equal("Test Root"))
 			Expect(t.intermediate.PublicKey).NotTo(Equal(t.root.PublicKey))
-			Expect(validateErr(t.intermediate, t.expectedForIntermediate)).To(Succeed())
+			Expect(validateErr(t.intermediate, &t.expectedForIntermediate)).To(Succeed())
 			Expect(len(t.intermediate.SerialNumber.Bytes())).To(BeNumerically("<=", 16))
 		})
 
@@ -221,7 +227,7 @@ var _ = Context("KMSCA", func() {
 			Expect(err).NotTo(BeNil())
 			_, err = t.client.MakeIntermediate(context.TODO(), t.rootKeyID, t.root, t.rootKeyID, caInput("Same", 48*time.Hour, t.now))
 			Expect(err).NotTo(BeNil())
-			_, err = t.client.MakeIntermediate(context.TODO(), t.issuingKeyID, t.root, newKey(t.client, "alias/x"), caInput("Wrong root key", 48*time.Hour, t.now))
+			_, err = t.client.MakeIntermediate(context.TODO(), t.issuingKeyID, t.root, newKey(t.client, otherAlias), caInput("Wrong root key", 48*time.Hour, t.now))
 			Expect(err).NotTo(BeNil())
 		})
 
@@ -270,29 +276,29 @@ var _ = Context("KMSCA", func() {
 			Expect(err).To(BeNil())
 			forged, err := t.client.MakeIntermediate(context.TODO(), otherRootKey, otherRoot, t.issuingKeyID, caInput("Test Issuing", 48*time.Hour, t.now))
 			Expect(err).To(BeNil())
-			Expect(validateErr(forged, t.expectedForIntermediate)).NotTo(Succeed())
+			Expect(validateErr(forged, &t.expectedForIntermediate)).NotTo(Succeed())
 		})
 
 		It("refuses constraints outside the allowed domains, another key, or an expired intermediate", func() {
 			t := newTwoTier()
 			other := t.expectedForIntermediate
 			other.AllowedDomains = []string{"other.internal"}
-			Expect(validateErr(t.intermediate, other)).NotTo(Succeed())
+			Expect(validateErr(t.intermediate, &other)).NotTo(Succeed())
 
 			other = t.expectedForIntermediate
 			other.Now = t.intermediate.NotAfter.Add(time.Second)
-			Expect(validateErr(t.intermediate, other)).NotTo(Succeed())
+			Expect(validateErr(t.intermediate, &other)).NotTo(Succeed())
 
 			otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 			other = t.expectedForIntermediate
 			other.PublicKey = otherKey.Public()
-			Expect(validateErr(t.intermediate, other)).NotTo(Succeed())
+			Expect(validateErr(t.intermediate, &other)).NotTo(Succeed())
 
 			By("refusing the root itself as an intermediate")
 			rootPub, _ := t.client.PublicKey(context.TODO(), t.rootKeyID)
 			other = t.expectedForIntermediate
 			other.PublicKey = rootPub
-			Expect(validateErr(t.root, other)).NotTo(Succeed())
+			Expect(validateErr(t.root, &other)).NotTo(Succeed())
 		})
 
 		It("accepts only server auth as the extended key usage, and at most 183 days", func() {
@@ -310,7 +316,7 @@ var _ = Context("KMSCA", func() {
 				Expect(err).To(BeNil())
 				return cert
 			}
-			Expect(validateErr(sign(func(*x509.Certificate) {}), t.expectedForIntermediate)).To(Succeed())
+			Expect(validateErr(sign(func(*x509.Certificate) {}), &t.expectedForIntermediate)).To(Succeed())
 			for name, eku := range map[string][]x509.ExtKeyUsage{
 				"none":                 nil,
 				"server and client":    {x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
@@ -319,12 +325,12 @@ var _ = Context("KMSCA", func() {
 				"server and code sign": {x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageCodeSigning},
 			} {
 				By("refusing extended key usage: " + name)
-				Expect(validateErr(sign(func(c *x509.Certificate) { c.ExtKeyUsage = eku }), t.expectedForIntermediate)).NotTo(Succeed())
+				Expect(validateErr(sign(func(c *x509.Certificate) { c.ExtKeyUsage = eku }), &t.expectedForIntermediate)).NotTo(Succeed())
 			}
 			at := sign(func(c *x509.Certificate) { c.NotAfter = c.NotBefore.Add(kmsca.MaxIntermediateDuration) })
-			Expect(validateErr(at, t.expectedForIntermediate)).To(Succeed())
+			Expect(validateErr(at, &t.expectedForIntermediate)).To(Succeed())
 			over := sign(func(c *x509.Certificate) { c.NotAfter = c.NotBefore.Add(kmsca.MaxIntermediateDuration + time.Second) })
-			Expect(validateErr(over, t.expectedForIntermediate)).NotTo(Succeed())
+			Expect(validateErr(over, &t.expectedForIntermediate)).NotTo(Succeed())
 		})
 
 		It("refuses an unconstrained intermediate signed by the root key", func() {
@@ -342,7 +348,7 @@ var _ = Context("KMSCA", func() {
 				KeyID: t.rootKeyID, Cert: tmpl, Parent: t.root, PublicKey: pub,
 			})
 			Expect(err).To(BeNil())
-			Expect(validateErr(unconstrained, t.expectedForIntermediate)).NotTo(Succeed())
+			Expect(validateErr(unconstrained, &t.expectedForIntermediate)).NotTo(Succeed())
 		})
 	})
 

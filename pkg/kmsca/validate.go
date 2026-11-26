@@ -15,6 +15,9 @@ import (
 	"github.com/sunsofterp/kms-issuer/v5/pkg/domains"
 )
 
+// pemCertificate is a PEM certificate block's type.
+const pemCertificate = "CERTIFICATE"
+
 // ParseCertificatePEM parses exactly one PEM CERTIFICATE block and nothing else.
 // Anything before or after it (another certificate, junk) is refused, so what is
 // stored can never smuggle extra trust material into what is handed out.
@@ -40,7 +43,7 @@ func ParseCertificatesPEM(data []byte) ([]*x509.Certificate, error) {
 		}
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
-		if block == nil || block.Type != "CERTIFICATE" {
+		if block == nil || block.Type != pemCertificate {
 			return nil, errors.New("not a PEM CERTIFICATE")
 		}
 		if len(block.Headers) > 0 {
@@ -61,7 +64,7 @@ func ParseCertificatesPEM(data []byte) ([]*x509.Certificate, error) {
 
 // EncodeCertificatePEM re-encodes a parsed certificate.
 func EncodeCertificatePEM(cert *x509.Certificate) []byte {
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	return pem.EncodeToMemory(&pem.Block{Type: pemCertificate, Bytes: cert.Raw})
 }
 
 // ValidateRoot returns an error unless root is a usable root for this CA: a
@@ -142,7 +145,42 @@ type ExpectedIntermediate struct {
 // and no other, critical name constraints with every DNS, URI and email domain
 // inside both the allowed domains and the root's, every IP address excluded, a name
 // different from the root's, valid now, and no longer-lived than the maximum.
-func ValidateIntermediate(cert *x509.Certificate, expected ExpectedIntermediate) (*x509.Certificate, error) {
+func ValidateIntermediate(cert *x509.Certificate, expected *ExpectedIntermediate) (*x509.Certificate, error) {
+	root, err := issuingRoot(cert, expected)
+	if err != nil {
+		return nil, err
+	}
+	err = checkIntermediateShape(cert, root, expected.MaxDuration)
+	if err != nil {
+		return nil, err
+	}
+	err = checkConstraints(cert)
+	if err != nil {
+		return nil, err
+	}
+	err = checkConstraintsWithin(cert, expected.AllowedDomains, root)
+	if err != nil {
+		return nil, err
+	}
+	err = checkValidity(cert, expected.Now)
+	if err != nil {
+		return nil, err
+	}
+	// Full path validation as clients do it, root constraints included.
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	_, err = cert.Verify(x509.VerifyOptions{
+		Roots: roots, CurrentTime: expected.Now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("does not verify to the pinned root: %w", err)
+	}
+	return root, nil
+}
+
+// issuingRoot returns the pinned root that issued and signed cert, after checking
+// cert is for the issuer's KMS key and no root's (pinned or other).
+func issuingRoot(cert *x509.Certificate, expected *ExpectedIntermediate) (*x509.Certificate, error) {
 	if cert == nil {
 		return nil, errors.New("no intermediate certificate")
 	}
@@ -166,53 +204,53 @@ func ValidateIntermediate(cert *x509.Certificate, expected ExpectedIntermediate)
 			root = r
 		}
 	}
-	maxDuration := expected.MaxDuration
+	if root == nil {
+		return nil, errors.New("not issued by a pinned root")
+	}
+	return root, nil
+}
+
+// checkIntermediateShape requires a CA with path length 0, a name different from
+// the root's, cert-sign key usage (CRL sign and digital signature also allowed),
+// exactly the server-auth extended key usage, and a validity no longer than
+// maxDuration (0 or more than MaxIntermediateDuration: MaxIntermediateDuration).
+func checkIntermediateShape(cert, root *x509.Certificate, maxDuration time.Duration) error {
 	if maxDuration <= 0 || maxDuration > MaxIntermediateDuration {
 		maxDuration = MaxIntermediateDuration
 	}
 	switch {
-	case root == nil:
-		return nil, errors.New("not issued by a pinned root")
 	case bytes.Equal(cert.RawSubject, root.RawSubject) || cert.Subject.CommonName == root.Subject.CommonName:
-		return nil, errors.New("the intermediate's name is the root's")
+		return errors.New("the intermediate's name is the root's")
 	case !cert.BasicConstraintsValid || !cert.IsCA:
-		return nil, errors.New("not a CA certificate")
+		return errors.New("not a CA certificate")
 	case !cert.MaxPathLenZero || cert.MaxPathLen != 0:
-		return nil, errors.New("path length is not 0")
+		return errors.New("path length is not 0")
 	case cert.KeyUsage&x509.KeyUsageCertSign == 0:
-		return nil, errors.New("no cert-sign key usage")
+		return errors.New("no cert-sign key usage")
 	case cert.KeyUsage&^(x509.KeyUsageCertSign|x509.KeyUsageCRLSign|x509.KeyUsageDigitalSignature) != 0:
-		return nil, errors.New("unexpected key usages")
+		return errors.New("unexpected key usages")
 	case !slices.Equal(cert.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}) || len(cert.UnknownExtKeyUsage) > 0:
-		return nil, errors.New("extended key usage is not exactly server auth")
+		return errors.New("extended key usage is not exactly server auth")
 	case cert.NotAfter.Sub(cert.NotBefore) > maxDuration:
-		return nil, fmt.Errorf("valid for %s, longer than the %s an intermediate may be", cert.NotAfter.Sub(cert.NotBefore), maxDuration)
+		return fmt.Errorf("valid for %s, longer than the %s an intermediate may be", cert.NotAfter.Sub(cert.NotBefore), maxDuration)
 	}
-	if err := checkConstraints(cert); err != nil {
-		return nil, err
-	}
+	return nil
+}
+
+// checkConstraintsWithin requires every DNS, URI and email constraint domain of
+// cert inside both the allowed domains and the root's DNS constraints.
+func checkConstraintsWithin(cert *x509.Certificate, allowed []string, root *x509.Certificate) error {
 	for _, list := range [][]string{cert.PermittedDNSDomains, cert.PermittedURIDomains, cert.PermittedEmailAddresses} {
 		for _, d := range list {
-			if !WithinDomains(d, expected.AllowedDomains) {
-				return nil, fmt.Errorf("name constraint %q is outside the allowed domains %v", d, expected.AllowedDomains)
+			if !WithinDomains(d, allowed) {
+				return fmt.Errorf("name constraint %q is outside the allowed domains %v", d, allowed)
 			}
 			if !WithinDomains(d, root.PermittedDNSDomains) {
-				return nil, fmt.Errorf("name constraint %q is outside the root's %v", d, root.PermittedDNSDomains)
+				return fmt.Errorf("name constraint %q is outside the root's %v", d, root.PermittedDNSDomains)
 			}
 		}
 	}
-	if err := checkValidity(cert, expected.Now); err != nil {
-		return nil, err
-	}
-	// Full path validation as clients do it, root constraints included.
-	roots := x509.NewCertPool()
-	roots.AddCert(root)
-	if _, err := cert.Verify(x509.VerifyOptions{
-		Roots: roots, CurrentTime: expected.Now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}); err != nil {
-		return nil, fmt.Errorf("does not verify to the pinned root: %w", err)
-	}
-	return root, nil
+	return nil
 }
 
 // errNotYetValid marks a certificate whose validity hasn't started.

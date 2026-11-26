@@ -167,8 +167,10 @@ jobs:
             issuerRef: {name: kms-issuer-sample, kind: KMSIssuer, group: cert-manager.skyscanner.net}
           EOF
           for _ in $(seq 1 30); do
-            reason=$(kubectl get certificaterequest -n default -l "cert-manager.io/certificate-name=outside" \
-              -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
+            # cert-manager names the request's Certificate in an annotation, not a label.
+            reason=$(kubectl get certificaterequest -n default -o json | jq -r '.items[]
+              | select(.metadata.annotations["cert-manager.io/certificate-name"] == "outside")
+              | .status.conditions[]? | select(.type == "Ready") | .reason' 2>/dev/null || true)
             if [ "${reason}" = "Failed" ]; then echo "refused"; exit 0; fi
             sleep 2
           done

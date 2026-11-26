@@ -22,9 +22,9 @@ import (
 	"time"
 
 	"golang.org/x/crypto/cryptobyte"
+	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
 
 	"github.com/sunsofterp/kms-issuer/v5/pkg/domains"
-	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
 )
 
 const (
@@ -91,53 +91,21 @@ func Template(req *Request, iss *Issuer, parent *x509.Certificate, serial *big.I
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := checkSANTypes(csr); err != nil {
-		return nil, nil, err
-	}
-	if len(csr.IPAddresses) > 0 || len(csr.URIs) > 0 || len(csr.EmailAddresses) > 0 {
-		return nil, nil, deny("only DNS names may be requested (no IP addresses, URIs or email addresses)")
-	}
-	names, err := checkDNSNames(csr.DNSNames, iss)
+	names, commonName, err := checkSubject(csr, iss)
 	if err != nil {
 		return nil, nil, err
-	}
-	commonName := strings.ToLower(csr.Subject.CommonName)
-	if commonName != "" && !contains(names, commonName) {
-		return nil, nil, deny("the common name %q is not one of the requested DNS names", csr.Subject.CommonName)
-	}
-	if len(commonName) > maxCommonName {
-		return nil, nil, deny("the common name is %d characters; at most %d are allowed (leave it empty for longer names)", len(commonName), maxCommonName)
 	}
 	keyUsage, err := checkPublicKey(csr.PublicKey)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := checkUsages(req.Usages); err != nil {
+	err = checkUsages(req.Usages)
+	if err != nil {
 		return nil, nil, err
 	}
-
-	duration := req.Duration
-	if duration == 0 {
-		duration = req.DefaultDuration
-	}
-	if duration < minDuration {
-		return nil, nil, deny("duration %s is shorter than %s", duration, minDuration)
-	}
-	if iss.MaxDuration <= 0 || duration > iss.MaxDuration {
-		return nil, nil, deny("duration %s is longer than the issuer allows (%s)", duration, iss.MaxDuration)
-	}
-	// The validity is exactly the duration, backdating included, so it never
-	// exceeds what the issuer allows.
-	notBefore := now.Add(-clockSkew).UTC().Truncate(time.Second)
-	notAfter := notBefore.Add(duration)
-	// Cut short to end with the intermediate, a certificate must still be worth
-	// issuing; below the minimum, the intermediate needs renewing first. Not a
-	// denial: the request is retried and succeeds once it is renewed.
-	if notAfter.After(parent.NotAfter) {
-		notAfter = parent.NotAfter
-		if notAfter.Sub(now) < minDuration {
-			return nil, nil, fmt.Errorf("%w: the intermediate expires at %s, too soon to issue under it: renew the intermediate", ErrWait, parent.NotAfter.Format(time.RFC3339))
-		}
+	notBefore, notAfter, err := validity(req, iss, parent, now)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	cert := &x509.Certificate{
@@ -154,6 +122,58 @@ func Template(req *Request, iss *Issuer, parent *x509.Certificate, serial *big.I
 	return cert, csr.PublicKey, nil
 }
 
+// checkSubject returns the certificate's DNS names and common name (lower-cased):
+// DNS names only, each inside the issuer's domains, and a common name that is one
+// of them and fits RFC 5280's bound.
+func checkSubject(csr *x509.CertificateRequest, iss *Issuer) (names []string, commonName string, err error) {
+	err = checkSANTypes(csr)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(csr.IPAddresses) > 0 || len(csr.URIs) > 0 || len(csr.EmailAddresses) > 0 {
+		return nil, "", deny("only DNS names may be requested (no IP addresses, URIs or email addresses)")
+	}
+	if names, err = checkDNSNames(csr.DNSNames, iss); err != nil {
+		return nil, "", err
+	}
+	commonName = strings.ToLower(csr.Subject.CommonName)
+	if commonName != "" && !contains(names, commonName) {
+		return nil, "", deny("the common name %q is not one of the requested DNS names", csr.Subject.CommonName)
+	}
+	if len(commonName) > maxCommonName {
+		return nil, "", deny("the common name is %d characters; at most %d are allowed (leave it empty for longer names)", len(commonName), maxCommonName)
+	}
+	return names, commonName, nil
+}
+
+// validity returns the certificate's validity: exactly the requested (or default)
+// duration, backdating included, so it never exceeds what the issuer allows, and
+// cut short to end with the intermediate.
+func validity(req *Request, iss *Issuer, parent *x509.Certificate, now time.Time) (notBefore, notAfter time.Time, err error) {
+	duration := req.Duration
+	if duration == 0 {
+		duration = req.DefaultDuration
+	}
+	if duration < minDuration {
+		return time.Time{}, time.Time{}, deny("duration %s is shorter than %s", duration, minDuration)
+	}
+	if iss.MaxDuration <= 0 || duration > iss.MaxDuration {
+		return time.Time{}, time.Time{}, deny("duration %s is longer than the issuer allows (%s)", duration, iss.MaxDuration)
+	}
+	notBefore = now.Add(-clockSkew).UTC().Truncate(time.Second)
+	notAfter = notBefore.Add(duration)
+	// Cut short to end with the intermediate, a certificate must still be worth
+	// issuing; below the minimum, the intermediate needs renewing first. Not a
+	// denial: the request is retried and succeeds once it is renewed.
+	if notAfter.After(parent.NotAfter) {
+		notAfter = parent.NotAfter
+		if notAfter.Sub(now) < minDuration {
+			return time.Time{}, time.Time{}, fmt.Errorf("%w: the intermediate expires at %s, too soon to issue under it: renew the intermediate", ErrWait, parent.NotAfter.Format(time.RFC3339))
+		}
+	}
+	return notBefore, notAfter, nil
+}
+
 func deny(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrDenied, fmt.Sprintf(format, args...))
 }
@@ -163,7 +183,7 @@ func parseCSR(pemBytes []byte) (*x509.CertificateRequest, error) {
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
 		return nil, deny("spec.request is not a PEM CERTIFICATE REQUEST")
 	}
-	if len(strings.TrimSpace(string(rest))) > 0 {
+	if strings.TrimSpace(string(rest)) != "" {
 		return nil, deny("spec.request has data after the CERTIFICATE REQUEST block")
 	}
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
