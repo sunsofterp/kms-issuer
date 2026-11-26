@@ -36,6 +36,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
@@ -149,9 +150,13 @@ func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, string, error) {
 }
 
 // loadConfig loads the AWS configuration and, outside test builds, makes sure
-// every AWS call goes straight to AWS's own endpoints: no proxy (ignored), no
-// custom CA bundle and no endpoint override of any kind (refused). Nothing is
-// called.
+// every call to an AWS service (KMS, STS, SSO...) goes straight to AWS's own
+// endpoint: no proxy (ignored, by credential fetches too), no CA bundle or
+// SSL_CERT_* variable and no service endpoint override (refused). Where
+// credentials come from (a profile, credential_process, the instance or
+// container metadata endpoint) is left to the configuration; the identity they
+// give is printed. Nothing is called: the defaults mode is pinned to standard,
+// whose "auto" would ask the instance metadata service while loading.
 func (c *common) loadConfig(ctx context.Context) (aws.Config, error) {
 	var opts []func(*awsconfig.LoadOptions) error
 	if c.region != "" {
@@ -165,12 +170,17 @@ func (c *common) loadConfig(ctx context.Context) (aws.Config, error) {
 			opts = append(opts, awsconfig.WithRegion("eu-west-1"))
 		}
 	} else {
-		// Every client the configuration builds, credential providers (SSO,
-		// IMDS...) included, uses this one: proxy settings are ignored, so a
-		// TLS-inspecting proxy can't stand in for AWS.
-		opts = append(opts, awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
-			tr.Proxy = nil
-		})))
+		// Every client the configuration builds uses this one: the service
+		// clients and the SSO and instance metadata credential providers through
+		// WithHTTPClient, the container credential provider, which builds its
+		// own otherwise, through WithEndpointCredentialOptions. Proxy settings
+		// are ignored, so a proxy can neither stand in for AWS nor read
+		// credentials fetched over plain HTTP.
+		client := proxyless()
+		opts = append(opts,
+			awsconfig.WithHTTPClient(client),
+			awsconfig.WithEndpointCredentialOptions(func(o *endpointcreds.Options) { o.HTTPClient = client }),
+			awsconfig.WithDefaultsMode(aws.DefaultsModeStandard))
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
@@ -188,17 +198,25 @@ func (c *common) loadConfig(ctx context.Context) (aws.Config, error) {
 	return cfg, nil
 }
 
+// proxyless is the HTTP client every AWS call of a release build uses: the SDK's
+// default, with proxy settings ignored.
+func proxyless() *awshttp.BuildableClient {
+	return awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) { tr.Proxy = nil })
+}
+
 // refuseRedirects returns an error if anything in the AWS configuration could send
-// a call anywhere but AWS's own endpoints, or trust a certificate the system
-// doesn't: any AWS_ENDPOINT_URL* variable (for any service: SSO too, which carries
-// the admin's token), an endpoint_url or services section in the profile, a custom
-// CA bundle (AWS_CA_BUNDLE or ca_bundle), and, as the SDK resolves them, the KMS
-// and STS clients' endpoints. The root key must only ever be used through AWS.
+// a call to an AWS service anywhere but AWS's own endpoint, or trust a certificate
+// the system store doesn't: any AWS_ENDPOINT_URL* variable (for any service: SSO
+// too, which carries the admin's token), an endpoint_url or services section in
+// the profile, a custom CA bundle (AWS_CA_BUNDLE or ca_bundle), SSL_CERT_FILE or
+// SSL_CERT_DIR, and, as the SDK resolves them, the KMS and STS clients'
+// endpoints. The root key must only ever be used through AWS.
 func refuseRedirects(cfg aws.Config, environ []string) error {
 	const fix = "kms-ca only talks to AWS's own endpoints with the system's trusted CAs; run it from a clean environment"
 	for _, kv := range environ {
 		name, value, _ := strings.Cut(kv, "=")
-		if strings.HasPrefix(strings.ToUpper(name), "AWS_ENDPOINT_URL") && value != "" {
+		upper := strings.ToUpper(name)
+		if value != "" && (strings.HasPrefix(upper, "AWS_ENDPOINT_URL") || upper == "SSL_CERT_FILE" || upper == "SSL_CERT_DIR") {
 			return fmt.Errorf("%s is set: %s", name, fix)
 		}
 	}

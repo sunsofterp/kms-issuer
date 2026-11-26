@@ -2,9 +2,13 @@ package certmanager
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"math/big"
 	"strings"
 	"sync"
 	"testing"
@@ -518,6 +522,76 @@ func TestKeptCertificateDroppedOnceRecorded(t *testing.T) {
 	}
 	if n := h.kms.count(h.u.issuingKey); n != 1 {
 		t.Errorf("signed %d times, want once", n)
+	}
+}
+
+// signLeaf signs a one-day leaf for svc.example.internal with the issuing key,
+// under parent.
+func signLeaf(t *testing.T, u *unitCA, parent *x509.Certificate, from time.Time) *x509.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := u.ca.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
+		KeyID: u.issuingKey, Parent: parent, PublicKey: key.Public(),
+		Cert: &x509.Certificate{
+			SerialNumber: big.NewInt(42), Subject: pkix.Name{CommonName: "svc.example.internal"}, DNSNames: []string{"svc.example.internal"},
+			NotBefore: from, NotAfter: from.Add(24 * time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return leaf
+}
+
+// A kept certificate whose intermediate has expired, or whose root is no longer a
+// pinned root valid now, is not handed out.
+func TestKeptChainCurrent(t *testing.T) {
+	u := newUnitCA(t)
+	verified := verifiedIssuer{intermediate: u.intermediate, root: u.root}
+
+	// Its intermediate expires.
+	access, err := NewAccess([]string{"default"}, []string{u.issuingKey}, unitCeilings(), []*x509.Certificate{u.root}, unitNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := signedCertificate{leaf: signLeaf(t, u, u.intermediate, unitNow), intermediate: u.intermediate, root: u.root}
+	if why := keptChainCurrent(p, verified, access, unitNow.Add(time.Hour)); why != "" {
+		t.Errorf("a current chain refused: %s", why)
+	}
+	if why := keptChainCurrent(p, verified, access, u.intermediate.NotAfter); !strings.Contains(why, "intermediate") {
+		t.Errorf("once its intermediate expired: %q, want refused for the intermediate", why)
+	}
+
+	// Its root expires before it is recorded: a one-day root, and an intermediate
+	// under it that outlives it (kms-ca refuses to make one, the controller doesn't
+	// check), on the issuing key.
+	short, shortKey := makeRootKey(t, u, "alias/short-root", "Short Root", unitNow.Add(-time.Hour), 24*time.Hour)
+	tmpl, err := kmsca.CATemplate(&kmsca.CAInput{
+		Subject: pkix.Name{CommonName: "Under Short"}, PermittedDNSDomains: []string{"example.internal"}, Duration: 48 * time.Hour, Now: unitNow.Add(-time.Hour),
+	}, kmsca.Intermediate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	underShort, err := u.ca.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{KeyID: shortKey, Cert: tmpl, Parent: short, PublicKey: u.intermediate.PublicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access, err = NewAccess([]string{"default"}, []string{u.issuingKey}, unitCeilings(), []*x509.Certificate{u.root, short}, unitNow); err != nil {
+		t.Fatal(err)
+	}
+	p = signedCertificate{leaf: signLeaf(t, u, underShort, unitNow), intermediate: underShort, root: short}
+	if why := keptChainCurrent(p, verified, access, unitNow.Add(time.Hour)); why != "" {
+		t.Errorf("a chain to a valid pinned root refused: %s", why)
+	}
+	afterRoot := short.NotAfter.Add(time.Minute)
+	if !afterRoot.Before(underShort.NotAfter) {
+		t.Fatal("test setup: the intermediate must outlive the root")
+	}
+	if why := keptChainCurrent(p, verified, access, afterRoot); !strings.Contains(why, "root") {
+		t.Errorf("once its root expired: %q, want refused for the root", why)
 	}
 }
 

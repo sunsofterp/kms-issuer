@@ -10,9 +10,11 @@ import (
 	"encoding/pem"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,13 +24,14 @@ import (
 // isolate points the AWS SDK at empty config files and static credentials, so
 // nothing outside the test is read. The tests below only load the configuration
 // (loadConfig), which calls nothing: even if a refusal regressed, no request
-// would be made.
+// would be made. The two exceptions talk only to loopback listeners or to a
+// .invalid name.
 func isolate(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
-		if strings.HasPrefix(name, "AWS_") || strings.HasSuffix(strings.ToUpper(name), "_PROXY") {
+		if upper := strings.ToUpper(name); strings.HasPrefix(name, "AWS_") || strings.HasSuffix(upper, "_PROXY") || strings.HasPrefix(upper, "SSL_CERT_") {
 			t.Setenv(name, "")
 			os.Unsetenv(name)
 		}
@@ -49,6 +52,11 @@ func TestRedirectsRefused(t *testing.T) {
 		"AWS_ENDPOINT_URL_STS":      func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1") },
 		"AWS_ENDPOINT_URL_SSO":      func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_SSO", "http://127.0.0.1:1") },
 		"AWS_ENDPOINT_URL_SSO_OIDC": func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_SSO_OIDC", "http://127.0.0.1:1") },
+		"SSL_CERT_FILE": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "ca.pem"), testCAPEM(t))
+			t.Setenv("SSL_CERT_FILE", filepath.Join(dir, "ca.pem"))
+		},
+		"SSL_CERT_DIR": func(t *testing.T, dir string) { t.Setenv("SSL_CERT_DIR", dir) },
 		"AWS_CA_BUNDLE": func(t *testing.T, dir string) {
 			writeFile(t, filepath.Join(dir, "ca.pem"), testCAPEM(t))
 			t.Setenv("AWS_CA_BUNDLE", filepath.Join(dir, "ca.pem"))
@@ -104,6 +112,72 @@ func TestProxyIgnored(t *testing.T) {
 	}
 	if client.GetTransport().Proxy != nil {
 		t.Error("the transport still uses a proxy")
+	}
+}
+
+// listener counts the connections made to it and closes each at once.
+func listener(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	var hits atomic.Int32
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			hits.Add(1)
+			conn.Close()
+		}
+	}()
+	return "http://" + l.Addr().String(), &hits
+}
+
+// The container credential provider (ECS, EKS Pod Identity) builds its own HTTP
+// client unless told otherwise: it must not go through the proxy either. The
+// credential URI is a .invalid name, so the fetch fails at name resolution
+// without the proxy and reaches nothing.
+func TestContainerCredentialsIgnoreProxy(t *testing.T) {
+	isolate(t)
+	proxy, hits := listener(t)
+	t.Setenv("HTTPS_PROXY", proxy)
+	t.Setenv("HTTP_PROXY", proxy)
+	os.Unsetenv("AWS_ACCESS_KEY_ID")
+	os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "https://creds.invalid/credentials")
+	c := &common{}
+	cfg, err := c.loadConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := cfg.Credentials.Retrieve(ctx); err == nil {
+		t.Fatal("credentials retrieved from creds.invalid")
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("the credential fetch went through the proxy (%d connections)", n)
+	}
+}
+
+// AWS_DEFAULTS_MODE=auto would make loading the configuration ask the instance
+// metadata service: release builds pin the standard mode, so nothing is called.
+func TestDefaultsModeAutoCallsNothing(t *testing.T) {
+	isolate(t)
+	imds, hits := listener(t)
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", imds)
+	t.Setenv("AWS_DEFAULTS_MODE", "auto")
+	t.Setenv("AWS_ENDPOINT_URL_KMS", "http://127.0.0.1:1")
+	c := &common{}
+	if _, err := c.loadConfig(context.Background()); err == nil {
+		t.Fatal("AWS_ENDPOINT_URL_KMS not refused")
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("loading the configuration called the metadata service (%d connections)", n)
 	}
 }
 
