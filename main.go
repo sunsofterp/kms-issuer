@@ -86,9 +86,9 @@ func main() {
 	flag.BoolVar(&allowWildcards, "allow-wildcards", false,
 		"Let KMSIssuers allow wildcard names (allowWildcards). Off by default.")
 	flag.DurationVar(&maxCertificateDuration, "max-certificate-duration", 30*24*time.Hour,
-		"The longest issued validity any KMSIssuer may allow (maxCertificateDuration).")
+		"The longest issued validity any KMSIssuer may allow (maxCertificateDuration). Less than half --max-intermediate-duration.")
 	flag.DurationVar(&maxIntermediateDuration, "max-intermediate-duration", kmsca.MaxIntermediateDuration,
-		"The longest an intermediate may be valid (at most the default).")
+		"The longest an intermediate may be valid (above zero, at most the default).")
 	flag.StringVar(&rootCertificateFile, "root-certificate", "",
 		"Required. File holding the PEM root CA certificate(s) (made with `kms-ca root`) every KMSIssuer's intermediate must chain to. "+
 			"More than one only while replacing a root.")
@@ -124,8 +124,12 @@ func main() {
 		os.Exit(1)
 	}
 	certmanager.RecordRoots(access)
-	for _, root := range roots {
+	for _, root := range access.Roots() {
 		setupLog.Info("pinned root", "subject", root.Subject.String(), "notAfter", root.NotAfter, "permittedDNSDomains", root.PermittedDNSDomains)
+	}
+	for _, s := range access.Skipped() {
+		setupLog.Error(s.Reason, "PINNED ROOT SKIPPED: not valid now, nothing can chain to it; remove it from --root-certificate",
+			"index", s.Index, "subject", s.Root.Subject.String(), "notBefore", s.Root.NotBefore, "notAfter", s.Root.NotAfter)
 	}
 	// Watch and cache namespaced objects (KMSIssuers, CertificateRequests) in the
 	// allowed namespaces only: nothing elsewhere is read, let alone written.

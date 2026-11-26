@@ -39,7 +39,7 @@ args:
   # -- Let KMSIssuers allow wildcard names.
   allowWildcards: false
   # -- The longest issued validity any KMSIssuer may allow. Short: cert-manager
-  # renews automatically.
+  # renews automatically. Less than half maxIntermediateDuration.
   maxCertificateDuration: 720h
   # -- The longest an intermediate may be valid (at most 4392h, 183 days, which
   # kms-ca also enforces). Renewing one is a manual step with the root key.

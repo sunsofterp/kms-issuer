@@ -82,7 +82,8 @@ func TestSettingsValidate(t *testing.T) {
 func TestCheckIssuerCeilings(t *testing.T) {
 	u := newUnitCA(t, "fleet.internal")
 	access, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
-		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: 90 * 24 * time.Hour,
+		MaxIntermediateDuration: kmsca.MaxIntermediateDuration,
+		PermittedDNSDomains:     []string{"fleet.internal"}, MaxCertificateDuration: 90 * 24 * time.Hour,
 	}, []*x509.Certificate{u.root}, unitNow)
 	if err != nil {
 		t.Fatal(err)
@@ -123,17 +124,20 @@ func TestCheckIssuerCeilings(t *testing.T) {
 		}
 	}
 	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
-		PermittedDNSDomains: []string{"internal"}, MaxCertificateDuration: time.Hour,
+		MaxIntermediateDuration: kmsca.MaxIntermediateDuration,
+		PermittedDNSDomains:     []string{"internal"}, MaxCertificateDuration: time.Hour,
 	}, []*x509.Certificate{u.root}, unitNow); err == nil {
 		t.Error("a single-label ceiling was accepted")
 	}
 	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
-		PermittedDNSDomains: []string{"fleet.internal"}, MaxCertificateDuration: time.Hour,
+		MaxIntermediateDuration: kmsca.MaxIntermediateDuration,
+		PermittedDNSDomains:     []string{"fleet.internal"}, MaxCertificateDuration: time.Hour,
 	}, []*x509.Certificate{u.intermediate}, unitNow); err == nil {
 		t.Error("an intermediate was accepted as the root")
 	}
 	if _, err := NewAccess([]string{"ca"}, []string{"key-1"}, Ceilings{
-		PermittedDNSDomains: []string{"sso.fleet.internal"}, MaxCertificateDuration: time.Hour,
+		MaxIntermediateDuration: kmsca.MaxIntermediateDuration,
+		PermittedDNSDomains:     []string{"sso.fleet.internal"}, MaxCertificateDuration: time.Hour,
 	}, []*x509.Certificate{u.root}, unitNow); err == nil {
 		t.Error("a root wider than the operator's domains was accepted")
 	}

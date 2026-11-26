@@ -88,8 +88,15 @@ func (c *common) register(fs *flag.FlagSet, defaultDuration time.Duration) {
 	fs.StringVar(&c.outFile, "out", "", "Required. Where to write the PEM certificate (must not exist).")
 	fs.DurationVar(&c.duration, "duration", defaultDuration, "Validity.")
 	fs.StringVar(&c.region, "region", "", "AWS region (default: the AWS configuration's).")
-	fs.StringVar(&c.endpoint, "aws-endpoint", "", "Test only: a local KMS endpoint, with static test credentials.")
+	if registerTestEndpoint != nil {
+		registerTestEndpoint(fs, c)
+	}
 }
+
+// registerTestEndpoint adds --aws-endpoint, a local test KMS. Only builds with the
+// kmsca_test_endpoint tag have it (testendpoint.go): release binaries, the ones
+// handed root-key credentials, can't be pointed anywhere but AWS.
+var registerTestEndpoint func(fs *flag.FlagSet, c *common)
 
 func (c *common) check() error {
 	if c.keyID == "" || c.commonName == "" || c.domains == "" || c.outFile == "" {

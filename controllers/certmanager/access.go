@@ -7,6 +7,7 @@ import (
 	"time"
 
 	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/domains"
 	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 )
 
@@ -21,6 +22,15 @@ type Access struct {
 	keyIDs     map[string]bool
 	ceilings   Ceilings
 	roots      []*x509.Certificate
+	skipped    []SkippedRoot
+}
+
+// SkippedRoot is a pinned root left out because it is not valid now (expired, or
+// not yet valid). Nothing chains to it; it should be removed from the pin.
+type SkippedRoot struct {
+	Index  int // 1-based position in --root-certificate
+	Root   *x509.Certificate
+	Reason error
 }
 
 // Ceilings are the operator's upper bounds on every KMSIssuer.
@@ -32,16 +42,20 @@ type Ceilings struct {
 	AllowWildcards bool
 	// MaxCertificateDuration: the longest issued validity any issuer may allow.
 	MaxCertificateDuration time.Duration
-	// MaxIntermediateDuration: the longest an issuer's intermediate may be valid
-	// (0: kmsca.MaxIntermediateDuration, which is also the most it may be).
+	// MaxIntermediateDuration: the longest an issuer's intermediate may be valid,
+	// above zero and at most kmsca.MaxIntermediateDuration.
 	MaxIntermediateDuration time.Duration
 }
 
 // NewAccess builds an Access. Namespaces, key IDs, permitted domains and at least
 // one root are all required. Aliases are refused as keys: they can be re-pointed at
-// another key. Each root must be a valid root for this CA (self-signed, path length
-// 1, name constrained) with every permitted domain inside the operator's. More than
-// one root is pinned only while replacing one: intermediates may chain to either.
+// another key. Permitted domains must be valid constraint domains. Every root must
+// be a root for this CA (self-signed, path length 1, name constrained) with every
+// name constraint inside the operator's domains; any that fails is fatal. More than
+// one root is pinned only while replacing one: intermediates may chain to either. A
+// root that is structurally sound but not valid now (an old root that expired
+// before it was removed from the pin) is skipped and reported (Skipped), not fatal,
+// as long as one valid root is left.
 func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Certificate, now time.Time) (*Access, error) {
 	a := &Access{namespaces: map[string]bool{}, keyIDs: map[string]bool{}}
 	for _, ns := range namespaces {
@@ -66,44 +80,64 @@ func NewAccess(namespaces, keyIDs []string, ceilings Ceilings, roots []*x509.Cer
 		return nil, fmt.Errorf("at least one allowed KMS key is required")
 	}
 	for _, d := range ceilings.PermittedDNSDomains {
-		d = normalizeDomain(d)
-		if d == "" || !strings.Contains(d, ".") {
-			return nil, fmt.Errorf("permitted DNS domain %q must have at least two labels", d)
+		d = strings.TrimSpace(d)
+		if err := kmsca.ValidConstraintDomain(d); err != nil {
+			return nil, fmt.Errorf("permitted DNS domain: %w", err)
 		}
 		a.ceilings.PermittedDNSDomains = append(a.ceilings.PermittedDNSDomains, d)
 	}
 	if len(a.ceilings.PermittedDNSDomains) == 0 {
 		return nil, fmt.Errorf("at least one permitted DNS domain is required")
 	}
+	if ceilings.MaxIntermediateDuration <= 0 || ceilings.MaxIntermediateDuration > kmsca.MaxIntermediateDuration {
+		return nil, fmt.Errorf("the maximum intermediate duration must be above zero and at most %s", kmsca.MaxIntermediateDuration)
+	}
 	if ceilings.MaxCertificateDuration < time.Hour || ceilings.MaxCertificateDuration%time.Second != 0 {
 		return nil, fmt.Errorf("the maximum certificate duration must be whole seconds and at least 1h")
 	}
-	if ceilings.MaxIntermediateDuration > kmsca.MaxIntermediateDuration {
-		return nil, fmt.Errorf("the maximum intermediate duration is at most %s", kmsca.MaxIntermediateDuration)
+	// Issuers warn from twice the leaf maximum before their intermediate expires: a
+	// fresh intermediate must start outside that window, or leaves are cut short
+	// and the warning never clears.
+	if 2*ceilings.MaxCertificateDuration >= ceilings.MaxIntermediateDuration {
+		return nil, fmt.Errorf("the maximum certificate duration %s must be less than half the maximum intermediate duration %s",
+			ceilings.MaxCertificateDuration, ceilings.MaxIntermediateDuration)
 	}
 	if len(roots) == 0 {
 		return nil, fmt.Errorf("at least one root certificate is required")
 	}
 	for i, root := range roots {
-		if err := kmsca.ValidateRoot(root, now); err != nil {
+		if err := kmsca.ValidateRootStructure(root); err != nil {
 			return nil, fmt.Errorf("root certificate %d: %w", i+1, err)
 		}
-		for _, d := range root.PermittedDNSDomains {
-			if !withinDomains(d, a.ceilings.PermittedDNSDomains) {
+		for _, d := range kmsca.RootConstraintDomains(root) {
+			if !domains.Within(d, a.ceilings.PermittedDNSDomains) {
 				return nil, fmt.Errorf("root certificate %d permits %q, outside the permitted DNS domains %v", i+1, d, a.ceilings.PermittedDNSDomains)
 			}
 		}
+		if err := kmsca.ValidateRoot(root, now); err != nil {
+			a.skipped = append(a.skipped, SkippedRoot{Index: i + 1, Root: root, Reason: err})
+			continue
+		}
+		a.roots = append(a.roots, root)
+	}
+	if len(a.roots) == 0 {
+		return nil, fmt.Errorf("no pinned root certificate is valid now: %v", a.skipped[0].Reason)
 	}
 	a.ceilings.AllowWildcards = ceilings.AllowWildcards
 	a.ceilings.MaxCertificateDuration = ceilings.MaxCertificateDuration
 	a.ceilings.MaxIntermediateDuration = ceilings.MaxIntermediateDuration
-	a.roots = roots
 	return a, nil
 }
 
-// Roots are the pinned root certificates.
+// Roots are the pinned root certificates valid at startup: intermediates must
+// chain to one of them.
 func (a *Access) Roots() []*x509.Certificate {
 	return a.roots
+}
+
+// Skipped are pinned roots left out at startup because they were not valid then.
+func (a *Access) Skipped() []SkippedRoot {
+	return a.skipped
 }
 
 // MaxIntermediateDuration is the longest an intermediate may be valid.
@@ -140,7 +174,7 @@ func (a *Access) CheckIssuer(issuer *kmsiapi.KMSIssuer, s settings) error {
 		return fmt.Errorf("permittedDNSDomains is required")
 	}
 	for _, d := range issuer.Spec.PermittedDNSDomains {
-		if !withinDomains(normalizeDomain(d), a.ceilings.PermittedDNSDomains) {
+		if !domains.Within(d, a.ceilings.PermittedDNSDomains) {
 			return fmt.Errorf("permitted DNS domain %q is outside the operator's %v", d, a.ceilings.PermittedDNSDomains)
 		}
 	}
@@ -155,18 +189,4 @@ func (a *Access) CheckIssuer(issuer *kmsiapi.KMSIssuer, s settings) error {
 
 func isAlias(id string) bool {
 	return strings.HasPrefix(id, "alias/") || strings.Contains(id, ":alias/")
-}
-
-func normalizeDomain(d string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
-}
-
-// withinDomains reports whether d equals one of domains or is a subdomain of one.
-func withinDomains(d string, domains []string) bool {
-	for _, c := range domains {
-		if d == c || strings.HasSuffix(d, "."+c) {
-			return true
-		}
-	}
-	return false
 }

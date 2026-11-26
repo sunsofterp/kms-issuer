@@ -2,6 +2,7 @@ package certmanager
 
 import (
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -42,9 +43,14 @@ func init() {
 	metrics.Registry.MustRegister(caNotAfter, certificatesIssued, requestsRefused, leavesTruncated, rootNotAfter)
 }
 
-// RecordRoots exports each pinned root's expiry.
+// RecordRoots exports each pinned root's expiry, skipped roots included (an
+// expired one shows as a past timestamp to alert on).
 func RecordRoots(a *Access) {
-	for _, root := range a.Roots() {
+	roots := append([]*x509.Certificate{}, a.Roots()...)
+	for _, s := range a.Skipped() {
+		roots = append(roots, s.Root)
+	}
+	for _, root := range roots {
 		sum := sha256.Sum256(root.Raw)
 		rootNotAfter.WithLabelValues(root.Subject.String(), hex.EncodeToString(sum[:])).Set(float64(root.NotAfter.Unix()))
 	}

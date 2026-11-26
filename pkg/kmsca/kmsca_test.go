@@ -295,6 +295,38 @@ var _ = Context("KMSCA", func() {
 			Expect(validateErr(t.root, other)).NotTo(Succeed())
 		})
 
+		It("accepts only server auth as the extended key usage, and at most 183 days", func() {
+			t := newTwoTier()
+			pub, err := t.client.PublicKey(context.TODO(), t.issuingKeyID)
+			Expect(err).To(BeNil())
+			// sign makes an intermediate from the root key's template after mutate.
+			sign := func(mutate func(*x509.Certificate)) *x509.Certificate {
+				tmpl, err := kmsca.CATemplate(caInput("Hand Signed", 48*time.Hour, t.now), kmsca.Intermediate)
+				Expect(err).To(BeNil())
+				mutate(tmpl)
+				cert, err := t.client.SignCertificate(context.TODO(), &kmsca.IssueCertificateInput{
+					KeyID: t.rootKeyID, Cert: tmpl, Parent: t.root, PublicKey: pub,
+				})
+				Expect(err).To(BeNil())
+				return cert
+			}
+			Expect(validateErr(sign(func(*x509.Certificate) {}), t.expectedForIntermediate)).To(Succeed())
+			for name, eku := range map[string][]x509.ExtKeyUsage{
+				"none":                 nil,
+				"server and client":    {x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+				"any":                  {x509.ExtKeyUsageAny},
+				"client only":          {x509.ExtKeyUsageClientAuth},
+				"server and code sign": {x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageCodeSigning},
+			} {
+				By("refusing extended key usage: " + name)
+				Expect(validateErr(sign(func(c *x509.Certificate) { c.ExtKeyUsage = eku }), t.expectedForIntermediate)).NotTo(Succeed())
+			}
+			at := sign(func(c *x509.Certificate) { c.NotAfter = c.NotBefore.Add(kmsca.MaxIntermediateDuration) })
+			Expect(validateErr(at, t.expectedForIntermediate)).To(Succeed())
+			over := sign(func(c *x509.Certificate) { c.NotAfter = c.NotBefore.Add(kmsca.MaxIntermediateDuration + time.Second) })
+			Expect(validateErr(over, t.expectedForIntermediate)).NotTo(Succeed())
+		})
+
 		It("refuses an unconstrained intermediate signed by the root key", func() {
 			t := newTwoTier()
 			rootSignerCA := t.client

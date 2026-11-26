@@ -78,7 +78,8 @@ jobs:
           ROOT_KEY_ID: ${{ steps.key.outputs.root_key_id }}
           KEY_ID: ${{ steps.key.outputs.key_id }}
         run: |
-          go build -o kms-ca ./cmd/kms-ca
+          # A test build: only it has --aws-endpoint.
+          go build -tags kmsca_test_endpoint -o kms-ca ./cmd/kms-ca
           ./kms-ca root --aws-endpoint "${KMS}" --key-id "${ROOT_KEY_ID}" \
             --common-name "E2E Root" --domains example.internal --out root.pem
           ./kms-ca intermediate --aws-endpoint "${KMS}" --root-key-id "${ROOT_KEY_ID}" --root-certificate root.pem \

@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/sunsofterp/kms-issuer/v5/pkg/domains"
 )
 
 // ParseCertificatePEM parses exactly one PEM CERTIFICATE block and nothing else.
@@ -67,6 +69,15 @@ func EncodeCertificatePEM(cert *x509.Certificate) []byte {
 // cert-sign key usage, critical name constraints of valid domains with no IP
 // address, and valid at now.
 func ValidateRoot(root *x509.Certificate, now time.Time) error {
+	if err := ValidateRootStructure(root); err != nil {
+		return err
+	}
+	return checkValidity(root, now)
+}
+
+// ValidateRootStructure is ValidateRoot without the validity period: what makes a
+// certificate a root of this CA at all, expired or not.
+func ValidateRootStructure(root *x509.Certificate) error {
 	switch {
 	case root == nil:
 		return errors.New("no root certificate")
@@ -87,7 +98,23 @@ func ValidateRoot(root *x509.Certificate, now time.Time) error {
 			return err
 		}
 	}
-	return checkValidity(root, now)
+	// URI and email constraints too: each must name a valid domain.
+	for _, c := range slices.Concat(root.PermittedURIDomains, root.PermittedEmailAddresses) {
+		if err := ValidConstraintDomain(ConstraintDomain(c)); err != nil {
+			return fmt.Errorf("URI or email constraint: %w", err)
+		}
+	}
+	return nil
+}
+
+// RootConstraintDomains are the domains every name constraint of a root covers
+// (DNS, URI and email).
+func RootConstraintDomains(root *x509.Certificate) []string {
+	var ds []string
+	for _, c := range slices.Concat(root.PermittedDNSDomains, root.PermittedURIDomains, root.PermittedEmailAddresses) {
+		ds = append(ds, ConstraintDomain(c))
+	}
+	return ds
 }
 
 // ExpectedIntermediate is what an issuer's intermediate must match.
@@ -214,21 +241,21 @@ func checkValidity(cert *x509.Certificate, now time.Time) error {
 // WithinDomains reports whether d (or the host part of an email constraint) equals
 // one of domains or is a subdomain of one. A leading dot (a constraint meaning
 // "subdomains only") is inside the domain it qualifies.
-func WithinDomains(d string, domains []string) bool {
-	d = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(d, "."), "."))
-	if i := strings.LastIndex(d, "@"); i >= 0 {
-		d = d[i+1:]
+func WithinDomains(d string, permitted []string) bool {
+	cs := make([]string, 0, len(permitted))
+	for _, c := range permitted {
+		cs = append(cs, ConstraintDomain(c))
 	}
-	if d == "" {
-		return false
+	return domains.Within(ConstraintDomain(d), cs)
+}
+
+// ConstraintDomain is the domain a name constraint entry covers: a URI constraint's
+// leading dot ("subdomains of") and an email constraint's mailbox are dropped.
+func ConstraintDomain(c string) string {
+	if i := strings.LastIndex(c, "@"); i >= 0 {
+		c = c[i+1:]
 	}
-	for _, c := range domains {
-		c = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(c, "."), "."))
-		if c != "" && (d == c || strings.HasSuffix(d, "."+c)) {
-			return true
-		}
-	}
-	return false
+	return strings.TrimPrefix(c, ".")
 }
 
 func excludesAllIPs(ranges []*net.IPNet) bool {

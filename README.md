@@ -49,25 +49,36 @@ extensions:
   `--allowed-issuer-namespaces` and `--allowed-key-ids` flags name the namespaces a KMSIssuer may live in
   and the KMS keys it may use (by ID or ARN, never alias). Its `--permitted-dns-domains` (required),
   `--allow-wildcards` and `--max-certificate-duration` flags bound every issuer: whoever can write a
-  KMSIssuer can narrow its policy, never widen it past them. Any other KMSIssuer signs nothing.
+  KMSIssuer can narrow its policy, never widen it past them. Any other KMSIssuer signs nothing. Permitted
+  domains must be lower-case names of two labels or more; `--max-intermediate-duration` must be above zero
+  and at most 183 days, and `--max-certificate-duration` less than half of it (so a fresh intermediate is
+  never already in its expiry-warning window).
 - **Only under a verified intermediate.** At signing time, the issuer's intermediate must be for its KMS
   key, issued and signed by the pinned root (full path validation), path length 0, critically
   name-constrained inside the operator's domains and covering the issuer's, and valid now. A KMSIssuer
   cannot change the root: it is the controller's.
 
-What is handed out: `tls.crt` is the leaf followed by the intermediate; `ca.crt` is the pinned root. Every
-issuance is logged with its serial, names, validity, issuer, key and requester.
+What is handed out: `tls.crt` is the leaf followed by the intermediate that signed it; `ca.crt` is the
+pinned root that intermediate chains to. Every issuance is logged with its serial, names, validity, issuer,
+key and requester.
+
+A certificate signed but not yet recorded (a failed status write) is kept, with its chain, and recorded on
+the next attempt rather than signed again. That holds within one controller process: if the controller
+restarts or loses leadership between signing and recording, the request is signed a second time. Both
+certificates are in the issuance log; only the recorded one is handed out.
 
 ## Making the CA (by hand, with administrator credentials)
 
 Create two asymmetric `SIGN_VERIFY` KMS keys (RSA 3072 or 4096) outside the cluster: the root key, which no
 workload may use, and the issuing key. Then:
 
-Use the `kms-ca` binary attached to the release you deploy, after verifying it:
+Use the `kms-ca` binary attached to the release you deploy, after verifying that the release workflow signed
+it at that release's tag (a signature from any other workflow or branch is refused):
 
 ```console
+TAG=v5.3.0   # the release you deploy
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/sunsofterp/kms-issuer/' \
+  --certificate-identity "https://github.com/sunsofterp/kms-issuer/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 kms-ca root --key-id <root key ARN> --common-name "Example Root" --domains example.internal --out root.pem
@@ -101,7 +112,14 @@ helm upgrade --install kms-issuer oci://ghcr.io/sunsofterp/charts/kms-issuer \
 ```
 
 `image.digest` is required: use the digest a release records. Release images and the chart are signed with
-cosign (keyless); images also carry SBOM and provenance attestations.
+cosign (keyless) by the release workflow; images also carry SBOM and provenance attestations. Verify (or
+enforce at admission) that exact signer identity, never a pattern over the repository:
+
+```console
+cosign verify ghcr.io/sunsofterp/kms-issuer@sha256:... \
+  --certificate-identity "https://github.com/sunsofterp/kms-issuer/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 The controller watches and has permissions in the allowed issuer namespaces only (a Role in each); it is
 cluster-wide only for KMSKeys, when that controller is enabled. Keep the allowed namespaces to platform
@@ -154,7 +172,8 @@ with the intermediate in its last `maxCertificateDuration`, so renew before then
   30 days) before expiry;
 - `kms_issuer_intermediate_not_after_timestamp_seconds` is the expiry to alert on, and
   `kms_issuer_leaves_truncated` turns 1 once leaves are being cut short (an overdue renewal);
-- under an hour of intermediate left, requests wait (pending) rather than get a uselessly short certificate.
+- under an hour of intermediate left, requests wait (`Ready=False`, reason `Pending`, saying the intermediate
+  must be renewed) rather than get a uselessly short certificate.
 
 **Root replacement (planned, no hard cutover).**
 
@@ -165,6 +184,11 @@ with the intermediate in its last `maxCertificateDuration`, so renew before then
 3. Make a new intermediate under the new root and replace each issuer's `intermediateCertificate`.
 4. Once every certificate has renewed under the new root, remove the old root from `rootCertificate` and
    from devices, and schedule the old root key's deletion.
+
+If a pinned root expires (or isn't valid yet) the controller skips it at startup with an error log line
+(`PINNED ROOT SKIPPED`) and keeps running on the others; it refuses to start only when no pinned root is
+valid. A root that is not a root of this CA at all, or wider than `--permitted-dns-domains`, is always
+fatal.
 
 `rootCertificate` lives in an immutable ConfigMap named by its content, so every change is a rollout.
 

@@ -68,6 +68,8 @@ var (
 	testCeilings = Ceilings{
 		PermittedDNSDomains:    []string{"example.internal"},
 		MaxCertificateDuration: 90 * 24 * time.Hour,
+		// 183 days: less than twice the 90-day leaf maximum is refused.
+		MaxIntermediateDuration: 183 * 24 * time.Hour,
 	}
 )
 

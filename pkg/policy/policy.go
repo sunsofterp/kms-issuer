@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/cryptobyte"
+
+	"github.com/sunsofterp/kms-issuer/v5/pkg/domains"
 	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
 )
 
@@ -49,6 +51,10 @@ var oidSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
 
 // ErrDenied wraps every refusal: the request will never be signed as it is.
 var ErrDenied = errors.New("request refused by the issuer's policy")
+
+// ErrWait wraps a request that can't be signed yet but will be once the issuer is
+// fixed (its intermediate renewed): it stays pending, never failed.
+var ErrWait = errors.New("request waits for the issuer")
 
 // Issuer is what the issuer allows.
 type Issuer struct {
@@ -130,7 +136,7 @@ func Template(req *Request, iss *Issuer, parent *x509.Certificate, serial *big.I
 	if notAfter.After(parent.NotAfter) {
 		notAfter = parent.NotAfter
 		if notAfter.Sub(now) < minDuration {
-			return nil, nil, fmt.Errorf("the CA certificate expires at %s, too soon to issue under it: renew the intermediate", parent.NotAfter.Format(time.RFC3339))
+			return nil, nil, fmt.Errorf("%w: the intermediate expires at %s, too soon to issue under it: renew the intermediate", ErrWait, parent.NotAfter.Format(time.RFC3339))
 		}
 	}
 
@@ -225,7 +231,7 @@ func checkDNSNames(requested []string, iss *Issuer) ([]string, error) {
 		if !validHostname(host) {
 			return nil, deny("%q is not a valid DNS name", raw)
 		}
-		if !permitted(host, iss.PermittedDNSDomains) {
+		if !domains.Within(host, iss.PermittedDNSDomains) {
 			return nil, deny("%q is outside the issuer's permitted domains %v", raw, iss.PermittedDNSDomains)
 		}
 		names = append(names, name)
@@ -234,16 +240,6 @@ func checkDNSNames(requested []string, iss *Issuer) ([]string, error) {
 }
 
 // permitted reports whether host equals a domain or is a subdomain of one.
-func permitted(host string, domains []string) bool {
-	for _, d := range domains {
-		d = strings.ToLower(strings.TrimSuffix(d, "."))
-		if host == d || strings.HasSuffix(host, "."+d) {
-			return true
-		}
-	}
-	return false
-}
-
 // validHostname accepts letters, digits and hyphens in labels of 1-63 characters,
 // no leading or trailing hyphen, no empty label, no trailing dot.
 func validHostname(host string) bool {

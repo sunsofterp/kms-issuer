@@ -66,10 +66,26 @@ type CertificateRequestReconciler struct {
 	signed sync.Map
 }
 
-// signedCertificate is a certificate signed for the request with this UID.
+// signedCertificate is a certificate signed for the request with this UID, with
+// the chain and root as they were when it was signed: if the issuer's intermediate
+// is replaced before it is recorded, the leaf still goes out beside the
+// intermediate that signed it.
 type signedCertificate struct {
-	uid  types.UID
-	cert *x509.Certificate
+	uid     types.UID
+	serial  string
+	certPEM []byte // the leaf, then the intermediate that signed it
+	rootPEM []byte // the pinned root that intermediate chains to
+}
+
+// newSignedCertificate encodes what is handed out for a leaf, from parsed
+// certificates.
+func newSignedCertificate(uid types.UID, leaf *x509.Certificate, verified verifiedIssuer) signedCertificate {
+	return signedCertificate{
+		uid:     uid,
+		serial:  leaf.SerialNumber.Text(16),
+		certPEM: append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}), kmsca.EncodeCertificatePEM(verified.intermediate)...),
+		rootPEM: kmsca.EncodeCertificatePEM(verified.root),
+	}
 }
 
 // Annotation for generating RBAC role for writing Events
@@ -101,11 +117,17 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	shouldProcess, err := r.requestShouldBeProcessed(ctx, log, cr)
 	if err != nil || !shouldProcess {
+		if err == nil {
+			// Finished (or not ours to sign yet): nothing kept for it is needed,
+			// including a certificate whose write succeeded but reported an error.
+			r.signed.Delete(req.NamespacedName)
+		}
 		return ctrl.Result{}, err
 	}
 
 	if len(cr.Status.Certificate) > 0 {
 		log.V(levelDebug).Info("existing certificate data found in status, skipping already completed CertificateRequest")
+		r.signed.Delete(req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 
@@ -160,7 +182,7 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// recorded now instead of signing a second one.
 	if pending, ok := r.signed.Load(req.NamespacedName); ok {
 		if p := pending.(signedCertificate); p.uid == cr.UID {
-			return r.record(ctx, log, req, &issuer, verified, p.cert)
+			return r.record(ctx, log, req, &issuer, p)
 		}
 		r.signed.Delete(req.NamespacedName)
 	}
@@ -198,6 +220,10 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 			requestsRefused.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
 			return ctrl.Result{}, r.fail(ctx, cr, "%v", err)
 		}
+		if errors.Is(err, policy.ErrWait) {
+			log.Info("request waits", "reason", err.Error())
+			_ = r.setStatus(ctx, cr, cmmeta.ConditionFalse, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -224,19 +250,19 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		"requester", cr.Spec.Username,
 		"requesterGroups", cr.Spec.Groups,
 	)
-	r.signed.Store(req.NamespacedName, signedCertificate{uid: cr.UID, cert: signed})
-	return r.record(ctx, log, req, &issuer, verified, signed)
+	p := newSignedCertificate(cr.UID, signed, verified)
+	r.signed.Store(req.NamespacedName, p)
+	return r.record(ctx, log, req, &issuer, p)
 }
 
 // record writes a signed certificate into the request's status. A conflicting
 // write is retried with the certificate already signed, and a failed one keeps it
 // for the next attempt: signing again would issue a second certificate. The chain
-// handed out is the leaf then the intermediate; ca.crt is the pinned root the
-// intermediate chains to, the certificate clients trust. All re-encoded from parsed
-// certificates.
-func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logger, req ctrl.Request, issuer *kmsiapi.KMSIssuer, verified verifiedIssuer, signed *x509.Certificate) (ctrl.Result, error) {
-	certPEM := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signed.Raw}), kmsca.EncodeCertificatePEM(verified.intermediate)...)
-	rootPEM := kmsca.EncodeCertificatePEM(verified.root)
+// handed out is the leaf then the intermediate that signed it; ca.crt is the
+// pinned root that intermediate chains to, the certificate clients trust. Both were
+// fixed when the leaf was signed.
+func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logger, req ctrl.Request, issuer *kmsiapi.KMSIssuer, p signedCertificate) (ctrl.Result, error) {
+	certPEM, rootPEM := p.certPEM, p.rootPEM
 	var cr *cmapi.CertificateRequest
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := new(cmapi.CertificateRequest)
@@ -257,7 +283,7 @@ func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logg
 			r.signed.Delete(req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "failed to record the issued certificate (kept for the next attempt)", "serial", signed.SerialNumber.Text(16))
+		log.Error(err, "failed to record the issued certificate (kept for the next attempt)", "serial", p.serial)
 		return ctrl.Result{}, err
 	}
 	r.signed.Delete(req.NamespacedName)
