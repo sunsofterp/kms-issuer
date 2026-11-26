@@ -74,22 +74,26 @@ type CertificateRequestReconciler struct {
 // is replaced before it is recorded, the leaf still goes out beside the
 // intermediate that signed it.
 type signedCertificate struct {
-	uid     types.UID
-	leaf    *x509.Certificate
-	serial  string
-	certPEM []byte // the leaf, then the intermediate that signed it
-	rootPEM []byte // the pinned root that intermediate chains to
+	uid          types.UID
+	leaf         *x509.Certificate
+	intermediate *x509.Certificate // the intermediate that signed it
+	root         *x509.Certificate // the pinned root that intermediate chains to
+	serial       string
+	certPEM      []byte // the leaf, then the intermediate that signed it
+	rootPEM      []byte // the pinned root that intermediate chains to
 }
 
 // newSignedCertificate encodes what is handed out for a leaf, from parsed
 // certificates.
 func newSignedCertificate(uid types.UID, leaf *x509.Certificate, verified verifiedIssuer) signedCertificate {
 	return signedCertificate{
-		uid:     uid,
-		leaf:    leaf,
-		serial:  leaf.SerialNumber.Text(16),
-		certPEM: append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}), kmsca.EncodeCertificatePEM(verified.intermediate)...),
-		rootPEM: kmsca.EncodeCertificatePEM(verified.root),
+		uid:          uid,
+		leaf:         leaf,
+		intermediate: verified.intermediate,
+		root:         verified.root,
+		serial:       leaf.SerialNumber.Text(16),
+		certPEM:      append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}), kmsca.EncodeCertificatePEM(verified.intermediate)...),
+		rootPEM:      kmsca.EncodeCertificatePEM(verified.root),
 	}
 }
 
@@ -190,7 +194,10 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if pending, ok := r.signed.Load(req.NamespacedName); ok {
 		p := pending.(signedCertificate)
 		if p.uid == cr.UID {
-			why := stillAcceptable(p.leaf, &issuer, settings, r.Clock.Now())
+			why := keptChainCurrent(p, verified, r.Access, r.Clock.Now())
+			if why == "" {
+				why = stillAcceptable(p.leaf, &issuer, settings, r.Clock.Now())
+			}
 			if why == "" {
 				return r.record(ctx, log, req, &issuer, p)
 			}
@@ -265,6 +272,27 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 	p := newSignedCertificate(cr.UID, signed, verified)
 	r.signed.Store(req.NamespacedName, p)
 	return r.record(ctx, log, req, &issuer, p)
+}
+
+// keptChainCurrent returns why a kept certificate's chain no longer matches the
+// issuer as it is now, or "" if it does: the leaf must be signed by the issuer's
+// current key (it verifies against the current intermediate: a renewed
+// intermediate on the same key is fine, another key is not), and the chain it is
+// handed out with must still be valid: its intermediate unexpired, its root a
+// pinned root valid now.
+func keptChainCurrent(p signedCertificate, verified verifiedIssuer, access *Access, now time.Time) string {
+	if err := p.leaf.CheckSignatureFrom(verified.intermediate); err != nil {
+		return "not signed by the issuer's current key"
+	}
+	if !now.Before(p.intermediate.NotAfter) {
+		return "the intermediate that signed it has expired"
+	}
+	for _, r := range access.RootsAt(now) {
+		if r.Equal(p.root) {
+			return ""
+		}
+	}
+	return "the root it chains to is no longer a valid pinned root"
 }
 
 // stillAcceptable returns why a kept leaf may no longer be handed out by the

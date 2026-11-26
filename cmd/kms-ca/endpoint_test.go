@@ -2,23 +2,36 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 )
 
 // isolate points the AWS SDK at empty config files and static credentials, so
-// nothing outside the test is read and nothing is called.
+// nothing outside the test is read. The tests below only load the configuration
+// (loadConfig), which calls nothing: even if a refusal regressed, no request
+// would be made.
 func isolate(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, k := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_KMS", "AWS_ENDPOINT_URL_STS", "AWS_PROFILE", "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"} {
-		t.Setenv(k, "")
-		os.Unsetenv(k)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, "AWS_") || strings.HasSuffix(strings.ToUpper(name), "_PROXY") {
+			t.Setenv(name, "")
+			os.Unsetenv(name)
+		}
 	}
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "config"))
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
@@ -28,13 +41,22 @@ func isolate(t *testing.T) string {
 	return dir
 }
 
-// Every way the AWS configuration can redirect KMS or STS is refused before
-// anything is called.
-func TestEndpointOverridesRefused(t *testing.T) {
+// Everything that could redirect a call, or make it trust another CA, is refused.
+func TestRedirectsRefused(t *testing.T) {
 	cases := map[string]func(t *testing.T, dir string){
-		"AWS_ENDPOINT_URL":     func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:1") },
-		"AWS_ENDPOINT_URL_KMS": func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_KMS", "http://127.0.0.1:1") },
-		"AWS_ENDPOINT_URL_STS": func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1") },
+		"AWS_ENDPOINT_URL":          func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:1") },
+		"AWS_ENDPOINT_URL_KMS":      func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_KMS", "http://127.0.0.1:1") },
+		"AWS_ENDPOINT_URL_STS":      func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1") },
+		"AWS_ENDPOINT_URL_SSO":      func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_SSO", "http://127.0.0.1:1") },
+		"AWS_ENDPOINT_URL_SSO_OIDC": func(t *testing.T, _ string) { t.Setenv("AWS_ENDPOINT_URL_SSO_OIDC", "http://127.0.0.1:1") },
+		"AWS_CA_BUNDLE": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "ca.pem"), testCAPEM(t))
+			t.Setenv("AWS_CA_BUNDLE", filepath.Join(dir, "ca.pem"))
+		},
+		"ca_bundle in the profile": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "ca.pem"), testCAPEM(t))
+			writeFile(t, filepath.Join(dir, "config"), "[default]\nca_bundle = "+filepath.Join(dir, "ca.pem")+"\n")
+		},
 		"endpoint_url in the profile": func(t *testing.T, dir string) {
 			writeFile(t, filepath.Join(dir, "config"), "[default]\nendpoint_url = http://127.0.0.1:1\n")
 		},
@@ -42,25 +64,68 @@ func TestEndpointOverridesRefused(t *testing.T) {
 			writeFile(t, filepath.Join(dir, "config"),
 				"[default]\nservices = evil\n\n[services evil]\nkms =\n  endpoint_url = http://127.0.0.1:1\n")
 		},
+		"a services section for SSO": func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, "config"),
+				"[default]\nservices = evil\n\n[services evil]\nsso =\n  endpoint_url = http://127.0.0.1:1\n")
+		},
 	}
 	for name, set := range cases {
 		t.Run(name, func(t *testing.T) {
 			dir := isolate(t)
 			set(t, dir)
 			c := &common{}
-			_, _, err := c.connect(context.Background())
-			if err == nil || !strings.Contains(err.Error(), "overrides the") {
+			if _, err := c.loadConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "clean environment") {
 				t.Fatalf("not refused: %v", err)
 			}
 		})
 	}
-	t.Run("no override", func(t *testing.T) {
+	t.Run("nothing set", func(t *testing.T) {
 		isolate(t)
-		cfgErr := refuseEndpointOverridesFor(t)
-		if cfgErr != nil {
-			t.Fatalf("refused the default configuration: %v", cfgErr)
+		c := &common{}
+		if _, err := c.loadConfig(context.Background()); err != nil {
+			t.Fatalf("refused a clean configuration: %v", err)
 		}
 	})
+}
+
+// Proxy settings are ignored by every client the configuration builds.
+func TestProxyIgnored(t *testing.T) {
+	isolate(t)
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	c := &common{}
+	cfg, err := c.loadConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, ok := cfg.HTTPClient.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("HTTP client is %T", cfg.HTTPClient)
+	}
+	if client.GetTransport().Proxy != nil {
+		t.Error("the transport still uses a proxy")
+	}
+}
+
+// The endpoint printed follows the FIPS setting.
+func TestResolvedEndpoint(t *testing.T) {
+	isolate(t)
+	c := &common{}
+	cfg, err := c.loadConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep, err := resolvedKMSEndpoint(context.Background(), cfg)
+	if err != nil || ep != "https://kms.us-east-1.amazonaws.com" {
+		t.Errorf("endpoint %q, %v", ep, err)
+	}
+	t.Setenv("AWS_USE_FIPS_ENDPOINT", "true")
+	if cfg, err = c.loadConfig(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ep, _ = resolvedKMSEndpoint(context.Background(), cfg); !strings.Contains(ep, "kms-fips.") {
+		t.Errorf("FIPS endpoint %q", ep)
+	}
 }
 
 // A release (untagged) build has no --aws-endpoint flag.
@@ -75,15 +140,23 @@ func TestNoTestEndpointFlag(t *testing.T) {
 	}
 }
 
-// refuseEndpointOverridesFor checks the configuration as loaded now, without
-// calling AWS.
-func refuseEndpointOverridesFor(t *testing.T) error {
+// testCAPEM is a throwaway self-signed CA certificate, as a CA bundle would hold.
+func testCAPEM(t *testing.T) string {
 	t.Helper()
-	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return refuseEndpointOverrides(cfg)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Interception CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
 func writeFile(t *testing.T, path, content string) {

@@ -27,11 +27,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
@@ -96,8 +98,8 @@ func (c *common) register(fs *flag.FlagSet, defaultDuration time.Duration) {
 
 // registerTestEndpoint adds --aws-endpoint, a local test KMS. Only builds with the
 // kmsca_test_endpoint tag have it (testendpoint.go). Release binaries, the ones
-// handed root-key credentials, have no such flag and refuse endpoint overrides
-// from the AWS configuration (refuseEndpointOverrides).
+// handed root-key credentials, have no such flag, ignore proxies and refuse
+// endpoint overrides and custom CA bundles (loadConfig, refuseRedirects).
 var registerTestEndpoint func(fs *flag.FlagSet, c *common)
 
 func (c *common) check() error {
@@ -128,6 +130,29 @@ func (c *common) input() *kmsca.CAInput {
 var newCA = func(ctx context.Context, c *common) (*kmsca.KMSCA, string, error) { return c.connect(ctx) }
 
 func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, string, error) {
+	cfg, err := c.loadConfig(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if c.endpoint != "" {
+		return kmsca.NewKMSCA(&cfg), "(test endpoint " + c.endpoint + ")", nil
+	}
+	endpoint, err := resolvedKMSEndpoint(ctx, cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	who, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return nil, "", fmt.Errorf("checking the AWS identity: %w", err)
+	}
+	return kmsca.NewKMSCA(&cfg), aws.ToString(who.Arn) + " via " + endpoint, nil
+}
+
+// loadConfig loads the AWS configuration and, outside test builds, makes sure
+// every AWS call goes straight to AWS's own endpoints: no proxy (ignored), no
+// custom CA bundle and no endpoint override of any kind (refused). Nothing is
+// called.
+func (c *common) loadConfig(ctx context.Context) (aws.Config, error) {
 	var opts []func(*awsconfig.LoadOptions) error
 	if c.region != "" {
 		opts = append(opts, awsconfig.WithRegion(c.region))
@@ -139,48 +164,85 @@ func (c *common) connect(ctx context.Context) (*kmsca.KMSCA, string, error) {
 		if c.region == "" {
 			opts = append(opts, awsconfig.WithRegion("eu-west-1"))
 		}
+	} else {
+		// Every client the configuration builds, credential providers (SSO,
+		// IMDS...) included, uses this one: proxy settings are ignored, so a
+		// TLS-inspecting proxy can't stand in for AWS.
+		opts = append(opts, awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		})))
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, "", err
+		return aws.Config{}, err
 	}
 	if cfg.Region == "" {
-		return nil, "", errors.New("no AWS region: set --region or AWS_REGION")
+		return aws.Config{}, errors.New("no AWS region: set --region or AWS_REGION")
 	}
 	if c.endpoint != "" {
-		return kmsca.NewKMSCA(&cfg), "(test endpoint " + c.endpoint + ")", nil
+		return cfg, nil
 	}
-	// The root key must be AWS's: refuse any endpoint override (AWS_ENDPOINT_URL,
-	// AWS_ENDPOINT_URL_KMS / _STS, endpoint_url or a services section in the AWS
-	// config), which could send the signing to another KMS while STS still names
-	// the real identity. Checked on the clients as the SDK resolves them.
-	if err := refuseEndpointOverrides(cfg); err != nil {
-		return nil, "", err
+	if err := refuseRedirects(cfg, os.Environ()); err != nil {
+		return aws.Config{}, err
 	}
-	endpoint, err := kms.NewDefaultEndpointResolverV2().ResolveEndpoint(ctx, kms.EndpointParameters{Region: aws.String(cfg.Region)})
-	if err != nil {
-		return nil, "", fmt.Errorf("resolving the KMS endpoint: %w", err)
-	}
-	who, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err != nil {
-		return nil, "", fmt.Errorf("checking the AWS identity: %w", err)
-	}
-	return kmsca.NewKMSCA(&cfg), aws.ToString(who.Arn) + " via " + endpoint.URI.String(), nil
+	return cfg, nil
 }
 
-// refuseEndpointOverrides returns an error if the AWS configuration points KMS or
-// STS anywhere but the default AWS endpoint.
-func refuseEndpointOverrides(cfg aws.Config) error {
+// refuseRedirects returns an error if anything in the AWS configuration could send
+// a call anywhere but AWS's own endpoints, or trust a certificate the system
+// doesn't: any AWS_ENDPOINT_URL* variable (for any service: SSO too, which carries
+// the admin's token), an endpoint_url or services section in the profile, a custom
+// CA bundle (AWS_CA_BUNDLE or ca_bundle), and, as the SDK resolves them, the KMS
+// and STS clients' endpoints. The root key must only ever be used through AWS.
+func refuseRedirects(cfg aws.Config, environ []string) error {
+	const fix = "kms-ca only talks to AWS's own endpoints with the system's trusted CAs; run it from a clean environment"
+	for _, kv := range environ {
+		name, value, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "AWS_ENDPOINT_URL") && value != "" {
+			return fmt.Errorf("%s is set: %s", name, fix)
+		}
+	}
+	for _, src := range cfg.ConfigSources {
+		switch s := src.(type) {
+		case awsconfig.EnvConfig:
+			if s.CustomCABundle != "" {
+				return fmt.Errorf("AWS_CA_BUNDLE is set: %s", fix)
+			}
+		case awsconfig.SharedConfig:
+			switch {
+			case s.CustomCABundle != "":
+				return fmt.Errorf("profile %q sets ca_bundle: %s", s.Profile, fix)
+			case s.BaseEndpoint != "":
+				return fmt.Errorf("profile %q sets endpoint_url: %s", s.Profile, fix)
+			case len(s.Services.ServiceValues) > 0:
+				return fmt.Errorf("profile %q has a services section (endpoint overrides): %s", s.Profile, fix)
+			}
+		}
+	}
 	for service, ep := range map[string]*string{
 		"KMS": kms.NewFromConfig(cfg).Options().BaseEndpoint,
 		"STS": sts.NewFromConfig(cfg).Options().BaseEndpoint,
 	} {
 		if ep != nil {
-			return fmt.Errorf("the AWS configuration overrides the %s endpoint (%s): kms-ca only signs through AWS's own endpoints; "+
-				"unset AWS_ENDPOINT_URL* and remove endpoint_url / services from the AWS config profile", service, aws.ToString(ep))
+			return fmt.Errorf("the AWS configuration overrides the %s endpoint (%s): %s", service, aws.ToString(ep), fix)
 		}
 	}
 	return nil
+}
+
+// resolvedKMSEndpoint is the endpoint the KMS client resolves for this
+// configuration, with its FIPS and dual-stack settings.
+func resolvedKMSEndpoint(ctx context.Context, cfg aws.Config) (string, error) {
+	o := kms.NewFromConfig(cfg).Options()
+	ep, err := o.EndpointResolverV2.ResolveEndpoint(ctx, kms.EndpointParameters{
+		Region:       aws.String(o.Region),
+		UseFIPS:      aws.Bool(o.EndpointOptions.UseFIPSEndpoint == aws.FIPSEndpointStateEnabled),
+		UseDualStack: aws.Bool(o.EndpointOptions.UseDualStackEndpoint == aws.DualStackEndpointStateEnabled),
+	})
+	if err != nil {
+		return "", fmt.Errorf("resolving the KMS endpoint: %w", err)
+	}
+	return ep.URI.String(), nil
 }
 
 func root(args []string, out io.Writer) error {

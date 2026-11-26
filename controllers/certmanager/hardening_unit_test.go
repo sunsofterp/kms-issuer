@@ -190,14 +190,18 @@ func TestIntermediatesUnderSkippedRoots(t *testing.T) {
 		}
 	}
 	afterOldExpired := old.NotAfter.Add(time.Minute)
-	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underOld), afterOldExpired); err == nil {
-		t.Error("an intermediate under an expired root verified")
+	// Refused by the pinned-root check itself (RootsAt), not only later by path
+	// validation: the error names the root as not pinned.
+	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underOld), afterOldExpired); err == nil ||
+		!strings.Contains(err.Error(), "not issued by a pinned root") {
+		t.Errorf("an intermediate under an expired root: %v, want refused as not issued by a pinned root", err)
 	}
 	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underFuture), unitNow.Add(25*time.Hour+time.Minute)); err != nil {
 		t.Errorf("an intermediate under a root that became valid after startup: %v", err)
 	}
-	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underFuture), unitNow.Add(time.Hour)); err == nil {
-		t.Error("an intermediate under a root not valid yet verified")
+	if _, err := verifyIssuer(context.TODO(), u.ca, a, issuer(u.issuingKey, underFuture), unitNow.Add(time.Hour)); err == nil ||
+		!strings.Contains(err.Error(), "not issued by a pinned root") {
+		t.Errorf("an intermediate under a root not valid yet: %v, want refused as not issued by a pinned root", err)
 	}
 
 	// The expired old root's key as an issuing key, under the current root.
@@ -414,6 +418,54 @@ func TestKeptCertificateDroppedWhenIssuerNarrowed(t *testing.T) {
 	}
 	if h.kept() {
 		t.Error("the unacceptable certificate is still kept")
+	}
+}
+
+// A kept certificate is dropped if the issuer now uses another key (recreated
+// under the same name): it is re-signed with the new key, never handed out beside
+// the old key's intermediate.
+func TestKeptCertificateDroppedOnKeyChange(t *testing.T) {
+	h := newRequestHarness(t, unitNow.Add(time.Hour))
+	h.failNext = func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+		return errors.New("injected: status write failed")
+	}
+	if err := h.reconcile(); err == nil {
+		t.Fatal("the failed write was not reported")
+	}
+	keyB, err := h.u.ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: "alias/issuing-b", OwnerUID: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	interB, err := h.u.ca.MakeIntermediate(context.TODO(), h.u.rootKey, h.u.root, keyB, &kmsca.CAInput{
+		Subject: pkix.Name{CommonName: "Issuing B"}, PermittedDNSDomains: []string{"example.internal"}, Duration: 90 * 24 * time.Hour, Now: unitNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.r.Access, err = NewAccess([]string{"default"}, []string{h.u.issuingKey, keyB}, unitCeilings(), []*x509.Certificate{h.u.root}, unitNow); err != nil {
+		t.Fatal(err)
+	}
+	issuer := &kmsiapi.KMSIssuer{}
+	if err := h.fc.Get(context.TODO(), client.ObjectKeyFromObject(h.issuer), issuer); err != nil {
+		t.Fatal(err)
+	}
+	issuer.Spec.KeyID = keyB
+	issuer.Spec.IntermediateCertificate = string(encodeForTest(interB.Raw))
+	if err := h.fc.Update(context.TODO(), issuer); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.reconcile(); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if a, b := h.kms.count(h.u.issuingKey), h.kms.count(keyB); a != 1 || b != 1 {
+		t.Errorf("signed %d times with the old key and %d with the new, want once each", a, b)
+	}
+	chain, err := kmsca.ParseCertificatesPEM(h.request(t).Status.Certificate)
+	if err != nil || len(chain) != 2 {
+		t.Fatalf("chain: %d certificates, %v", len(chain), err)
+	}
+	if chain[1].Subject.CommonName != "Issuing B" || chain[0].CheckSignatureFrom(chain[1]) != nil {
+		t.Errorf("recorded beside %q; want a leaf signed by the new key beside its intermediate", chain[1].Subject.CommonName)
 	}
 }
 
