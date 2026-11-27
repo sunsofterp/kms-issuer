@@ -618,4 +618,7 @@ func TestLastHourWaitsPending(t *testing.T) {
 		!strings.Contains(ready.Message, "renew the intermediate") {
 		t.Errorf("Ready condition %+v, want False/Pending saying to renew the intermediate", ready)
 	}
+	if got := h.events(); len(got) != 1 || !strings.HasPrefix(got[0], "Warning "+eventWaiting+" ") {
+		t.Errorf("events %q, want one Warning %s", got, eventWaiting)
+	}
 }

@@ -17,9 +17,12 @@ limitations under the License.
 package certmanager
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 
+	"github.com/aws/smithy-go"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 )
@@ -47,6 +50,26 @@ func eventNote(note string) string {
 		cut--
 	}
 	return note[:cut] + ellipsis
+}
+
+// stableText is err's text with the AWS operation error in it, if any, cut down to
+// the operation, the error code and the message. The SDK's own text carries a
+// request ID that is new on every call: written into a status condition, it would
+// change the object on every retry, and the watch event each change makes would
+// start the next pass at once, past the work queue's backoff. Statuses and events
+// take this text; the log keeps the full error.
+func stableText(err error) string {
+	text := err.Error()
+	var op *smithy.OperationError
+	if !errors.As(err, &op) {
+		return text
+	}
+	short := fmt.Sprintf("%s %s failed (the controller log has the details)", op.Service(), op.Operation())
+	var api smithy.APIError
+	if errors.As(op.Err, &api) {
+		short = fmt.Sprintf("%s %s: %s: %s", op.Service(), op.Operation(), api.ErrorCode(), api.ErrorMessage())
+	}
+	return strings.Replace(text, op.Error(), short, 1)
 }
 
 func removeString(slice []string, s string) (result []string) {

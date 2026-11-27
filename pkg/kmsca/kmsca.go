@@ -165,7 +165,7 @@ func (ca *KMSCA) DeleteKey(ctx context.Context, input *DeleteKeyInput) error {
 	if described.KeyMetadata.KeyState != kmstypes.KeyStatePendingDeletion {
 		deleteInput := &kms.ScheduleKeyDeletionInput{KeyId: aws.String(keyID)}
 		if input.PendingWindowInDays >= 7 && input.PendingWindowInDays <= 30 {
-			deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) //nolint:gosec // G115: bounded to 7-30 just above
+			deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) // #nosec G115 -- bounded to 7-30 just above
 		}
 		_, err = ca.Client.ScheduleKeyDeletion(ctx, deleteInput)
 		if err != nil {

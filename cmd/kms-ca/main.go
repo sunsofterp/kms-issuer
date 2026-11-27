@@ -51,7 +51,8 @@ const usage = `usage:
 
 // The subcommands.
 const (
-	cmdRoot = "root"
+	cmdRoot         = "root"
+	cmdIntermediate = "intermediate"
 )
 
 func main() {
@@ -68,7 +69,7 @@ func run(args []string, out io.Writer) error {
 	switch args[0] {
 	case cmdRoot:
 		return root(args[1:], out)
-	case "intermediate":
+	case cmdIntermediate:
 		return intermediate(args[1:], out)
 	case "show":
 		if len(args) != 2 {
@@ -301,7 +302,7 @@ func root(args []string, out io.Writer) error {
 }
 
 func intermediate(args []string, out io.Writer) error {
-	fs := flag.NewFlagSet("intermediate", flag.ContinueOnError)
+	fs := flag.NewFlagSet(cmdIntermediate, flag.ContinueOnError)
 	var c common
 	var rootKeyID, rootFile string
 	c.register(fs, kmsca.MaxIntermediateDuration)
@@ -375,17 +376,30 @@ func create(file string) (*os.File, error) {
 	return os.OpenFile(filepath.Clean(file), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
+// output is the file a certificate is written to.
+type output interface {
+	io.WriteCloser
+	Name() string
+}
+
 // discard removes an output file left empty by a failure, reporting a file it
 // couldn't close or remove beside the failure.
-func discard(f *os.File, err error) error {
+func discard(f output, err error) error {
 	return errors.Join(err, f.Close(), os.Remove(f.Name()))
 }
 
-func finish(f *os.File, cert *x509.Certificate) error {
+// finish writes the signed certificate to f and closes it. A failure to close
+// says the certificate was written, so the administrator checks it rather than
+// signing again.
+func finish(f output, cert *x509.Certificate) error {
 	if _, err := f.Write(kmsca.EncodeCertificatePEM(cert)); err != nil {
 		return discard(f, err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("the certificate was signed and written to %s, but closing the file failed (check it with `kms-ca show %s` before signing again): %w",
+			f.Name(), f.Name(), err)
+	}
+	return nil
 }
 
 func readCertificate(file string) (*x509.Certificate, error) {

@@ -127,6 +127,34 @@ var _ = Context("KMSIssuer", func() {
 			Expect(k8sClient.Create(context.Background(), issuer)).ShouldNot(Succeed())
 		})
 
+		It("should react to spec changes, not to status writes", func() {
+			key := client.ObjectKey{Name: "issuer-status-only", Namespace: testNamespace}
+			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, otherKeyID))).Should(Succeed())
+			refusal := func() string {
+				issuer := &kmsiapi.KMSIssuer{}
+				Expect(k8sClient.Get(context.Background(), key, issuer)).Should(Succeed())
+				if c := issuer.Status.GetCondition(kmsiapi.ConditionReady); c != nil {
+					return c.Message
+				}
+				return ""
+			}
+			Eventually(refusal, time.Second*5, time.Millisecond*100).Should(ContainSubstring("may not issue"))
+
+			By("writing only the status: no pass (a failing pass would otherwise retry at once)")
+			issuer := &kmsiapi.KMSIssuer{}
+			Expect(k8sClient.Get(context.Background(), key, issuer)).Should(Succeed())
+			marked := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSIssuerReasonFailed, statusOnly)
+			issuer.Status.SetCondition(&marked)
+			Expect(k8sClient.Status().Update(context.Background(), issuer)).Should(Succeed())
+			Consistently(refusal, time.Second*2, time.Millisecond*200).Should(Equal(statusOnly))
+
+			By("changing the spec: a pass")
+			Expect(k8sClient.Get(context.Background(), key, issuer)).Should(Succeed())
+			issuer.Spec.MaxCertificateDuration = &metav1.Duration{Duration: 24 * time.Hour}
+			Expect(k8sClient.Update(context.Background(), issuer)).Should(Succeed())
+			Eventually(refusal, time.Second*5, time.Millisecond*100).Should(ContainSubstring("may not issue"))
+		})
+
 		It("should refuse changing keyId", func() {
 			key := client.ObjectKey{Name: "issuer-immutable", Namespace: testNamespace}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())

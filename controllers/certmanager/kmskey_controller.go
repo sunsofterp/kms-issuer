@@ -26,8 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
 	kmsca "github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
@@ -126,9 +128,12 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{}, r.manageSuccess(ctx, log, kmsKey)
 }
 
+// SetupWithManager watches KMSKeys for spec changes and deletion only (deletion
+// bumps the generation): the controller's own status writes must not start a pass,
+// or a failing one would retry at once instead of backing off.
 func (r *KMSKeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&kmsiapi.KMSKey{}).
+		For(&kmsiapi.KMSKey{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
 }
 
@@ -161,8 +166,8 @@ func (r *KMSKeyReconciler) manageSuccess(ctx context.Context, log logr.Logger, k
 // retries with backoff.
 func (r *KMSKeyReconciler) manageFailure(ctx context.Context, log logr.Logger, kmskey *kmsiapi.KMSKey, issue error, msg string) error {
 	reason := kmsiapi.KMSKeyReasonFailed
-	msg = fmt.Sprintf("%s: %v", msg, issue)
 	log.Error(issue, msg)
+	msg = fmt.Sprintf("%s: %s", msg, stableText(issue))
 	eventf(r.Recorder, kmskey, core.EventTypeWarning, reason, actionReconcile, "%s", msg)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, msg)
 	kmskey.Status.SetCondition(&ready)

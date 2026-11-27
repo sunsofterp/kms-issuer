@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -67,10 +69,19 @@ func vtSign(t *testing.T, tmpl, parent *x509.Certificate, pub crypto.PublicKey, 
 	return cert
 }
 
-// Each refusal of ValidateIntermediate, by its own check (the error names it), so
-// that dropping any one check fails here even where a later one would also refuse.
+// Each refusal of ValidateIntermediate's explicit checks, and each condition of
+// each, by its own check (the error names it), so that dropping any one fails here
+// even where a later one would also refuse. What only the final Verify refuses is
+// TestValidateIntermediateVerifyOnly.
 func TestValidateIntermediateRefusals(t *testing.T) {
-	const wantRootKey = "the issuing key is a root key"
+	const (
+		wantRootKey        = "the issuing key is a root key"
+		wantEKU            = "extended key usage is not exactly server auth"
+		wantURIEmail       = "URI and email names are not limited"
+		wantIPs            = "IP addresses are not all excluded"
+		wantOutsideAllowed = "outside the allowed domains"
+		wantRootName       = "the intermediate's name is the root's"
+	)
 	rootKey, issuingKey, otherKey := vtKey(t), vtKey(t), vtKey(t)
 	root := vtRoot(t, rootKey, "Root", vtDomain)
 	expect := func(change func(*ExpectedIntermediate)) *ExpectedIntermediate {
@@ -106,7 +117,7 @@ func TestValidateIntermediateRefusals(t *testing.T) {
 			wantRootKey},
 		{"not signed by the pinned root", vtIntermediate(t, impostor, otherKey, issuingKey.Public(), nil), expect(nil), "not issued by a pinned root"},
 		{"the root's name", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.Subject = root.Subject }),
-			expect(nil), "the intermediate's name is the root's"},
+			expect(nil), wantRootName},
 		{"not a CA", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
 			c.IsCA, c.MaxPathLen, c.MaxPathLenZero = false, -1, false
 		}), expect(nil), "not a CA certificate"},
@@ -118,18 +129,90 @@ func TestValidateIntermediateRefusals(t *testing.T) {
 			expect(nil), "unexpected key usages"},
 		{"client auth too", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
 			c.ExtKeyUsage = append(c.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
-		}), expect(nil), "extended key usage is not exactly server auth"},
+		}), expect(nil), wantEKU},
+		{"an unknown usage too", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.UnknownExtKeyUsage = []asn1.ObjectIdentifier{{1, 2, 3, 4}}
+		}), expect(nil), wantEKU},
+		{"the root's common name in another name", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.Subject = pkix.Name{CommonName: root.Subject.CommonName, Organization: []string{"Other"}}
+		}), expect(nil), wantRootName},
+		{"constraints not critical", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.PermittedDNSDomainsCritical = false }),
+			expect(nil), "name constraints are missing or not critical"},
+		{"no DNS constraint", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.PermittedDNSDomains = nil }),
+			expect(nil), "no permitted DNS domain"},
+		{"URIs not limited", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.PermittedURIDomains = nil }),
+			expect(nil), wantURIEmail},
+		{"emails not limited", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.PermittedEmailAddresses = nil }),
+			expect(nil), wantURIEmail},
+		{"an IP family not excluded", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.ExcludedIPRanges = c.ExcludedIPRanges[:1] }),
+			expect(nil), wantIPs},
+		{"an IP range permitted", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.PermittedIPRanges = []*net.IPNet{{IP: net.IPv4(10, 0, 0, 0).To4(), Mask: net.CIDRMask(8, 32)}}
+		}), expect(nil), wantIPs},
+		{"a URI constraint outside the allowed domains", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.PermittedURIDomains = []string{vtOther}
+		}), expect(nil), wantOutsideAllowed},
+		{"an email constraint outside the allowed domains", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.PermittedEmailAddresses = []string{vtOther}
+		}), expect(nil), wantOutsideAllowed},
 		{"longer than the operator's maximum", good, expect(func(e *ExpectedIntermediate) { e.MaxDuration = 30 * vtDays }), "longer than the 720h0m0s"},
 		{"longer than the package maximum", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
 			c.NotAfter = c.NotBefore.Add(MaxIntermediateDuration + time.Second)
 		}), expect(nil), "longer than the 4392h0m0s"},
-		{"allowed domains elsewhere", good, expect(func(e *ExpectedIntermediate) { e.AllowedDomains = []string{vtOther} }), "outside the allowed domains"},
+		{"allowed domains elsewhere", good, expect(func(e *ExpectedIntermediate) { e.AllowedDomains = []string{vtOther} }), wantOutsideAllowed},
 		{"expired", good, expect(func(e *ExpectedIntermediate) { e.Now = good.NotAfter.Add(time.Minute) }), "expired at"},
 		{"before its notBefore", good, expect(func(e *ExpectedIntermediate) { e.Now = good.NotBefore.Add(-time.Minute) }), "not valid yet"},
 	} {
 		_, err := ValidateIntermediate(c.cert, c.expect)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v, want %q", c.name, err, c.want)
+		}
+	}
+}
+
+// What only the final Verify (path validation as clients do it) refuses: each
+// passes every explicit check before it.
+func TestValidateIntermediateVerifyOnly(t *testing.T) {
+	rootKey, issuingKey := vtKey(t), vtKey(t)
+	critical := pkix.Extension{Id: asn1.ObjectIdentifier{1, 2, 3, 4, 5}, Critical: true, Value: []byte{0x05, 0x00}}
+	// rootWith self-signs a root after change.
+	rootWith := func(d time.Duration, change func(*x509.Certificate)) *x509.Certificate {
+		tmpl, err := CATemplate(&CAInput{Subject: pkix.Name{CommonName: "Root"}, PermittedDNSDomains: []string{vtDomain}, Duration: d, Now: vtNow}, Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if change != nil {
+			change(tmpl)
+		}
+		return vtSign(t, tmpl, tmpl, rootKey.Public(), rootKey)
+	}
+	root := rootWith(365*vtDays, nil)
+	clientAuthRoot := rootWith(365*vtDays, func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth} })
+	criticalRoot := rootWith(365*vtDays, func(c *x509.Certificate) { c.ExtraExtensions = []pkix.Extension{critical} })
+	shortRoot := rootWith(30*vtDays, nil)
+
+	for _, c := range []struct {
+		name string
+		root *x509.Certificate
+		cert *x509.Certificate
+		now  time.Time
+	}{
+		{"an unknown critical extension", root, vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.ExtraExtensions = []pkix.Extension{critical}
+		}), vtNow.Add(time.Hour)},
+		{"a DNS name outside the root's constraints", root, vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
+			c.DNSNames = []string{"www." + vtOther}
+		}), vtNow.Add(time.Hour)},
+		{"a root for client auth only", clientAuthRoot, vtIntermediate(t, clientAuthRoot, rootKey, issuingKey.Public(), nil), vtNow.Add(time.Hour)},
+		{"a root with an unknown critical extension", criticalRoot, vtIntermediate(t, criticalRoot, rootKey, issuingKey.Public(), nil), vtNow.Add(time.Hour)},
+		// The intermediate outlives its root: valid itself, under a root expired.
+		{"an expired root", shortRoot, vtIntermediate(t, shortRoot, rootKey, issuingKey.Public(), nil), vtNow.Add(40 * vtDays)},
+	} {
+		_, err := ValidateIntermediate(c.cert, &ExpectedIntermediate{
+			Roots: []*x509.Certificate{c.root}, PublicKey: issuingKey.Public(), AllowedDomains: []string{vtDomain}, Now: c.now,
+		})
+		if err == nil || !strings.Contains(err.Error(), "does not verify to the pinned root") {
+			t.Errorf("%s: %v, want refused by path validation", c.name, err)
 		}
 	}
 }

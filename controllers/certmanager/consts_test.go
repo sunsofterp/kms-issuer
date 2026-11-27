@@ -19,4 +19,8 @@ const (
 	suiteOwner     = "suite"
 	reasonApproved = "Approved"
 	reasonDenied   = "Denied"
+	// statusOnly marks a condition written by a test, not the controller.
+	statusOnly = "written by the test"
+	retain     = "Retain"
+	changed    = "changed"
 )

@@ -54,8 +54,8 @@ const (
 
 // The reasons of the warning events for a request left pending (its Ready
 // condition's reason is Pending for all of them). Events of one reason on one
-// request are merged by the events API, keeping the first note, so each cause
-// has its own; the Ready condition's message is always the current one.
+// version of one request are merged by the events API, keeping the first note, so
+// each cause has its own; the Ready condition's message is always the current one.
 const (
 	eventIssuerUnavailable = "IssuerUnavailable"
 	eventIssuerNotReady    = "IssuerNotReady"
@@ -213,7 +213,7 @@ func (r *CertificateRequestReconciler) signingIssuer(ctx context.Context, log lo
 	if err != nil {
 		err = fmt.Errorf("KMSIssuer %s cannot sign now: %w", issuerName, err)
 		log.Error(err, "not signing")
-		_ = r.pending(ctx, cr, eventIssuerCannotSign, "%v (will retry)", err)
+		_ = r.pending(ctx, cr, eventIssuerCannotSign, "%s (will retry)", stableText(err))
 		return nil, verifiedIssuer{}, err
 	}
 	return issuer, verified, nil
@@ -312,7 +312,7 @@ func (r *CertificateRequestReconciler) sign(ctx context.Context, log logr.Logger
 	})
 	if err != nil {
 		log.Error(err, "failed to sign certificate request")
-		_ = r.pending(ctx, cr, eventSigningFailed, "Failed to sign the certificate (will retry): %v", err)
+		_ = r.pending(ctx, cr, eventSigningFailed, "Failed to sign the certificate (will retry): %s", stableText(err))
 		return nil, err
 	}
 

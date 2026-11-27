@@ -76,7 +76,7 @@ var _ = Context("KMSKey", func() {
 					Tags: map[string]string{
 						"Project": "kms-issuer",
 					},
-					DeletionPolicy: "Retain",
+					DeletionPolicy: retain,
 				},
 			}
 			Expect(k8sClient.Create(context.Background(), kmsKey)).Should(Succeed(), "failed to create test KMSKey resource")
@@ -121,6 +121,32 @@ var _ = Context("KMSKey", func() {
 				KeyId: aws.String(kmsKey.Spec.AliasName),
 			})
 			Expect(err).To(BeAssignableToTypeOf(&kmstypes.NotFoundException{}))
+		})
+	})
+
+	Describe("when only its status is written", func() {
+		It("should not run a pass until the spec changes", func() {
+			key := client.ObjectKey{Name: "key-status-only", Namespace: testNamespace}
+			kmsKey := &kmsiapi.KMSKey{
+				ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+				Spec:       kmsiapi.KMSKeySpec{AliasName: "alias/kms-issuer-test-status-only", DeletionPolicy: retain},
+			}
+			Expect(k8sClient.Create(context.Background(), kmsKey)).Should(Succeed())
+			kmsKey = WaitForKMSKeyReady(key)
+
+			By("writing only the status: no pass (a failing pass would otherwise retry at once)")
+			marked := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSKeyReasonFailed, statusOnly)
+			kmsKey.Status.SetCondition(&marked)
+			Expect(k8sClient.Status().Update(context.Background(), kmsKey)).Should(Succeed())
+			Consistently(func() bool {
+				Expect(k8sClient.Get(context.Background(), key, kmsKey)).Should(Succeed())
+				return kmsKey.Status.IsReady()
+			}, time.Second*2, time.Millisecond*200).Should(BeFalse())
+
+			By("changing the spec: a pass")
+			kmsKey.Spec.Description = changed
+			Expect(k8sClient.Update(context.Background(), kmsKey)).Should(Succeed())
+			WaitForKMSKeyReady(key)
 		})
 	})
 })

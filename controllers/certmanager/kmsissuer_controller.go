@@ -31,8 +31,10 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
 	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
@@ -202,7 +204,7 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var kmsErr errKMS
 	switch {
 	case errors.As(err, &kmsErr):
-		eventf(r.Recorder, issuer, core.EventTypeWarning, eventKMSError, actionVerify, "%s", err.Error())
+		eventf(r.Recorder, issuer, core.EventTypeWarning, eventKMSError, actionVerify, "%s", stableText(err))
 		if issuer.Status.IsReady() && intermediate != nil && now.Before(intermediate.NotAfter) {
 			log.Error(err, "KMS error; staying ready with the current intermediate")
 			return ctrl.Result{}, err
@@ -267,10 +269,12 @@ func ParseCertificate(cert []byte) (*x509.Certificate, error) {
 	return kmsca.ParseCertificatePEM(cert)
 }
 
-// SetupWithManager is pre-generated
+// SetupWithManager watches KMSIssuers for spec changes only: the controller's own
+// status writes must not start a pass, or a failing one would retry at once
+// instead of backing off. It re-checks each issuer on a timer.
 func (r *KMSIssuerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&kmsiapi.KMSIssuer{}).
+		For(&kmsiapi.KMSIssuer{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
 }
 
@@ -287,8 +291,8 @@ func (r *KMSIssuerReconciler) setReady(ctx context.Context, issuer *kmsiapi.KMSI
 // setNotReady marks the issuer not ready with the cause. It returns only the status
 // write's error: configuration problems are not retried until the spec changes.
 func (r *KMSIssuerReconciler) setNotReady(ctx context.Context, issuer *kmsiapi.KMSIssuer, message string, cause error) error {
-	message = fmt.Sprintf("%s: %v", message, cause)
 	r.Log.Error(cause, message, "kms-issuer", client.ObjectKeyFromObject(issuer))
+	message = fmt.Sprintf("%s: %s", message, stableText(cause))
 	eventf(r.Recorder, issuer, core.EventTypeWarning, kmsiapi.KMSIssuerReasonFailed, actionVerify, "%s", message)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSIssuerReasonFailed, message)
 	issuer.Status.SetCondition(&ready)

@@ -152,7 +152,7 @@ func TestIssuerReadUncached(t *testing.T) {
 func TestFreshRequestGuards(t *testing.T) {
 	for name, change := range map[string]func(*cmapi.CertificateRequest){
 		"already signed": func(cr *cmapi.CertificateRequest) { cr.Status.Certificate = []byte("signed elsewhere") }, // same resource version
-		"changed":        func(cr *cmapi.CertificateRequest) { cr.ResourceVersion += "1" },
+		changed:          func(cr *cmapi.CertificateRequest) { cr.ResourceVersion += "1" },
 	} {
 		h := newRequestHarness(t, unitNow.Add(time.Hour))
 		h.withAPI(t, func(issuer *kmsiapi.KMSIssuer, cr *cmapi.CertificateRequest) []client.Object {
