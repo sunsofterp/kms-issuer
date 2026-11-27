@@ -213,7 +213,7 @@ func (r *CertificateRequestReconciler) signingIssuer(ctx context.Context, log lo
 	if err != nil {
 		err = fmt.Errorf("KMSIssuer %s cannot sign now: %w", issuerName, err)
 		log.Error(err, "not signing")
-		_ = r.pending(ctx, cr, eventIssuerCannotSign, "%s (will retry)", stableText(err))
+		_ = r.pendingKMS(ctx, cr, eventIssuerCannotSign, "%s (will retry)", err)
 		return nil, verifiedIssuer{}, err
 	}
 	return issuer, verified, nil
@@ -312,7 +312,7 @@ func (r *CertificateRequestReconciler) sign(ctx context.Context, log logr.Logger
 	})
 	if err != nil {
 		log.Error(err, "failed to sign certificate request")
-		_ = r.pending(ctx, cr, eventSigningFailed, "Failed to sign the certificate (will retry): %s", stableText(err))
+		_ = r.pendingKMS(ctx, cr, eventSigningFailed, "Failed to sign the certificate (will retry): %s", err)
 		return nil, err
 	}
 
@@ -485,20 +485,29 @@ func (r *CertificateRequestReconciler) fail(ctx context.Context, cr *cmapi.Certi
 // setStatus sets Ready=False with the reason and message, with a warning event of
 // the same reason.
 func (r *CertificateRequestReconciler) setStatus(ctx context.Context, cr *cmapi.CertificateRequest, reason, message string, args ...any) error {
-	return r.notReady(ctx, cr, reason, reason, fmt.Sprintf(message, args...))
+	message = fmt.Sprintf(message, args...)
+	return r.notReady(ctx, cr, reason, reason, message, message)
 }
 
 // pending sets Ready=False with reason Pending (the request is retried) and the
 // message, with a warning event whose reason is the cause.
 func (r *CertificateRequestReconciler) pending(ctx context.Context, cr *cmapi.CertificateRequest, cause, message string, args ...any) error {
-	return r.notReady(ctx, cr, cmapi.CertificateRequestReasonPending, cause, fmt.Sprintf(message, args...))
+	message = fmt.Sprintf(message, args...)
+	return r.notReady(ctx, cr, cmapi.CertificateRequestReasonPending, cause, message, message)
 }
 
-// notReady writes Ready=False and records the warning event: every status it
-// writes is a request not (yet) signed. An issued certificate is recorded by
-// record.
-func (r *CertificateRequestReconciler) notReady(ctx context.Context, cr *cmapi.CertificateRequest, reason, eventReason, message string) error {
+// pendingKMS is pending for a KMS error, format holding one %s for it: the
+// condition names the error's code only (stableText), so that a retry meeting the
+// same failure writes the same status; the event also carries the AWS message.
+func (r *CertificateRequestReconciler) pendingKMS(ctx context.Context, cr *cmapi.CertificateRequest, cause, format string, err error) error {
+	return r.notReady(ctx, cr, cmapi.CertificateRequestReasonPending, cause, fmt.Sprintf(format, stableText(err)), fmt.Sprintf(format, eventText(err)))
+}
+
+// notReady writes Ready=False with message and records the warning event with
+// note: every status it writes is a request not (yet) signed. An issued
+// certificate is recorded by record.
+func (r *CertificateRequestReconciler) notReady(ctx context.Context, cr *cmapi.CertificateRequest, reason, eventReason, message, note string) error {
 	apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionReady, cmmeta.ConditionFalse, reason, message)
-	eventf(r.Recorder, cr, core.EventTypeWarning, eventReason, actionSign, "%s", message)
+	eventf(r.Recorder, cr, core.EventTypeWarning, eventReason, actionSign, "%s", note)
 	return r.Status().Update(ctx, cr)
 }

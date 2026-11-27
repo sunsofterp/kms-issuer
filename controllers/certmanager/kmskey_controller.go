@@ -19,7 +19,6 @@ package certmanager
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/go-logr/logr"
 	core "k8s.io/api/core/v1"
@@ -38,21 +37,27 @@ import (
 // NewKMSKeyReconciler Initialise a new NewKMSKeyReconciler
 func NewKMSKeyReconciler(mgr manager.Manager, ca *kmsca.KMSCA) *KMSKeyReconciler {
 	return &KMSKeyReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("kmskey_controller"),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("kmskey_controller"),
-		KMSCA:    ca,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("kmskey_controller"),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("kmskey_controller"),
+		KMSCA:     ca,
 	}
 }
 
 // KMSKeyReconciler reconciles a KMSKey object
 type KMSKeyReconciler struct {
 	client.Client
-	Log      logr.Logger
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
-	KMSCA    *kmsca.KMSCA
+	// APIReader reads the base of the status patch uncached: a cached copy that
+	// predates the last status write and already matches the new status would make
+	// an empty patch, and the controller ignores its own status writes, so nothing
+	// would repair it.
+	APIReader client.Reader
+	Log       logr.Logger
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
+	KMSCA     *kmsca.KMSCA
 }
 
 // The RBAC the controller needs to write events (events.k8s.io/v1 only).
@@ -141,7 +146,7 @@ func (r *KMSKeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *KMSKeyReconciler) patchKeyStatus(ctx context.Context, issuer *kmsiapi.KMSKey) error {
 	var latest kmsiapi.KMSKey
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(issuer), &latest); err != nil {
+	if err := readerOr(r.APIReader, r.Client).Get(ctx, client.ObjectKeyFromObject(issuer), &latest); err != nil {
 		return err
 	}
 
@@ -167,9 +172,8 @@ func (r *KMSKeyReconciler) manageSuccess(ctx context.Context, log logr.Logger, k
 func (r *KMSKeyReconciler) manageFailure(ctx context.Context, log logr.Logger, kmskey *kmsiapi.KMSKey, issue error, msg string) error {
 	reason := kmsiapi.KMSKeyReasonFailed
 	log.Error(issue, msg)
-	msg = fmt.Sprintf("%s: %s", msg, stableText(issue))
-	eventf(r.Recorder, kmskey, core.EventTypeWarning, reason, actionReconcile, "%s", msg)
-	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, msg)
+	eventf(r.Recorder, kmskey, core.EventTypeWarning, reason, actionReconcile, "%s: %s", msg, eventText(issue))
+	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, msg+": "+stableText(issue))
 	kmskey.Status.SetCondition(&ready)
 	return errors.Join(issue, r.patchKeyStatus(ctx, kmskey))
 }

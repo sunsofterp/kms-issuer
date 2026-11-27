@@ -105,7 +105,7 @@ var _ = Context("KMSKey", func() {
 				},
 				Spec: kmsiapi.KMSKeySpec{
 					AliasName:      "alias/kms-issuer-test-key-to-delete",
-					DeletionPolicy: "Delete",
+					DeletionPolicy: deleteKey,
 				},
 			}
 			Expect(k8sClient.Create(context.Background(), kmsKey)).Should(Succeed(), "failed to create test KMSKey resource")

@@ -67,12 +67,17 @@ const (
 // KMSIssuerReconciler reconciles a KMSIssuer object.
 type KMSIssuerReconciler struct {
 	client.Client
-	Log      logr.Logger
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
-	KMSCA    *kmsca.KMSCA
-	Access   *Access
-	Clock    clock.Clock
+	// APIReader reads the issuer uncached. The controller ignores its own status
+	// writes, so a pass must never decide from a cached copy that may predate the
+	// last write (it would skip a write that is needed, and nothing would start
+	// another pass to repair it).
+	APIReader client.Reader
+	Log       logr.Logger
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
+	KMSCA     *kmsca.KMSCA
+	Access    *Access
+	Clock     clock.Clock
 }
 
 // The RBAC the controller needs to write events (events.k8s.io/v1 only: the
@@ -86,13 +91,14 @@ type KMSIssuerReconciler struct {
 // NewKMSIssuerReconciler Initialise a new KMSIssuerReconciler
 func NewKMSIssuerReconciler(mgr manager.Manager, ca *kmsca.KMSCA, access *Access) *KMSIssuerReconciler {
 	return &KMSIssuerReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("kmsissuer_controller"),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("kmsissuer_controller"),
-		KMSCA:    ca,
-		Access:   access,
-		Clock:    clock.RealClock{},
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("kmsissuer_controller"),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("kmsissuer_controller"),
+		KMSCA:     ca,
+		Access:    access,
+		Clock:     clock.RealClock{},
 	}
 }
 
@@ -188,7 +194,7 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	log := r.Log.WithValues("kms-issuer", req.NamespacedName)
 
 	issuer := &kmsiapi.KMSIssuer{}
-	if err := r.Get(ctx, req.NamespacedName, issuer); err != nil {
+	if err := readerOr(r.APIReader, r.Client).Get(ctx, req.NamespacedName, issuer); err != nil {
 		if apierrors.IsNotFound(err) {
 			caNotAfter.DeleteLabelValues(req.Namespace, req.Name)
 			leavesTruncated.DeleteLabelValues(req.Namespace, req.Name)
@@ -204,7 +210,7 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var kmsErr errKMS
 	switch {
 	case errors.As(err, &kmsErr):
-		eventf(r.Recorder, issuer, core.EventTypeWarning, eventKMSError, actionVerify, "%s", stableText(err))
+		eventf(r.Recorder, issuer, core.EventTypeWarning, eventKMSError, actionVerify, "%s", eventText(err))
 		if issuer.Status.IsReady() && intermediate != nil && now.Before(intermediate.NotAfter) {
 			log.Error(err, "KMS error; staying ready with the current intermediate")
 			return ctrl.Result{}, err
@@ -254,7 +260,7 @@ func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 func (r *KMSIssuerReconciler) patchIssuerStatus(ctx context.Context, issuer *kmsiapi.KMSIssuer) error {
 	var latest kmsiapi.KMSIssuer
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(issuer), &latest); err != nil {
+	if err := readerOr(r.APIReader, r.Client).Get(ctx, client.ObjectKeyFromObject(issuer), &latest); err != nil {
 		return err
 	}
 
@@ -292,9 +298,8 @@ func (r *KMSIssuerReconciler) setReady(ctx context.Context, issuer *kmsiapi.KMSI
 // write's error: configuration problems are not retried until the spec changes.
 func (r *KMSIssuerReconciler) setNotReady(ctx context.Context, issuer *kmsiapi.KMSIssuer, message string, cause error) error {
 	r.Log.Error(cause, message, "kms-issuer", client.ObjectKeyFromObject(issuer))
-	message = fmt.Sprintf("%s: %s", message, stableText(cause))
-	eventf(r.Recorder, issuer, core.EventTypeWarning, kmsiapi.KMSIssuerReasonFailed, actionVerify, "%s", message)
-	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSIssuerReasonFailed, message)
+	eventf(r.Recorder, issuer, core.EventTypeWarning, kmsiapi.KMSIssuerReasonFailed, actionVerify, "%s: %s", message, eventText(cause))
+	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSIssuerReasonFailed, message+": "+stableText(cause))
 	issuer.Status.SetCondition(&ready)
 	return r.patchIssuerStatus(ctx, issuer)
 }

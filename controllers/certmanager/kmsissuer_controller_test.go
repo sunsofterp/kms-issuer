@@ -22,6 +22,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -155,6 +157,15 @@ var _ = Context("KMSIssuer", func() {
 			Eventually(refusal, time.Second*5, time.Millisecond*100).Should(ContainSubstring("may not issue"))
 		})
 
+		It("should drop its metrics when deleted", func() {
+			key := client.ObjectKey{Name: "issuer-deleted", Namespace: testNamespace}
+			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
+			issuer := WaitIssuerReady(key)
+			Eventually(func() int { return issuerSeries(key) }, time.Second*5, time.Millisecond*100).Should(Equal(2))
+			Expect(k8sClient.Delete(context.Background(), issuer)).Should(Succeed())
+			Eventually(func() int { return issuerSeries(key) }, time.Second*5, time.Millisecond*100).Should(BeZero())
+		})
+
 		It("should refuse changing keyId", func() {
 			key := client.ObjectKey{Name: "issuer-immutable", Namespace: testNamespace}
 			Expect(k8sClient.Create(context.Background(), newIssuer(key.Namespace, key.Name, allowedKeyID))).Should(Succeed())
@@ -164,6 +175,29 @@ var _ = Context("KMSIssuer", func() {
 		})
 	})
 })
+
+// issuerSeries counts the per-issuer gauge series (intermediate expiry, leaves
+// truncated) exported for the issuer.
+func issuerSeries(key client.ObjectKey) int {
+	n := 0
+	for _, g := range []*prometheus.GaugeVec{caNotAfter, leavesTruncated} {
+		ch := make(chan prometheus.Metric, 100)
+		g.Collect(ch)
+		close(ch)
+		for m := range ch {
+			var d dto.Metric
+			Expect(m.Write(&d)).To(Succeed())
+			labels := map[string]string{}
+			for _, l := range d.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["namespace"] == key.Namespace && labels["name"] == key.Name {
+				n++
+			}
+		}
+	}
+	return n
+}
 
 // ParseableRoot is the suite's root certificate, PEM.
 func ParseableRoot() []byte {

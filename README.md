@@ -148,8 +148,10 @@ Metrics (authenticated; bind the `<release>-metrics-reader` ClusterRole to your 
 
 Events (events.k8s.io/v1) tell what happened, but the `Ready` condition is the current state: the events API
 merges repeated events of one reason on one version of one object, keeping the first note, and notes are cut to
-1024 bytes. KMS errors appear in conditions and events as their code and message; the controller's log has the
-full error, with its request ID.
+1024 bytes. A KMS error appears in a condition as its operation and error code (`KMS Sign: AccessDeniedException`),
+and in the event also with the AWS message; a failure without an AWS error (network, credentials) appears as
+`KMS <operation> failed (the controller log has the details)`. The controller's log has the full error, with its
+request ID.
 A request left pending raises a warning event whose reason is the cause (`IssuerUnavailable`,
 `IssuerNotReady`, `IssuerCannotSign`, `Waiting`, `SigningFailed`); its `Ready` condition says `Pending` with
 the current message in full.

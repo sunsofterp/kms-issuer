@@ -55,19 +55,30 @@ func awsErrorSaying(operation, message string) error {
 	}}
 }
 
-// deniedKMS is the mock with GetPublicKey, Sign and CreateAlias refused as the
-// SDK would refuse them, saying message (default accessDeniedMsg).
+// deniedKMS is the mock with GetPublicKey, Sign, CreateAlias and DescribeKey
+// refused as the SDK would refuse them, saying message (default accessDeniedMsg)
+// followed by a count that is new on every call: neither the request ID nor the
+// AWS message may reach a status condition.
 type deniedKMS struct {
 	*mocks.KMSMock
-	publicKey, sign, alias bool
-	message                string
+	publicKey, sign, alias, describe bool
+	message                          string
+	calls                            atomic.Int64
 }
 
 func (k *deniedKMS) denied(operation string) error {
-	if k.message != "" {
-		return awsErrorSaying(operation, k.message)
+	message := k.message
+	if message == "" {
+		message = accessDeniedMsg
 	}
-	return awsError(operation)
+	return awsErrorSaying(operation, fmt.Sprintf("%s (call %d)", message, k.calls.Add(1)))
+}
+
+func (k *deniedKMS) DescribeKey(ctx context.Context, in *kms.DescribeKeyInput, opts ...func(*kms.Options)) (*kms.DescribeKeyOutput, error) {
+	if k.describe {
+		return nil, k.denied("DescribeKey")
+	}
+	return k.KMSMock.DescribeKey(ctx, in, opts...)
 }
 
 func (k *deniedKMS) GetPublicKey(ctx context.Context, in *kms.GetPublicKeyInput, opts ...func(*kms.Options)) (*kms.GetPublicKeyOutput, error) {
@@ -92,8 +103,9 @@ func (k *deniedKMS) CreateAlias(ctx context.Context, in *kms.CreateAliasInput, o
 }
 
 // expectNotesCut checks every event rec holds has a note of at most maxEventNote
-// bytes and no request ID, and that there is at least one.
-func expectNotesCut(t *testing.T, name string, rec *events.FakeRecorder) {
+// bytes, no request ID, and the AWS message (events keep it; conditions don't),
+// and that there is at least one.
+func expectNotesCut(t *testing.T, name, message string, rec *events.FakeRecorder) {
 	t.Helper()
 	n := 0
 	for {
@@ -107,6 +119,9 @@ func expectNotesCut(t *testing.T, name string, rec *events.FakeRecorder) {
 			if strings.Contains(e, "RequestID") {
 				t.Errorf("%s: event %.60q... has the request ID", name, e)
 			}
+			if !strings.Contains(e, message[:min(len(message), 100)]) {
+				t.Errorf("%s: event %.60q... lacks the AWS message", name, e)
+			}
 		default:
 			if n == 0 {
 				t.Errorf("%s: no events", name)
@@ -116,23 +131,33 @@ func expectNotesCut(t *testing.T, name string, rec *events.FakeRecorder) {
 	}
 }
 
-func TestStableText(t *testing.T) {
-	a := fmt.Errorf("KMSIssuer x cannot sign now: reading the KMS key's public key: %w", awsError("GetPublicKey"))
-	b := fmt.Errorf("KMSIssuer x cannot sign now: reading the KMS key's public key: %w", awsError("GetPublicKey"))
-	if a.Error() == b.Error() {
-		t.Fatal("the test errors don't differ")
+// expectCodeOnly checks a condition message names the KMS error's code, and
+// carries neither its request ID nor its message.
+func expectCodeOnly(t *testing.T, name, message string) {
+	t.Helper()
+	if !strings.Contains(message, accessDenied) || strings.Contains(message, "RequestID") || strings.Contains(message, accessDeniedMsg) || strings.Contains(message, "xxxx") {
+		t.Errorf("%s: condition message %q, want the KMS error's code only", name, message)
 	}
-	want := "KMSIssuer x cannot sign now: reading the KMS key's public key: KMS GetPublicKey: " + accessDenied + ": " + accessDeniedMsg
-	if got := stableText(a); got != want || stableText(b) != want {
+}
+
+func TestStableText(t *testing.T) {
+	const prefix = "KMSIssuer x cannot sign now: reading the KMS key's public key: "
+	a := fmt.Errorf(prefix+"%w", awsErrorSaying("GetPublicKey", "denied (call 1)"))
+	b := fmt.Errorf(prefix+"%w", awsErrorSaying("GetPublicKey", "denied (call 2)"))
+	if got, want := stableText(a), prefix+"KMS GetPublicKey: "+accessDenied; got != want || stableText(b) != want {
 		t.Errorf("stableText = %q, want %q", got, want)
 	}
-	// Joined (the alias clean-up), the operation error is still found.
-	if got := stableText(errors.Join(fmt.Errorf("creating alias: %w", awsError("CreateAlias")), nil)); strings.Contains(got, "RequestID") {
-		t.Errorf("joined: %q keeps the request ID", got)
+	if got, want := eventText(a), prefix+"KMS GetPublicKey: "+accessDenied+": denied (call 1)"; got != want {
+		t.Errorf("eventText = %q, want %q", got, want)
+	}
+	// Two joined (the alias, then its clean-up, refused): both shortened.
+	joined := errors.Join(fmt.Errorf("creating alias: %w", awsError("CreateAlias")), awsError("ScheduleKeyDeletion"))
+	if got, want := stableText(joined), "creating alias: KMS CreateAlias: "+accessDenied+"\nKMS ScheduleKeyDeletion: "+accessDenied; got != want {
+		t.Errorf("joined: %q, want %q", got, want)
 	}
 	// An operation error without an API error (a network failure) gets a fixed text.
 	net := &smithy.OperationError{ServiceID: serviceKMS, OperationName: "Sign", Err: fmt.Errorf("dial tcp 10.0.0.1:%d: i/o timeout", requestIDs.Add(1))}
-	if got := stableText(net); got != "KMS Sign failed (the controller log has the details)" {
+	if got := stableText(net); got != "KMS Sign failed (the controller log has the details)" || eventText(net) != got {
 		t.Errorf("network failure: %q", got)
 	}
 	if got := stableText(errKMSDown); got != errKMSDown.Error() {
@@ -174,15 +199,16 @@ func TestSigningFailureIsStable(t *testing.T) {
 		h.r.KMSCA = &kmsca.KMSCA{Client: c.kms(h.u.mock)}
 		expectStable(t, name, h.reconcile, func() any { return h.request(t).Status })
 		ready := readyCondition(h.request(t))
-		if ready == nil || !strings.Contains(ready.Message, accessDenied+": "+accessDeniedMsg) || strings.Contains(ready.Message, "RequestID") {
-			t.Errorf("%s: Ready condition %+v, want the KMS error's code and message without its request ID", name, ready)
+		if ready == nil {
+			t.Fatalf("%s: no Ready condition", name)
 		}
+		expectCodeOnly(t, name, ready.Message)
 		found := false
 		for _, e := range h.events() {
-			found = found || strings.HasPrefix(e, "Warning "+c.reason+" ")
+			found = found || strings.HasPrefix(e, "Warning "+c.reason+" ") && strings.Contains(e, accessDeniedMsg)
 		}
 		if !found {
-			t.Errorf("%s: no Warning %s event", name, c.reason)
+			t.Errorf("%s: no Warning %s event with the AWS message", name, c.reason)
 		}
 	}
 }
@@ -230,25 +256,45 @@ func issuerKMSError(t *testing.T, message string) {
 		_, err := r.Reconcile(context.TODO(), ctrl.Request{NamespacedName: key})
 		return err
 	}, func() any { return get().Status })
-	if got := get(); got.Status.IsReady() || !strings.Contains(got.Status.Conditions[0].Message, accessDenied) {
-		t.Errorf("status %+v, want not ready with the KMS error", got.Status)
+	got := get()
+	if got.Status.IsReady() {
+		t.Errorf("status %+v, want not ready", got.Status)
 	}
-	expectNotesCut(t, "issuer", rec)
+	expectCodeOnly(t, "issuer", got.Status.Conditions[0].Message)
+	expectNotesCut(t, "issuer", orDenied(message), rec)
 }
 
-// A KMSKey whose alias KMS refuses isn't made ready, and its retries don't
-// rewrite it. A long KMS message keeps its events, cut short.
+// orDenied is message, or the default AWS message when it is empty.
+func orDenied(message string) string {
+	if message == "" {
+		return accessDeniedMsg
+	}
+	return message
+}
+
+// A KMSKey whose alias KMS refuses, or whose deletion KMS refuses, isn't made
+// ready, and its retries don't rewrite it. A long KMS message keeps its events,
+// cut short.
 func TestKMSKeyErrorIsStable(t *testing.T) {
 	for _, message := range []string{"", strings.Repeat("x", 2*maxEventNote)} {
-		kmsKeyError(t, message)
+		kmsKeyError(t, "CreateAlias refused", &deniedKMS{KMSMock: mocks.New(), alias: true, message: message}, nil, message)
+		deleting := metav1.Now()
+		kmsKeyError(t, "DescribeKey refused while deleting", &deniedKMS{KMSMock: mocks.New(), describe: true, message: message}, func(k *kmsiapi.KMSKey) {
+			k.Spec.DeletionPolicy = deleteKey
+			k.Finalizers = []string{FinalizerName}
+			k.DeletionTimestamp = &deleting
+		}, message)
 	}
 }
 
-func kmsKeyError(t *testing.T, message string) {
+func kmsKeyError(t *testing.T, name string, denied *deniedKMS, change func(*kmsiapi.KMSKey), message string) {
 	t.Helper()
 	kmsKey := &kmsiapi.KMSKey{
-		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "k", UID: "uid-k"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "k", UID: kmsKeyUID},
 		Spec:       kmsiapi.KMSKeySpec{AliasName: "alias/refused", DeletionPolicy: retain},
+	}
+	if change != nil {
+		change(kmsKey)
 	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -257,7 +303,7 @@ func kmsKeyError(t *testing.T, message string) {
 	rec := events.NewFakeRecorder(10)
 	r := &KMSKeyReconciler{
 		Client: fc, Log: logf.Log, Scheme: scheme, Recorder: rec,
-		KMSCA: &kmsca.KMSCA{Client: &deniedKMS{KMSMock: mocks.New(), alias: true, message: message}},
+		KMSCA: &kmsca.KMSCA{Client: denied},
 	}
 	key := client.ObjectKeyFromObject(kmsKey)
 	get := func() *kmsiapi.KMSKey {
@@ -267,12 +313,14 @@ func kmsKeyError(t *testing.T, message string) {
 		}
 		return got
 	}
-	expectStable(t, "CreateAlias refused", func() error {
+	expectStable(t, name, func() error {
 		_, err := r.Reconcile(context.TODO(), ctrl.Request{NamespacedName: key})
 		return err
 	}, func() any { return get().Status })
-	if got := get(); got.Status.IsReady() || !strings.Contains(got.Status.Conditions[0].Message, accessDenied) {
-		t.Errorf("status %+v, want not ready with the KMS error", got.Status)
+	got := get()
+	if got.Status.IsReady() {
+		t.Errorf("%s: status %+v, want not ready", name, got.Status)
 	}
-	expectNotesCut(t, "KMSKey", rec)
+	expectCodeOnly(t, name, got.Status.Conditions[0].Message)
+	expectNotesCut(t, name, orDenied(message), rec)
 }

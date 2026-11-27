@@ -25,6 +25,7 @@ import (
 	"github.com/aws/smithy-go"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // maxEventNote is the longest note an events.k8s.io/v1 Event may carry: the API
@@ -52,24 +53,64 @@ func eventNote(note string) string {
 	return note[:cut] + ellipsis
 }
 
-// stableText is err's text with the AWS operation error in it, if any, cut down to
-// the operation, the error code and the message. The SDK's own text carries a
-// request ID that is new on every call: written into a status condition, it would
-// change the object on every retry, and the watch event each change makes would
-// start the next pass at once, past the work queue's backoff. Statuses and events
-// take this text; the log keeps the full error.
-func stableText(err error) string {
+// stableText is err's text with every AWS operation error in it cut down to the
+// operation and its error code, for status conditions. The SDK's own text carries
+// a request ID that is new on every call, and the AWS message may vary too:
+// written into a condition, either would change the object on every retry, and
+// the watch event each change makes would start the next pass at once, past the
+// work queue's backoff. Error codes don't vary.
+func stableText(err error) string { return awsText(err, false) }
+
+// eventText is stableText with each AWS error's message, for events (which start
+// no pass). The log keeps the full error, with its request ID.
+func eventText(err error) string { return awsText(err, true) }
+
+func awsText(err error, withMessage bool) string {
 	text := err.Error()
-	var op *smithy.OperationError
-	if !errors.As(err, &op) {
-		return text
+	for _, op := range operationErrors(err) {
+		short := fmt.Sprintf("%s %s failed (the controller log has the details)", op.Service(), op.Operation())
+		var api smithy.APIError
+		if errors.As(op.Err, &api) {
+			short = fmt.Sprintf("%s %s: %s", op.Service(), op.Operation(), api.ErrorCode())
+			if withMessage {
+				short += ": " + api.ErrorMessage()
+			}
+		}
+		text = strings.Replace(text, op.Error(), short, 1)
 	}
-	short := fmt.Sprintf("%s %s failed (the controller log has the details)", op.Service(), op.Operation())
-	var api smithy.APIError
-	if errors.As(op.Err, &api) {
-		short = fmt.Sprintf("%s %s: %s: %s", op.Service(), op.Operation(), api.ErrorCode(), api.ErrorMessage())
+	return text
+}
+
+// operationErrors are the outermost AWS operation errors in err's tree (through
+// wrapped and joined errors alike).
+func operationErrors(err error) []*smithy.OperationError {
+	if op, ok := err.(*smithy.OperationError); ok {
+		return []*smithy.OperationError{op}
 	}
-	return strings.Replace(text, op.Error(), short, 1)
+	switch e := err.(type) {
+	case interface{ Unwrap() error }:
+		if inner := e.Unwrap(); inner != nil {
+			return operationErrors(inner)
+		}
+	case interface{ Unwrap() []error }:
+		var ops []*smithy.OperationError
+		for _, inner := range e.Unwrap() {
+			if inner != nil {
+				ops = append(ops, operationErrors(inner)...)
+			}
+		}
+		return ops
+	}
+	return nil
+}
+
+// readerOr is reader, or c when reader is nil (a reconciler built without an
+// uncached reader, as in unit tests).
+func readerOr(reader client.Reader, c client.Client) client.Reader {
+	if reader != nil {
+		return reader
+	}
+	return c
 }
 
 func removeString(slice []string, s string) (result []string) {
