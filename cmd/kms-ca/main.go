@@ -378,7 +378,7 @@ func finish(f *os.File, cert *x509.Certificate) error {
 }
 
 func readCertificate(file string) (*x509.Certificate, error) {
-	data, err := os.ReadFile(filepath.Clean(file))
+	data, err := os.ReadFile(file) //nolint:gosec // G703: the administrator names their own certificate file; its contents must parse as a certificate
 	if err != nil {
 		return nil, err
 	}

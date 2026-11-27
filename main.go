@@ -200,7 +200,7 @@ func main() {
 // loadAccess reads the pinned roots from rootFile and builds the operator's access
 // rules, logging what is wrong (and returning an error) if anything is.
 func loadAccess(log logr.Logger, rootFile string, namespaces, keyIDs []string, ceilings certmanager.Ceilings) (*certmanager.Access, error) {
-	rootPEM, err := os.ReadFile(rootFile)
+	rootPEM, err := os.ReadFile(rootFile) //nolint:gosec // G304: --root-certificate is set in the pod spec by whoever deploys the controller; its contents must pass the root checks
 	if err != nil {
 		log.Error(err, "reading --root-certificate")
 		return nil, err
