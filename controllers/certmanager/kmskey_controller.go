@@ -53,9 +53,8 @@ type KMSKeyReconciler struct {
 	KMSCA    *kmsca.KMSCA
 }
 
-// Annotation for generating RBAC role for writing Events
+// The RBAC the controller needs to write events (events.k8s.io/v1 only).
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmskeys,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmskeys/status,verbs=get;update;patch
@@ -93,7 +92,7 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				switch {
 				case errors.Is(err, kmsca.ErrNotOwned):
 					// Never delete a key this KMSKey didn't create; let the object go.
-					r.Recorder.Eventf(kmsKey, nil, core.EventTypeWarning, kmsiapi.KMSKeyReasonFailed, actionReconcile,
+					eventf(r.Recorder, kmsKey, core.EventTypeWarning, kmsiapi.KMSKeyReasonFailed, actionReconcile,
 						"The alias points at a key this KMSKey did not create; the key was not deleted")
 				case err != nil:
 					return ctrl.Result{}, r.manageFailure(ctx, log, kmsKey, err, "Failed to delete the KMS key")
@@ -152,7 +151,7 @@ func (r *KMSKeyReconciler) manageSuccess(ctx context.Context, log logr.Logger, k
 	reason := kmsiapi.KMSKeyReasonIssued
 	msg := ""
 	log.Info("successfully reconciled kms key")
-	r.Recorder.Eventf(kmskey, nil, core.EventTypeNormal, reason, actionReconcile, "%s", msg)
+	eventf(r.Recorder, kmskey, core.EventTypeNormal, reason, actionReconcile, "%s", msg)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionTrue, reason, msg)
 	kmskey.Status.SetCondition(&ready)
 	return r.patchKeyStatus(ctx, kmskey)
@@ -164,7 +163,7 @@ func (r *KMSKeyReconciler) manageFailure(ctx context.Context, log logr.Logger, k
 	reason := kmsiapi.KMSKeyReasonFailed
 	msg = fmt.Sprintf("%s: %v", msg, issue)
 	log.Error(issue, msg)
-	r.Recorder.Eventf(kmskey, nil, core.EventTypeWarning, reason, actionReconcile, "%s", msg)
+	eventf(r.Recorder, kmskey, core.EventTypeWarning, reason, actionReconcile, "%s", msg)
 	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, msg)
 	kmskey.Status.SetCondition(&ready)
 	return errors.Join(issue, r.patchKeyStatus(ctx, kmskey))

@@ -296,10 +296,8 @@ func root(args []string, out io.Writer) error {
 	if err := finish(f, cert); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(out, "wrote %s\n  signed by:    %s (root key)\n  as:           %s\n", c.outFile, c.keyID, identity); err != nil {
-		return err
-	}
-	return describe(out, cert)
+	_, headErr := fmt.Fprintf(out, "wrote %s\n  signed by:    %s (root key)\n  as:           %s\n", f.Name(), c.keyID, identity)
+	return summarized(f.Name(), headErr, out, cert)
 }
 
 func intermediate(args []string, out io.Writer) error {
@@ -352,14 +350,27 @@ func intermediate(args []string, out io.Writer) error {
 	if err := finish(f, cert); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(out, "wrote %s\n  for key:      %s (issuing key)\n  signed by:    %s (root key)\n  as:           %s\n",
-		c.outFile, c.keyID, rootKeyID, identity); err != nil {
-		return err
+	_, headErr := fmt.Fprintf(out, "wrote %s\n  for key:      %s (issuing key)\n  signed by:    %s (root key)\n  as:           %s\n",
+		f.Name(), c.keyID, rootKeyID, identity)
+	return summarized(f.Name(), headErr, out, cert)
+}
+
+// summarized prints the summary of a certificate already written to file (after
+// the heading, whose write error is headErr), saying that it was written if the
+// summary can't be printed: signing again would use the root key a second time.
+func summarized(file string, headErr error, out io.Writer, cert *x509.Certificate) error {
+	err := headErr
+	if err == nil {
+		err = describe(out, cert)
 	}
-	return describe(out, cert)
+	if err != nil {
+		return fmt.Errorf("the certificate was written to %s, but printing its summary failed (see it with `kms-ca show %s`): %w", file, file, err)
+	}
+	return nil
 }
 
 // create makes the output file, failing if it exists, before anything is signed.
+// The name is cleaned; the file's Name is the path used, and the one reported.
 func create(file string) (*os.File, error) {
 	return os.OpenFile(filepath.Clean(file), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
@@ -378,7 +389,7 @@ func finish(f *os.File, cert *x509.Certificate) error {
 }
 
 func readCertificate(file string) (*x509.Certificate, error) {
-	data, err := os.ReadFile(file) //nolint:gosec // G703: the administrator names their own certificate file; its contents must parse as a certificate
+	data, err := os.ReadFile(file) // #nosec G304 G703 -- the administrator names their own certificate file; its contents must parse as a certificate
 	if err != nil {
 		return nil, err
 	}

@@ -16,6 +16,39 @@ limitations under the License.
 
 package certmanager
 
+import (
+	"fmt"
+	"unicode/utf8"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
+)
+
+// maxEventNote is the longest note an events.k8s.io/v1 Event may carry: the API
+// server refuses a longer one, and the recorder drops the refused event.
+const maxEventNote = 1024
+
+// eventf records an event on regarding with the formatted note, cut to
+// maxEventNote bytes (at a character boundary, ending in "...") so that a long
+// message (a requester's long name in a refusal, say) never loses the event.
+// The status condition and the log keep the full text.
+func eventf(rec events.EventRecorder, regarding runtime.Object, eventtype, reason, action, format string, args ...any) {
+	rec.Eventf(regarding, nil, eventtype, reason, action, "%s", eventNote(fmt.Sprintf(format, args...)))
+}
+
+// eventNote is note cut to at most maxEventNote bytes.
+func eventNote(note string) string {
+	if len(note) <= maxEventNote {
+		return note
+	}
+	const ellipsis = "..."
+	cut := maxEventNote - len(ellipsis)
+	for cut > 0 && !utf8.RuneStart(note[cut]) {
+		cut--
+	}
+	return note[:cut] + ellipsis
+}
+
 func removeString(slice []string, s string) (result []string) {
 	for _, item := range slice {
 		if item == s {

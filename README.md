@@ -146,6 +146,12 @@ Metrics (authenticated; bind the `<release>-metrics-reader` ClusterRole to your 
 (alert well before either expires), `kms_issuer_leaves_truncated`, `kms_issuer_certificates_issued_total`,
 `kms_issuer_requests_refused_total`.
 
+Events (events.k8s.io/v1) tell what happened, but the `Ready` condition is the current state: the events API
+merges repeated events of one reason on one object, keeping the first note, and notes are cut to 1024 bytes.
+A request left pending raises a warning event whose reason is the cause (`IssuerUnavailable`,
+`IssuerNotReady`, `IssuerCannotSign`, `Waiting`, `SigningFailed`); its `Ready` condition says `Pending` with
+the current message in full.
+
 ## Create an issuer and a certificate
 
 ```yaml

@@ -58,9 +58,13 @@ func rootArgs(keyID, commonName, domains, out string) []string {
 }
 
 func (f *fixture) intermediate(out string, extra ...string) error {
-	args := append([]string{"intermediate", flagRootKeyID, f.rootKey, "--root-certificate", f.rootFile,
+	return run(f.intermediateArgs(out, extra...), &f.out)
+}
+
+// intermediateArgs is a `kms-ca intermediate` command line.
+func (f *fixture) intermediateArgs(out string, extra ...string) []string {
+	return append([]string{"intermediate", flagRootKeyID, f.rootKey, "--root-certificate", f.rootFile,
 		flagKeyID, f.issuingKey, flagCommonName, "Fleet Issuing", flagDomains, testDomain, flagOut, out}, extra...)
-	return run(args, &f.out)
 }
 
 func TestRootThenIntermediate(t *testing.T) {
@@ -142,5 +146,44 @@ func TestUsage(t *testing.T) {
 		if err := run(args, &out); err == nil {
 			t.Errorf("%v: no error", args)
 		}
+	}
+}
+
+// failingWriter fails every write.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, os.ErrClosed }
+
+// A summary that can't be printed after the certificate is written says it was
+// written, so the administrator doesn't sign again.
+func TestSummaryFailureSaysWritten(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.dir, "root2.pem")
+	err := run(rootArgs(f.rootKey, "Fleet Root 2", testDomain, root), failingWriter{})
+	if err == nil || !strings.Contains(err.Error(), "the certificate was written to "+root) {
+		t.Errorf("root: %v, want it to say the certificate was written", err)
+	}
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Errorf("root: %v", statErr)
+	}
+	inter := filepath.Join(f.dir, "inter.pem")
+	if err := run(f.intermediateArgs(inter), failingWriter{}); err == nil || !strings.Contains(err.Error(), "the certificate was written to "+inter) {
+		t.Errorf("intermediate: %v, want it to say the certificate was written", err)
+	}
+}
+
+// The path reported is the one written.
+func TestReportsThePathWritten(t *testing.T) {
+	f := newFixture(t)
+	f.out.Reset()
+	if err := os.Mkdir(filepath.Join(f.dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.intermediate(filepath.Join(f.dir, "sub") + "/../inter.pem"); err != nil {
+		t.Fatal(err)
+	}
+	written := filepath.Join(f.dir, "inter.pem")
+	if !strings.Contains(f.out.String(), "wrote "+written+"\n") {
+		t.Errorf("output %q does not name %s", f.out.String(), written)
 	}
 }

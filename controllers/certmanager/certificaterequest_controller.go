@@ -52,6 +52,18 @@ const (
 	issuerKind = "KMSIssuer"
 )
 
+// The reasons of the warning events for a request left pending (its Ready
+// condition's reason is Pending for all of them). Events of one reason on one
+// request are merged by the events API, keeping the first note, so each cause
+// has its own; the Ready condition's message is always the current one.
+const (
+	eventIssuerUnavailable = "IssuerUnavailable"
+	eventIssuerNotReady    = "IssuerNotReady"
+	eventIssuerCannotSign  = "IssuerCannotSign"
+	eventWaiting           = "Waiting"
+	eventSigningFailed     = "SigningFailed"
+)
+
 // CertificateRequestReconciler signs approved cert-manager CertificateRequests that
 // name a KMSIssuer, within the issuer's policy.
 type CertificateRequestReconciler struct {
@@ -97,9 +109,8 @@ func newSignedCertificate(uid types.UID, leaf *x509.Certificate, verified verifi
 	}
 }
 
-// Annotation for generating RBAC role for writing Events
+// The RBAC the controller needs to write events (events.k8s.io/v1 only).
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificaterequests,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificaterequests/status,verbs=get;update;patch
@@ -158,7 +169,9 @@ func (r *CertificateRequestReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !current {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		// Retried through the rate limiter (backing off), not on a fixed delay:
+		// each pass reads the issuer and asks KMS for its key before getting here.
+		return ctrl.Result{}, fmt.Errorf("the cache is behind CertificateRequest %s: retrying once it catches up", req.NamespacedName)
 	}
 
 	if p := r.keptCertificate(log, req, cr, issuer, &verified, limits); p != nil {
@@ -187,20 +200,20 @@ func (r *CertificateRequestReconciler) signingIssuer(ctx context.Context, log lo
 	issuerName := types.NamespacedName{Namespace: cr.Namespace, Name: cr.Spec.IssuerRef.Name}
 	if err := r.reader().Get(ctx, issuerName, issuer); err != nil {
 		log.Error(err, "failed to retrieve KMSIssuer resource", "issuer", issuerName)
-		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "Failed to retrieve KMSIssuer resource %s: %v", issuerName, err)
+		_ = r.pending(ctx, cr, eventIssuerUnavailable, "Failed to retrieve KMSIssuer resource %s: %v", issuerName, err)
 		return nil, verifiedIssuer{}, err
 	}
 	if !issuer.Status.IsReady() {
 		err := fmt.Errorf("KMSIssuer %s is not ready", issuerName)
 		log.Error(err, "issuer not ready")
-		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "KMSIssuer %s is not Ready", issuerName)
+		_ = r.pending(ctx, cr, eventIssuerNotReady, "KMSIssuer %s is not Ready", issuerName)
 		return nil, verifiedIssuer{}, err
 	}
 	verified, err := verifyIssuer(ctx, r.KMSCA, r.Access, issuer, r.Clock.Now())
 	if err != nil {
 		err = fmt.Errorf("KMSIssuer %s cannot sign now: %w", issuerName, err)
 		log.Error(err, "not signing")
-		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
+		_ = r.pending(ctx, cr, eventIssuerCannotSign, "%v (will retry)", err)
 		return nil, verifiedIssuer{}, err
 	}
 	return issuer, verified, nil
@@ -286,7 +299,7 @@ func (r *CertificateRequestReconciler) sign(ctx context.Context, log logr.Logger
 		}
 		if errors.Is(err, policy.ErrWait) {
 			log.Info("request waits", "reason", err.Error())
-			_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "%v (will retry)", err)
+			_ = r.pending(ctx, cr, eventWaiting, "%v (will retry)", err)
 		}
 		return nil, err
 	}
@@ -299,7 +312,7 @@ func (r *CertificateRequestReconciler) sign(ctx context.Context, log logr.Logger
 	})
 	if err != nil {
 		log.Error(err, "failed to sign certificate request")
-		_ = r.setStatus(ctx, cr, cmapi.CertificateRequestReasonPending, "Failed to sign the certificate (will retry): %v", err)
+		_ = r.pending(ctx, cr, eventSigningFailed, "Failed to sign the certificate (will retry): %v", err)
 		return nil, err
 	}
 
@@ -395,7 +408,7 @@ func (r *CertificateRequestReconciler) record(ctx context.Context, log logr.Logg
 	}
 	r.signed.Delete(req.NamespacedName)
 	certificatesIssued.WithLabelValues(issuer.Namespace, issuer.Name).Inc()
-	r.Recorder.Eventf(cr, nil, core.EventTypeNormal, cmapi.CertificateRequestReasonIssued, actionSign, "Certificate issued")
+	eventf(r.Recorder, cr, core.EventTypeNormal, cmapi.CertificateRequestReasonIssued, actionSign, "Certificate issued")
 	return ctrl.Result{}, nil
 }
 
@@ -469,12 +482,23 @@ func (r *CertificateRequestReconciler) fail(ctx context.Context, cr *cmapi.Certi
 	return r.setStatus(ctx, cr, cmapi.CertificateRequestReasonFailed, message, args...)
 }
 
-// setStatus sets Ready=False with the reason and message, with a warning event:
-// every status it writes is a request not (yet) signed. An issued certificate is
-// recorded by record.
+// setStatus sets Ready=False with the reason and message, with a warning event of
+// the same reason.
 func (r *CertificateRequestReconciler) setStatus(ctx context.Context, cr *cmapi.CertificateRequest, reason, message string, args ...any) error {
-	completeMessage := fmt.Sprintf(message, args...)
-	apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionReady, cmmeta.ConditionFalse, reason, completeMessage)
-	r.Recorder.Eventf(cr, nil, core.EventTypeWarning, reason, actionSign, "%s", completeMessage)
+	return r.notReady(ctx, cr, reason, reason, fmt.Sprintf(message, args...))
+}
+
+// pending sets Ready=False with reason Pending (the request is retried) and the
+// message, with a warning event whose reason is the cause.
+func (r *CertificateRequestReconciler) pending(ctx context.Context, cr *cmapi.CertificateRequest, cause, message string, args ...any) error {
+	return r.notReady(ctx, cr, cmapi.CertificateRequestReasonPending, cause, fmt.Sprintf(message, args...))
+}
+
+// notReady writes Ready=False and records the warning event: every status it
+// writes is a request not (yet) signed. An issued certificate is recorded by
+// record.
+func (r *CertificateRequestReconciler) notReady(ctx context.Context, cr *cmapi.CertificateRequest, reason, eventReason, message string) error {
+	apiutil.SetCertificateRequestCondition(cr, cmapi.CertificateRequestConditionReady, cmmeta.ConditionFalse, reason, message)
+	eventf(r.Recorder, cr, core.EventTypeWarning, eventReason, actionSign, "%s", message)
 	return r.Status().Update(ctx, cr)
 }
