@@ -1,0 +1,77 @@
+name: Fuzz
+
+# Nightly fuzzing of the signing policy and intermediate validation. Pull requests
+# run only the fuzz targets' saved inputs (in `make test`); fuzzing is random and
+# would fail pull requests for code they don't touch. A failure here uploads the
+# failing input; fix it with a pull request that adds the input to the target's
+# seeds, so every later pull request checks it.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: ./pkg/policy, target: FuzzTemplateNames }
+          - { package: ./pkg/policy, target: FuzzTemplateCSR }
+          - { package: ./pkg/kmsca, target: FuzzValidateIntermediate }
+          - { package: ./pkg/kmsca, target: FuzzValidConstraintDomain }
+    env:
+      PACKAGE: ${{ matrix.package }}
+      TARGET: ${{ matrix.target }}
+      # A cache of its own, so the corpus the fuzzer builds (under fuzz/) can be
+      # kept between runs.
+      GOCACHE: ${{ github.workspace }}/../gocache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Each run starts from the corpus the last one built.
+      - name: Restore the corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOCACHE }}/fuzz
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-${{ matrix.target }}-
+
+      - name: Fuzz for 10 minutes
+        run: go test -run='^$' -fuzz="^${TARGET}\$" -fuzztime=10m "${PACKAGE}"
+
+      - name: Save the corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOCACHE }}/fuzz
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+
+      # Reproduce with: go test -run='<target>/<file name>' <package>, after
+      # copying the file to <package>/testdata/fuzz/<target>/.
+      - name: Upload the failing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failing-input-${{ matrix.target }}
+          path: ${{ matrix.package }}/testdata/fuzz/${{ matrix.target }}/
+          if-no-files-found: ignore
