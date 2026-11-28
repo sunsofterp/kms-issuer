@@ -259,14 +259,16 @@ for known vulnerabilities.
 The signing policy (`pkg/policy`) and intermediate validation (`pkg/kmsca`) have Go fuzz targets. `make test`
 runs their seed inputs as fixed cases: one accepted input, then one per rule that breaks only that rule. The
 `Fuzz` workflow fuzzes each target for 10 minutes every night, starting from the corpus the last run saved. A
-failure uploads the failing input as an artifact; add it to the target's seeds in a pull request, so every
-later pull request checks it. To fuzz one target locally:
+failure opens a pull request committing the failing input under `<package>/testdata/fuzz/<target>/`, where
+every `go test` runs it, so the case stays checked once fixed: push the fix to that pull request's branch
+(GitHub runs no checks on a pull request a workflow opened until something is pushed to it). To fuzz one
+target locally:
 
 ```sh
 go test -run='^$' -fuzz='^FuzzTemplateNames$' -fuzztime=5m ./pkg/policy
 ```
 
-A failing input is written to `<package>/testdata/fuzz/<target>/`.
+A failing input is written to `<package>/testdata/fuzz/<target>/`; commit it there to keep it as a case.
 
 GitHub disables scheduled workflows in a public repository after 60 days without activity, and a stopped
 nightly fails nothing. `gh workflow list --all` shows its state; `gh workflow enable fuzz.yml` turns it back

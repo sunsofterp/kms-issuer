@@ -1,10 +1,11 @@
 name: Fuzz
 
 # Nightly fuzzing of the signing policy and intermediate validation. Pull requests
-# run only the fuzz targets' saved inputs (in `make test`); fuzzing is random and
-# would fail pull requests for code they don't touch. A failure here uploads the
-# failing input; fix it with a pull request that adds the input to the target's
-# seeds, so every later pull request checks it.
+# run only the fuzz targets' seeds and saved inputs (in `make test`); fuzzing is
+# random and would fail pull requests for code they don't touch. A failure here
+# opens a pull request committing the failing input under testdata/fuzz, where
+# every later `go test` runs it: that pull request fails until the bug is fixed on
+# its branch.
 
 on:
   schedule:
@@ -67,12 +68,59 @@ jobs:
           # The attempt too, so a re-run saves what it adds (a cache key is written once).
           key: fuzz-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # Reproduce with: go test -run='<target>/<file name>' <package>, after
-      # copying the file to <package>/testdata/fuzz/<target>/.
+      # Go writes it to <package>/testdata/fuzz/<target>/. The wildcard keeps the
+      # path from pkg/ on, so the next job puts it back where it was written.
       - name: Upload the failing input
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: failing-input-${{ matrix.target }}
-          path: ${{ matrix.package }}/testdata/fuzz/${{ matrix.target }}/
+          path: pkg/*/testdata/fuzz/
           if-no-files-found: ignore
+
+  # Its own job, so that fuzzing (which runs the repository's code) never holds a
+  # token that can write. This one runs no repository code: it commits the inputs
+  # as data and opens the pull request. GitHub runs no workflow on a pull request
+  # opened with this token: its checks start when the fix is pushed to its branch
+  # (or when it is closed and reopened).
+  add-failing-inputs:
+    name: Open a pull request adding the failing inputs
+    needs: fuzz
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the failing inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: failing-input-*
+          merge-multiple: true
+          path: pkg
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: fuzz/failing-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$(git status --porcelain -- pkg)" ]; then
+            echo "The failed jobs left no failing input (a timeout or a build failure?): see ${RUN_URL}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${BRANCH}"
+          git add -- pkg
+          git commit -m "Add the fuzz failing inputs from ${RUN_URL}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${BRANCH}"
+          gh pr create --base "${GITHUB_REF_NAME}" --head "${BRANCH}" \
+            --title "Fuzzing found failing inputs" \
+            --body "The nightly fuzz run ${RUN_URL} failed. This commits each failing input under its target's testdata/fuzz directory, so every go test runs it: the checks fail until the bug is fixed on this branch. Reproduce with go test -run='<target>/<file name>' <package>. GitHub starts no checks on a pull request opened by a workflow: they run once a fix is pushed here."
