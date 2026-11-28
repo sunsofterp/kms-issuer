@@ -43,7 +43,7 @@ func csrPEM(t *testing.T, key crypto.Signer, tmpl *x509.CertificateRequest) []by
 	if err != nil {
 		t.Fatal(err)
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	return pem.EncodeToMemory(&pem.Block{Type: csrBlock, Bytes: der})
 }
 
 func rsaKey(t *testing.T, bits int) *rsa.PrivateKey {
@@ -59,7 +59,7 @@ func TestTemplateIssuesAServerCertificate(t *testing.T) {
 	key := rsaKey(t, 2048)
 	req := &Request{
 		CSR: csrPEM(t, key, &x509.CertificateRequest{
-			Subject:  pkix.Name{CommonName: mixedCaseName, Organization: []string{"system:masters"}},
+			Subject:  pkix.Name{CommonName: mixedCaseName, Organization: []string{systemMaster}},
 			DNSNames: []string{mixedCaseName, "other.example.internal", testDomain},
 		}),
 		Usages:          []string{UsageDigitalSignature, UsageKeyEncipherment, UsageServerAuth},
@@ -162,7 +162,7 @@ func TestTemplateRefuses(t *testing.T) {
 		"a bad hostname":           {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{"a_b.example.internal"}}), DefaultDuration: time.Hour}},
 		"a trailing dot":           {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{"a.example.internal."}}), DefaultDuration: time.Hour}},
 		"no DNS name":              {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{Subject: pkix.Name{CommonName: testName}}), DefaultDuration: time.Hour}},
-		"a common name not a SAN":  {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "evil.com"}, DNSNames: []string{testName}}), DefaultDuration: time.Hour}},
+		"a common name not a SAN":  {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{Subject: pkix.Name{CommonName: evilName}, DNSNames: []string{testName}}), DefaultDuration: time.Hour}},
 		"an IP address":            {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{testName}, IPAddresses: []net.IP{net.IPv4(10, 0, 0, 1)}}), DefaultDuration: time.Hour}},
 		"a URI":                    {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{testName}, URIs: []*url.URL{uri}}), DefaultDuration: time.Hour}},
 		"an email address":         {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{testName}, EmailAddresses: []string{"a@example.internal"}}), DefaultDuration: time.Hour}},

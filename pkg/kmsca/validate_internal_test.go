@@ -23,7 +23,7 @@ const (
 
 var vtNow = time.Date(2026, time.November, 25, 12, 0, 0, 0, time.UTC)
 
-func vtKey(t *testing.T) *ecdsa.PrivateKey {
+func vtKey(t testing.TB) *ecdsa.PrivateKey {
 	t.Helper()
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -33,7 +33,7 @@ func vtKey(t *testing.T) *ecdsa.PrivateKey {
 }
 
 // vtRoot self-signs a root for the domains with key.
-func vtRoot(t *testing.T, key *ecdsa.PrivateKey, name string, domains ...string) *x509.Certificate {
+func vtRoot(t testing.TB, key *ecdsa.PrivateKey, name string, domains ...string) *x509.Certificate {
 	t.Helper()
 	tmpl, err := CATemplate(&CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: domains, Duration: 365 * vtDays, Now: vtNow}, Root)
 	if err != nil {
@@ -56,7 +56,7 @@ func vtIntermediate(t *testing.T, root *x509.Certificate, rootKey crypto.Signer,
 	return vtSign(t, tmpl, root, pub, rootKey)
 }
 
-func vtSign(t *testing.T, tmpl, parent *x509.Certificate, pub crypto.PublicKey, key crypto.Signer) *x509.Certificate {
+func vtSign(t testing.TB, tmpl, parent *x509.Certificate, pub crypto.PublicKey, key crypto.Signer) *x509.Certificate {
 	t.Helper()
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, key)
 	if err != nil {
@@ -234,7 +234,7 @@ func TestValidateIntermediateWithinTheRoot(t *testing.T) {
 // Each malformed label is refused by the label check itself.
 func TestValidConstraintDomainLabels(t *testing.T) {
 	for _, d := range []string{
-		"ex_ample.internal",
+		underscoreDomain,
 		"-example.internal",
 		"example-.internal",
 		"example..internal",
@@ -244,7 +244,7 @@ func TestValidConstraintDomainLabels(t *testing.T) {
 			t.Errorf("%q: %v, want an invalid label", d, err)
 		}
 	}
-	for _, d := range []string{"a-b.internal", strings.Repeat("a", 63) + ".internal", "x1.internal"} {
+	for _, d := range []string{ldhDomain, strings.Repeat("a", 63) + ".internal", "x1.internal"} {
 		if err := ValidConstraintDomain(d); err != nil {
 			t.Errorf("%q refused: %v", d, err)
 		}
