@@ -17,125 +17,250 @@ limitations under the License.
 package certmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
 	core "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	kmsiapi "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
-	"github.com/Skyscanner/kms-issuer/v4/pkg/kmsca"
+	kmsiapi "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
 )
 
 const (
-	// defaultCertDuration is the default duration the CA certificate is valid for.
-	defaultCertDuration = time.Hour * 24 * 365 * 3 // 3 years
-	// defaultCertRenewalRatio is the default period of time before the CA cetificate is renewed.
-	defaultCertRenewalRatio = 2.0 / 3
+	// defaultMaxCertificateDuration is the default longest issued validity. Leaves
+	// renew automatically, so they are kept short.
+	defaultMaxCertificateDuration = time.Hour * 24 * 30
+	// maxRequeue bounds how long the issuer goes unchecked.
+	maxRequeue = 12 * time.Hour
+	// refusedRequeue is how soon a refused issuer is checked again: a refusal can be
+	// time-dependent (an intermediate not valid yet) or fixed outside the spec.
+	refusedRequeue = 10 * time.Minute
+	// minExpiryWarning is the least warning before the intermediate expires. The
+	// warning starts at twice the issuer's longest leaf (leaves are cut short in
+	// the intermediate's last maxCertificateDuration), and never later than this.
+	minExpiryWarning = 30 * 24 * time.Hour
+
+	eventIntermediateAccepted = "IntermediateAccepted"
+	eventIntermediateExpiring = "IntermediateExpiringSoon"
+	eventKMSError             = "KMSError"
+
+	// The actions events report (events.k8s.io/v1 requires one).
+	actionSign      = "Sign"
+	actionVerify    = "Verify"
+	actionReconcile = "Reconcile"
 )
 
 // KMSIssuerReconciler reconciles a KMSIssuer object.
 type KMSIssuerReconciler struct {
 	client.Client
-	Log      logr.Logger
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
-	KMSCA    *kmsca.KMSCA
+	// APIReader reads the issuer uncached. The controller ignores its own status
+	// writes, so a pass must never decide from a cached copy that may predate the
+	// last write (it would skip a write that is needed, and nothing would start
+	// another pass to repair it).
+	APIReader client.Reader
+	Log       logr.Logger
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
+	KMSCA     *kmsca.KMSCA
+	Access    *Access
+	Clock     clock.Clock
 }
 
-// Annotation for generating RBAC role for writing Events
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// The RBAC the controller needs to write events (events.k8s.io/v1 only: the
+// recorder has no core/v1 fallback). Nothing generates RBAC from these markers in
+// this repository; the chart's templates/rbac.yaml is what grants it.
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmsissuers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmsissuers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.skyscanner.net,resources=kmsissuers/status,verbs=get;update;patch
 
 // NewKMSIssuerReconciler Initialise a new KMSIssuerReconciler
-func NewKMSIssuerReconciler(mgr manager.Manager, ca *kmsca.KMSCA) *KMSIssuerReconciler {
+func NewKMSIssuerReconciler(mgr manager.Manager, ca *kmsca.KMSCA, access *Access) *KMSIssuerReconciler {
 	return &KMSIssuerReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("kmsissuer_controller"),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("kmsissuer_controller"),
-		KMSCA:    ca,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Log:       ctrl.Log.WithName("controllers").WithName("kmsissuer_controller"),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("kmsissuer_controller"),
+		KMSCA:     ca,
+		Access:    access,
+		Clock:     clock.RealClock{},
 	}
+}
+
+// settings is an issuer's spec with defaults applied.
+type settings struct {
+	maxCertificateDuration time.Duration
+}
+
+func issuerSettings(issuer *kmsiapi.KMSIssuer) settings {
+	s := settings{maxCertificateDuration: defaultMaxCertificateDuration}
+	if d := issuer.Spec.MaxCertificateDuration; d != nil && d.Duration != 0 {
+		s.maxCertificateDuration = d.Duration
+	}
+	return s
+}
+
+func (s settings) validate() error {
+	if s.maxCertificateDuration%time.Second != 0 {
+		return fmt.Errorf("maxCertificateDuration %s is not a whole number of seconds", s.maxCertificateDuration)
+	}
+	if s.maxCertificateDuration < time.Hour {
+		return fmt.Errorf("maxCertificateDuration %s is shorter than 1h", s.maxCertificateDuration)
+	}
+	return nil
+}
+
+// errKMS marks a failure to reach KMS, as opposed to an issuer that is wrong.
+type errKMS struct{ error }
+
+func (e errKMS) Unwrap() error { return e.error }
+
+// verifiedIssuer is an issuer that may sign: its intermediate, and the pinned root
+// that intermediate chains to.
+type verifiedIssuer struct {
+	intermediate *x509.Certificate
+	root         *x509.Certificate
+}
+
+// verifyIssuer returns the issuer's intermediate and root when the issuer may sign:
+// allowed namespace and key, settings within the ceilings, and an intermediate that
+// is for the issuer's KMS key, signed by a pinned root, constrained within the
+// ceilings and the root and covering the issuer's domains, valid now and no
+// longer-lived than allowed. Errors wrapping errKMS are KMS failures (retry); others
+// are the issuer's configuration. On a KMS failure the parsed intermediate (not yet
+// verified) is returned, for the caller to judge whether to keep serving.
+func verifyIssuer(ctx context.Context, ca *kmsca.KMSCA, access *Access, issuer *kmsiapi.KMSIssuer, now time.Time) (verifiedIssuer, error) {
+	s := issuerSettings(issuer)
+	if err := s.validate(); err != nil {
+		return verifiedIssuer{}, fmt.Errorf("invalid issuer settings: %w", err)
+	}
+	if err := access.CheckIssuer(issuer, s); err != nil {
+		return verifiedIssuer{}, err
+	}
+	intermediate, err := kmsca.ParseCertificatePEM([]byte(issuer.Spec.IntermediateCertificate))
+	if err != nil {
+		return verifiedIssuer{}, fmt.Errorf("intermediateCertificate: %w", err)
+	}
+	pub, err := ca.PublicKey(ctx, issuer.Spec.KeyID)
+	if err != nil {
+		return verifiedIssuer{intermediate: intermediate}, errKMS{fmt.Errorf("reading the KMS key's public key: %w", err)}
+	}
+	root, err := kmsca.ValidateIntermediate(intermediate, &kmsca.ExpectedIntermediate{
+		Roots: access.RootsAt(now), OtherRoots: access.Roots(), PublicKey: pub, AllowedDomains: access.AllowedDomains(),
+		MaxDuration: access.MaxIntermediateDuration(), Now: now,
+	})
+	if err != nil {
+		return verifiedIssuer{}, fmt.Errorf("intermediateCertificate: %w", err)
+	}
+	for _, d := range issuer.Spec.PermittedDNSDomains {
+		if !kmsca.WithinDomains(d, intermediate.PermittedDNSDomains) {
+			return verifiedIssuer{}, fmt.Errorf("permitted DNS domain %q is outside the intermediate's name constraints %v", d, intermediate.PermittedDNSDomains)
+		}
+	}
+	return verifiedIssuer{intermediate: intermediate, root: root}, nil
+}
+
+// expiryWarning is how long before the intermediate expires the issuer warns.
+func expiryWarning(s settings) time.Duration {
+	if w := 2 * s.maxCertificateDuration; w > minExpiryWarning {
+		return w
+	}
+	return minExpiryWarning
 }
 
 // Reconcile KMSIssuer resources.
+//
+// An issuer that is wrong (outside the operator's ceilings, or naming an
+// intermediate that doesn't verify) is marked not ready until its spec changes. KMS
+// errors are returned so the work queue retries with backoff; while the issuer's
+// intermediate is still valid it stays ready through them, so a KMS blip never
+// stops issuance.
 func (r *KMSIssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("kms-issuer", req.NamespacedName)
 
-	// retrieve the KMSIssuer resource to reconcile.
 	issuer := &kmsiapi.KMSIssuer{}
-	if err := r.Get(ctx, req.NamespacedName, issuer); err != nil {
+	if err := readerOr(r.APIReader, r.Client).Get(ctx, req.NamespacedName, issuer); err != nil {
+		if apierrors.IsNotFound(err) {
+			caNotAfter.DeleteLabelValues(req.Namespace, req.Name)
+			leavesTruncated.DeleteLabelValues(req.Namespace, req.Name)
+			return ctrl.Result{}, nil
+		}
 		log.Error(err, "failed to retrieve KMSIssuer resource")
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, err
 	}
 
-	// validation
-	if issuer.Spec.KeyID == "" {
-		return ctrl.Result{}, r.manageFailure(ctx, issuer, errors.New("INVALID KeyId"), fmt.Sprintf("Not a valid key: %s", issuer.Spec.KeyID))
-	}
-	// set default values
-	r.setIssuerDefaultValues(issuer)
-
-	// Renew the certificate
-	certInput := desiredCertificateAuthorityCertificateInput(issuer)
-	desiredCert := r.KMSCA.GenerateCertificateAuthorityCertificate(certInput)
-
-	if r.certificateNeedsRenewal(issuer, desiredCert) {
-		log.Info("generate certificate")
-		cert, err := r.KMSCA.GenerateAndSignCertificateAuthorityCertificate(ctx, certInput)
-		if err != nil {
-			return ctrl.Result{}, r.manageFailure(ctx, issuer, err, "Failed to generate the Certificate Authority Certificate")
+	now := r.Clock.Now()
+	verified, err := verifyIssuer(ctx, r.KMSCA, r.Access, issuer, now)
+	intermediate := verified.intermediate
+	var kmsErr errKMS
+	switch {
+	case errors.As(err, &kmsErr):
+		eventf(r.Recorder, issuer, core.EventTypeWarning, eventKMSError, actionVerify, "%s", eventText(err))
+		if issuer.Status.IsReady() && intermediate != nil && now.Before(intermediate.NotAfter) {
+			log.Error(err, "KMS error; staying ready with the current intermediate")
+			return ctrl.Result{}, err
 		}
-		issuer.Status.Certificate = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+		return ctrl.Result{}, errors.Join(err, r.setNotReady(ctx, issuer, "KMS error", err))
+	case err != nil:
+		// Checked again soon: a refusal can be time-dependent (an intermediate not
+		// valid yet) or fixed outside the spec (the operator's flags, a new root).
+		return ctrl.Result{RequeueAfter: refusedRequeue}, r.setNotReady(ctx, issuer, "This KMSIssuer may not issue", err)
+	}
+
+	s := issuerSettings(issuer)
+	encoded := kmsca.EncodeCertificatePEM(intermediate)
+	if !bytes.Equal(issuer.Status.Certificate, encoded) {
+		issuer.Status.Certificate = encoded
 		if err := r.patchIssuerStatus(ctx, issuer); err != nil {
-			return ctrl.Result{}, r.manageFailure(ctx, issuer, err, "Failed to update the issuer with the issued Certificate")
+			return ctrl.Result{}, err
 		}
+		eventf(r.Recorder, issuer, core.EventTypeNormal, eventIntermediateAccepted, actionVerify,
+			"Signing under intermediate %s, valid until %s", intermediate.SerialNumber.Text(16), intermediate.NotAfter.Format(time.RFC3339))
+		log.Info("intermediate accepted", "serial", intermediate.SerialNumber.Text(16), "notAfter", intermediate.NotAfter)
 	}
-	return ctrl.Result{
-		RequeueAfter: time.Until(desiredCert.NotAfter.Add(-1 * issuer.Spec.RenewBefore.Duration)),
-	}, r.manageSuccess(ctx, issuer)
+	caNotAfter.WithLabelValues(issuer.Namespace, issuer.Name).Set(float64(intermediate.NotAfter.Unix()))
+	left := intermediate.NotAfter.Sub(now)
+	truncating := 0.0
+	if left < s.maxCertificateDuration {
+		truncating = 1
+	}
+	leavesTruncated.WithLabelValues(issuer.Namespace, issuer.Name).Set(truncating)
+	if left < expiryWarning(s) {
+		eventf(r.Recorder, issuer, core.EventTypeWarning, eventIntermediateExpiring, actionVerify,
+			"The intermediate expires %s (in %s; certificates are cut short from %s before): make a new one with `kms-ca intermediate` and update intermediateCertificate",
+			intermediate.NotAfter.Format(time.RFC3339), left.Round(time.Hour), s.maxCertificateDuration)
+	}
+
+	requeue := intermediate.NotAfter.Sub(now)
+	if requeue > maxRequeue {
+		requeue = maxRequeue
+	}
+	if requeue < time.Minute {
+		requeue = time.Minute
+	}
+	return ctrl.Result{RequeueAfter: requeue}, r.setReady(ctx, issuer)
 }
 
-// setIssuerDefaultValues
-func (r *KMSIssuerReconciler) setIssuerDefaultValues(issuer *kmsiapi.KMSIssuer) {
-	log := r.Log.WithValues("name", issuer.Name, "namespace", issuer.Namespace)
-	if issuer.Spec.Duration == nil || issuer.Spec.Duration.Duration == 0 {
-		log.Info("setting default duration", "duration", defaultCertDuration)
-		issuer.Spec.Duration = &metav1.Duration{Duration: defaultCertDuration}
-	}
-	renewBefore := time.Duration(float64(issuer.Spec.Duration.Nanoseconds()) * defaultCertRenewalRatio)
-	if issuer.Spec.RenewBefore == nil {
-		log.Info("setting default", "RenewBefore", renewBefore)
-		issuer.Spec.RenewBefore = &metav1.Duration{
-			Duration: renewBefore,
-		}
-	}
-	if issuer.Spec.RenewBefore.Duration > issuer.Spec.Duration.Duration {
-		log.Info("overriding missconfigured value", "RenewBefore", renewBefore)
-		issuer.Spec.RenewBefore = &metav1.Duration{
-			Duration: renewBefore,
-		}
-	}
-}
-
-// patchStatus updates the kmsiapi.KMSIssuer using a MergeFrom strategy
+// patchIssuerStatus updates the kmsiapi.KMSIssuer using a MergeFrom strategy
 func (r *KMSIssuerReconciler) patchIssuerStatus(ctx context.Context, issuer *kmsiapi.KMSIssuer) error {
 	var latest kmsiapi.KMSIssuer
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(issuer), &latest); err != nil {
+	if err := readerOr(r.APIReader, r.Client).Get(ctx, client.ObjectKeyFromObject(issuer), &latest); err != nil {
 		return err
 	}
 
@@ -145,83 +270,36 @@ func (r *KMSIssuerReconciler) patchIssuerStatus(ctx context.Context, issuer *kms
 	return r.Client.Status().Patch(ctx, &latest, patch)
 }
 
-// ParseCertificate parse the x509 certificate.
-// Returns an error if the certificate pem is invalid.
+// ParseCertificate parses exactly one PEM certificate.
 func ParseCertificate(cert []byte) (*x509.Certificate, error) {
-	// parse the certficate
-	block, _ := pem.Decode(cert)
-	if block == nil {
-		return nil, errors.New("failed to parse certificate PEM")
-	}
-	return x509.ParseCertificate(block.Bytes)
+	return kmsca.ParseCertificatePEM(cert)
 }
 
-// certificateNeedsRenewal returns True if the certificate needs to be created/renewed.
-func (r *KMSIssuerReconciler) certificateNeedsRenewal(issuer *kmsiapi.KMSIssuer, desiredCert *x509.Certificate) bool {
-	log := r.Log.WithValues("name", issuer.Name, "namespace", issuer.Namespace)
-	// Check if the certificate hasn't been issued yet.
-	if len(issuer.Status.Certificate) == 0 {
-		log.Info("certificate hasn't been issued yet")
-		return true
-	}
-	// Check if the existing cetificate is valid.
-	actualCert, err := ParseCertificate(issuer.Status.Certificate)
-	if err != nil {
-		log.Info("existing certificate isn't valid", "error", err)
-		return true
-	}
-	// Check if it is time to renew the certificate
-	if time.Until(actualCert.NotAfter.Add(-1*issuer.Spec.RenewBefore.Duration)) <= 0 {
-		log.Info("it is time to renew the certificate", "NotAfter", actualCert.NotAfter, "renewBefore", issuer.Spec.RenewBefore.Duration)
-		return true
-	}
-
-	// Check if the certificate has changed
-	if desiredCert.SerialNumber.Cmp(actualCert.SerialNumber) != 0 {
-		log.Info("certificate serial number missmatch", "desired", desiredCert.SerialNumber, "actual", actualCert.SerialNumber)
-		return true
-	}
-	return false
-}
-
-// desiredCertificateAuthorityCertificateInput returns the desired cert input
-func desiredCertificateAuthorityCertificateInput(issuer *kmsiapi.KMSIssuer) *kmsca.GenerateCertificateAuthorityCertificateInput {
-	return &kmsca.GenerateCertificateAuthorityCertificateInput{
-		KeyID: issuer.Spec.KeyID,
-		Subject: pkix.Name{
-			CommonName: issuer.Spec.CommonName,
-		},
-		Duration: issuer.Spec.Duration.Duration,
-		Rounding: issuer.Spec.Duration.Duration - issuer.Spec.RenewBefore.Duration,
-	}
-}
-
-// SetupWithManager is pre-generated
+// SetupWithManager watches KMSIssuers for spec changes only: the controller's own
+// status writes must not start a pass, or a failing one would retry at once
+// instead of backing off. It re-checks each issuer on a timer.
 func (r *KMSIssuerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&kmsiapi.KMSIssuer{}).
+		For(&kmsiapi.KMSIssuer{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
 }
 
-// manageSuccess
-func (r *KMSIssuerReconciler) manageSuccess(ctx context.Context, issuer *kmsiapi.KMSIssuer) error {
-	log := r.Log.WithValues("name", issuer.Name, "namespace", issuer.Namespace)
-	reason := kmsiapi.KMSIssuerReasonIssued
-	msg := ""
-	log.Info("successfully reconciled issuer")
-	r.Recorder.Event(issuer, core.EventTypeNormal, reason, msg)
-	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionTrue, reason, msg)
+func (r *KMSIssuerReconciler) setReady(ctx context.Context, issuer *kmsiapi.KMSIssuer) error {
+	if issuer.Status.IsReady() {
+		return nil
+	}
+	eventf(r.Recorder, issuer, core.EventTypeNormal, kmsiapi.KMSIssuerReasonIssued, actionVerify, "Ready to issue")
+	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionTrue, kmsiapi.KMSIssuerReasonIssued, "")
 	issuer.Status.SetCondition(&ready)
 	return r.patchIssuerStatus(ctx, issuer)
 }
 
-// manageFailure
-func (r *KMSIssuerReconciler) manageFailure(ctx context.Context, issuer *kmsiapi.KMSIssuer, issue error, message string) error {
-	log := r.Log.WithValues("name", issuer.Name, "namespace", issuer.Namespace)
-	reason := kmsiapi.KMSIssuerReasonFailed
-	log.Error(issue, message)
-	r.Recorder.Event(issuer, core.EventTypeWarning, reason, message)
-	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, reason, message)
+// setNotReady marks the issuer not ready with the cause. It returns only the status
+// write's error: configuration problems are not retried until the spec changes.
+func (r *KMSIssuerReconciler) setNotReady(ctx context.Context, issuer *kmsiapi.KMSIssuer, message string, cause error) error {
+	r.Log.Error(cause, message, "kms-issuer", client.ObjectKeyFromObject(issuer))
+	eventf(r.Recorder, issuer, core.EventTypeWarning, kmsiapi.KMSIssuerReasonFailed, actionVerify, "%s: %s", message, eventText(cause))
+	ready := kmsiapi.NewCondition(kmsiapi.ConditionReady, kmsiapi.ConditionFalse, kmsiapi.KMSIssuerReasonFailed, message+": "+stableText(cause))
 	issuer.Status.SetCondition(&ready)
 	return r.patchIssuerStatus(ctx, issuer)
 }

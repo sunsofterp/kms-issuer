@@ -10,7 +10,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/Skyscanner/kms-issuer
+        - github.com/sunsofterp/kms-issuer
 linters:
   default: none
   enable:

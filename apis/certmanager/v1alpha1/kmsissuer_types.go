@@ -20,9 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialised.
-
 // Condition reasons
 const (
 	KMSIssuerReasonPending = "Pending"
@@ -30,36 +27,59 @@ const (
 	KMSIssuerReasonIssued  = "Issued"
 )
 
-// KMSIssuerSpec defines the desired state of KMSIssuer
+// KMSIssuerSpec defines the desired state of KMSIssuer.
+//
+// The CA is two-tier. An offline root (its own KMS key, never usable by the
+// controller) signs an intermediate certificate for this issuer's KMS key, by hand,
+// with the kms-ca tool. The issuer signs leaves with that key, under that
+// intermediate. The root it must chain to is the controller's --root-certificate,
+// not anything here, so editing a KMSIssuer can never swap in another root.
 type KMSIssuerSpec struct {
+	// KeyID is the KMS key that signs leaves: a key ID or key ARN, never an alias (an
+	// alias can be re-pointed at another key). The key must be an asymmetric
+	// SIGN_VERIFY key, and the controller must be started with it in
+	// --allowed-key-ids. Immutable: a different key needs a different intermediate.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^(arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/)?(mrk-)?[0-9a-fA-F-]{32,36}$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="keyId is immutable"
+	KeyID string `json:"keyId"`
 
-	// KeyID is the unique identifier for the customer master key (CMK)
-	// deletion. When unspecified, a RSA 2048 key is created and managed by
-	// the operator.
+	// IntermediateCertificate is the PEM intermediate CA certificate for KeyID, made
+	// with `kms-ca intermediate`. It must be for this KMS key, signed by the
+	// controller's root, a CA with path length 0, and name-constrained (critically)
+	// to domains inside the operator's ceilings. Replacing it renews the issuer.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	IntermediateCertificate string `json:"intermediateCertificate"`
+
+	// PermittedDNSDomains are the DNS domains this issuer certifies: every request
+	// must name only these domains or their subdomains. They must be inside both the
+	// intermediate's name constraints and the operator's ceilings.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`
+	// +kubebuilder:validation:items:MaxLength=253
+	PermittedDNSDomains []string `json:"permittedDNSDomains"`
+
+	// AllowWildcards lets a request include wildcard names (*.example.internal).
+	// Off by default, and only possible if the operator allows wildcards.
 	// +optional
-	KeyID string `json:"keyId,omitempty"`
+	AllowWildcards bool `json:"allowWildcards,omitempty"`
 
-	// CommonName is a common name to be used on the Certificate.
-	// The CommonName should have a length of 64 characters or fewer to avoid
-	// generating invalid CSRs.
-	// This value is ignored by TLS clients when any subject alt name is set.
-	// This is x509 behaviour: https://tools.ietf.org/html/rfc6125#section-6.4.4
-	CommonName string `json:"commonName,omitempty"`
-
-	// Certificate default Duration
+	// MaxCertificateDuration is the longest validity a request may ask for, in whole
+	// seconds. Requests asking for longer are refused, not shortened. Issued
+	// certificates also never outlive the intermediate. Defaults to 720h (30 days;
+	// cert-manager renews them automatically); at most the operator's
+	// --max-certificate-duration. A request without a duration gets this maximum or
+	// cert-manager's default (90 days), whichever is shorter.
 	// +optional
-	Duration *metav1.Duration `json:"duration,omitempty"`
-
-	// RenewBefore is the amount of time before the currently issued certificate’s notAfter time that the issuer will begin to attempt to renew the certificate.
-	// If this value is greater than the total duration of the certificate (i.e. notAfter - notBefore), it will be automatically renewed 2/3rds of the way through the certificate’s duration.
-	// +optional
-	RenewBefore *metav1.Duration `json:"renewBefore,omitempty"`
+	MaxCertificateDuration *metav1.Duration `json:"maxCertificateDuration,omitempty"`
 }
 
 // KMSIssuerStatus defines the observed state of KMSIssuer
 type KMSIssuerStatus struct {
 	Status `json:",inline"`
-	// Byte slice containing a PEM encoded signed certificate of the CA
+	// Certificate is the intermediate certificate as last verified, PEM.
 	// +optional
 	Certificate []byte `json:"certificate,omitempty"`
 }
@@ -83,8 +103,4 @@ type KMSIssuerList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []KMSIssuer `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&KMSIssuer{}, &KMSIssuerList{})
 }

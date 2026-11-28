@@ -24,8 +24,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 
-	mocks "github.com/Skyscanner/kms-issuer/v4/pkg/kmsmock"
-	"github.com/Skyscanner/kms-issuer/v4/pkg/signer"
+	mocks "github.com/sunsofterp/kms-issuer/v5/pkg/kmsmock"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/signer"
 
 	"math/big"
 	"time"

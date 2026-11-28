@@ -1,11 +1,21 @@
+{{- /*
+What the controller needs, and no more. Namespaced objects (KMSIssuers,
+CertificateRequests, their events) only in the allowed issuer namespaces, through a
+Role in each; the controller's cache watches only those namespaces. It can read and
+write the status of these objects, never create or delete them.
+*/ -}}
+{{- $sa := include "kms-issuer.serviceAccountName" . }}
+{{- $fullname := include "kms-issuer.fullname" . }}
+{{- range $ns := .Values.args.allowedIssuerNamespaces }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-manager-role
+  name: {{ $fullname }}-manager
+  namespace: {{ $ns }}
 rules:
 - apiGroups:
-  - ""
+  - events.k8s.io
   resources:
   - events
   verbs:
@@ -18,7 +28,6 @@ rules:
   verbs:
   - get
   - list
-  - update
   - watch
 - apiGroups:
   - cert-manager.io
@@ -33,12 +42,8 @@ rules:
   resources:
   - kmsissuers
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - cert-manager.skyscanner.net
@@ -48,18 +53,40 @@ rules:
   - get
   - patch
   - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-manager
+  namespace: {{ $ns }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-manager
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- if or .Values.args.enableKMSKeyController .Values.args.metricsSecure }}
+---
+# Cluster-wide only for what has no namespace: KMSKeys (cluster-scoped, and their
+# events) when that controller runs, and the metrics endpoint's token checks.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-manager-role
+rules:
+{{- if .Values.args.enableKMSKeyController }}
 - apiGroups:
   - cert-manager.skyscanner.net
   resources:
   - kmskeys
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
+  - update
 - apiGroups:
   - cert-manager.skyscanner.net
   resources:
@@ -68,119 +95,15 @@ rules:
   - get
   - patch
   - update
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-manager-role
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "kms-issuer.fullname" . }}-manager-role
-subjects:
-- kind: ServiceAccount
-  name: {{ include "kms-issuer.serviceAccountName" . }}
-  namespace: {{ .Release.Namespace }}
-{{- if .Values.args.leaderElect }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-leader-election-role
-  namespace: {{ .Release.Namespace }}
-rules:
 - apiGroups:
-  - ""
-  resources:
-  - configmaps
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - ""
+  - events.k8s.io
   resources:
   - events
   verbs:
   - create
   - patch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-leader-election-role
-  namespace: {{ .Release.Namespace }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {{ include "kms-issuer.fullname" . }}-leader-election-role
-subjects:
-- kind: ServiceAccount
-  name: {{ include "kms-issuer.serviceAccountName" . }}
-  namespace: {{ .Release.Namespace }}
 {{- end }}
-{{- if .Values.certManagerApprovalRBAC.enable }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-cert-manager-controller-approve
-rules:
-- apiGroups:
-  - cert-manager.io
-  resourceNames:
-  - kmsissuers.cert-manager.skyscanner.net/*
-  resources:
-  - signers
-  verbs:
-  - approve
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-cert-manager-controller-approve
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "kms-issuer.fullname" . }}-cert-manager-controller-approve
-subjects:
-- kind: ServiceAccount
-  name: {{ .Values.certManagerApprovalRBAC.serviceAccountName }}
-  namespace: {{ .Values.certManagerApprovalRBAC.namespace }}
-{{- end }}
-{{- if .Values.enableMetricsRbacProxy }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-metrics-reader
-rules:
-- nonResourceURLs:
-  - /metrics
-  verbs:
-  - get
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "kms-issuer.fullname" . }}-proxy-role
-rules:
+{{- if .Values.args.metricsSecure }}
 - apiGroups:
   - authentication.k8s.io
   resources:
@@ -193,17 +116,108 @@ rules:
   - subjectaccessreviews
   verbs:
   - create
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "kms-issuer.fullname" . }}-proxy-role
+  name: {{ $fullname }}-manager-role
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "kms-issuer.fullname" . }}-proxy-role
+  name: {{ $fullname }}-manager-role
 subjects:
 - kind: ServiceAccount
-  name: {{ include "kms-issuer.serviceAccountName" . }}
+  name: {{ $sa }}
   namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.args.leaderElect }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-leader-election-role
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+# Leader election records its events through the core/v1 API.
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-leader-election-role
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.certManagerApprovalRBAC.enable }}
+{{- $issuers := required "certManagerApprovalRBAC.issuers is required when enabled" .Values.certManagerApprovalRBAC.issuers }}
+---
+# cert-manager's built-in approver approves every request it may; these are the
+# only KMSIssuers it may approve for. A policy approver is the better choice.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-cert-manager-controller-approve
+rules:
+- apiGroups:
+  - cert-manager.io
+  resourceNames:
+  {{- range $issuers }}
+  - kmsissuers.cert-manager.skyscanner.net/{{ . }}
+  {{- end }}
+  resources:
+  - signers
+  verbs:
+  - approve
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-cert-manager-controller-approve
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-cert-manager-controller-approve
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.certManagerApprovalRBAC.serviceAccountName }}
+  namespace: {{ .Values.certManagerApprovalRBAC.namespace }}
+{{- end }}
+{{- if .Values.args.metricsSecure }}
+---
+# Bind this to whatever scrapes the metrics (e.g. Prometheus' service account).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-metrics-reader
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
 {{- end }}

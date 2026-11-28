@@ -30,7 +30,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	mocks "github.com/Skyscanner/kms-issuer/v4/pkg/kmsmock"
+	mocks "github.com/sunsofterp/kms-issuer/v5/pkg/kmsmock"
 )
 
 var _ = Context("KMSMock", func() {
@@ -120,8 +120,10 @@ var _ = Context("KMSMock", func() {
 			message := []byte("message to be signed")
 			hashed := sha256.Sum256(message)
 			signed, err := client.Sign(context.TODO(), &kms.SignInput{
-				KeyId:   key.KeyMetadata.KeyId,
-				Message: hashed[:],
+				KeyId:            key.KeyMetadata.KeyId,
+				Message:          hashed[:],
+				MessageType:      kmstypes.MessageTypeDigest,
+				SigningAlgorithm: kmstypes.SigningAlgorithmSpecRsassaPkcs1V15Sha256,
 			})
 			Expect(err).To(BeNil())
 

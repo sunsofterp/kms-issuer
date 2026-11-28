@@ -1,201 +1,278 @@
 # KMS Issuer
 
-[![Build Status](https://github.com/Skyscanner/kms-issuer/actions/workflows/test-build.yml/badge.svg?branch=main)](https://github.com/Skyscanner/kms-issuer/actions)
-[![CodeQL Status](https://github.com/Skyscanner/kms-issuer/actions/workflows/code-quality.yml/badge.svg?branch=main)](https://github.com/Skyscanner/kms-issuer/actions)
-[![E2E Tests](https://github.com/Skyscanner/kms-issuer/actions/workflows/e2e.yaml/badge.svg?branch=main)](https://github.com/Skyscanner/kms-issuer/actions)
-[![Helm Chart Tests](https://github.com/Skyscanner/kms-issuer/actions/workflows/helm.yml/badge.svg?branch=main)](https://github.com/Skyscanner/kms-issuer/actions)
+[![Build Status](https://github.com/sunsofterp/kms-issuer/actions/workflows/test-build.yml/badge.svg?branch=main)](https://github.com/sunsofterp/kms-issuer/actions)
+[![E2E Tests](https://github.com/sunsofterp/kms-issuer/actions/workflows/e2e.yaml/badge.svg?branch=main)](https://github.com/sunsofterp/kms-issuer/actions)
+[![Helm Chart Tests](https://github.com/sunsofterp/kms-issuer/actions/workflows/helm.yml/badge.svg?branch=main)](https://github.com/sunsofterp/kms-issuer/actions)
 
-KMS issuer is a [cert-manager](https://cert-manager.io/) Certificate Request controller that uses [AWS KMS](https://aws.amazon.com/kms/) to sign the certificate request.
+KMS issuer is a [cert-manager](https://cert-manager.io/) external issuer that signs certificates with an
+[AWS KMS](https://aws.amazon.com/kms/) asymmetric key, so CA private keys never leave KMS.
 
-## Getting started
+This is a hardened fork of [Skyscanner/kms-issuer](https://github.com/Skyscanner/kms-issuer), meant to be a
+private CA that devices trust.
 
-In this guide, we assume that you have a [Kubernetes](https://kubernetes.io/) environment with [cert-manager](https://cert-manager.io/) v1.17 or higher installed.
+## The CA: two tiers
 
-For any details on Cert-Manager, check the [official documentation](https://cert-manager.io/docs/usage/).
+- **Root** — its own KMS key, which the controller can never use (no IAM permission). Self-signed by hand with
+  `kms-ca root`: path length 1, critically name-constrained to your domains, 20 years by default. This is the
+  certificate devices trust. The controller pins it (`--root-certificate`).
+- **Intermediate** — signed by the root key, by hand, with `kms-ca intermediate`, for the issuing KMS key:
+  path length 0, server auth only, critically name-constrained inside the root's, at most (and by default)
+  183 days. A KMSIssuer names it.
+- **Leaves** — signed by the controller with the issuing key, under the intermediate: 30 days by default,
+  renewed automatically by cert-manager.
+
+Every client enforces name constraints on an intermediate, so nothing the issuing key signs is trusted for a
+name outside the intermediate's domains, whatever the client does with constraints on roots. Whoever can use
+the issuing key (the controller, or its IAM role) can sign only what the intermediate allows (TLS server
+certificates, inside its domains), and only until it expires; making another intermediate takes the root
+key, which only administrators hold.
+
+## What it will sign
+
+Each issued certificate is built from fields the issuer has checked, never from the request's raw
+extensions:
+
+- **Server certificates only, never a CA.** `isCA` requests are refused. Usages may be only
+  `digital signature`, `key encipherment` and `server auth`; the certificate gets server auth, and key
+  encipherment only for RSA keys.
+- **DNS names inside the issuer's `permittedDNSDomains` only.** IP addresses, URIs, email addresses and
+  other name types are refused, as are wildcards unless `allowWildcards` is set. A common name must be one
+  of the DNS names and at most 64 characters; the subject is the common name alone.
+- **Bounded lifetime.** A request longer than `maxCertificateDuration` (default 30 days) is refused, and
+  no certificate outlives the intermediate. Validity is exactly the requested duration.
+- **Approved requests only.** A CertificateRequest must be approved; denied requests are failed. Approval
+  should come from a policy approver such as cert-manager
+  [approver-policy](https://cert-manager.io/docs/policy/approval/approver-policy/), not cert-manager's
+  built-in approver (which approves everything). The chart grants the built-in approver rights only if
+  `certManagerApprovalRBAC.enable` is set, and then only over the issuers it names.
+- **Only from allowed issuers, within the operator's ceilings.** The controller's required
+  `--allowed-issuer-namespaces` and `--allowed-key-ids` flags name the namespaces a KMSIssuer may live in
+  and the KMS keys it may use (by ID or ARN, never alias). Its `--permitted-dns-domains` (required),
+  `--allow-wildcards` and `--max-certificate-duration` flags bound every issuer: whoever can write a
+  KMSIssuer can narrow its policy, never widen it past them. Any other KMSIssuer signs nothing. Permitted
+  domains must be lower-case names of two labels or more; `--max-intermediate-duration` must be above zero
+  and at most 183 days, and `--max-certificate-duration` less than half of it (so a fresh full-length
+  intermediate doesn't start inside its expiry-warning window; a shorter one may). Issuer domains must be
+  lower-case names of two labels or more too: a wildcard or leading dot is refused, not left matching
+  nothing.
+- **Only under a verified intermediate.** At signing time, the issuer's intermediate must be for its KMS
+  key, issued and signed by the pinned root (full path validation), named (not empty, not the root's
+  name), path length 0, critically
+  name-constrained inside the operator's domains and covering the issuer's, and valid now. A KMSIssuer
+  cannot change the root: it is the controller's.
+
+What is handed out: `tls.crt` is the leaf followed by the intermediate that signed it; `ca.crt` is the
+pinned root that intermediate chains to. Every issuance is logged with its serial, names, validity, issuer,
+key and requester.
+
+A certificate signed but not yet recorded (a failed status write) is kept, with its chain, and recorded on
+the next attempt rather than signed again, unless the issuer as it is by then would not sign it (under an
+hour left, a name outside its domains, longer than its maximum, a wildcard it no longer allows) or its chain
+is no longer current (the issuer now uses another key, the intermediate that signed it has expired, or its
+root is no longer a pinned root valid now): then it is dropped and a new one signed. That holds within one
+controller process: if the controller
+restarts or loses leadership between signing and recording, the request is signed a second time. Both
+certificates are in the issuance log; only the recorded one is handed out.
+
+## Making the CA (by hand, with administrator credentials)
+
+Create two asymmetric `SIGN_VERIFY` KMS keys (RSA 3072 or 4096) outside the cluster: the root key, which no
+workload may use, and the issuing key. Then:
+
+Use the `kms-ca` binary attached to the release you deploy, after verifying that the release workflow signed
+it at that release's tag and commit (a signature from any other workflow, branch or commit is refused):
+
+```console
+TAG=v5.3.0                                   # the release you deploy
+COMMIT=<the full commit hash the tag names>  # e.g. from `git rev-list -n 1 "${TAG}"` in a checkout
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/sunsofterp/kms-issuer/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-github-workflow-sha "${COMMIT}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+kms-ca root --key-id <root key ARN> --common-name "Example Root" --domains example.internal --out root.pem
+kms-ca intermediate --root-key-id <root key ARN> --root-certificate root.pem \
+  --key-id <issuing key ARN> --common-name "Example Issuing" --domains example.internal --out intermediate.pem
+```
+
+`kms-ca` refuses aliases (keys are named by ID or ARN), domains that aren't lower-case names of two labels or
+more, an intermediate longer than 183 days, longer-lived than the root, wider than the root, named like the
+root, or on the root key. It creates the output file before asking KMS to sign anything and never
+overwrites one, checks a new intermediate exactly as the controller will, and prints what it made: subject,
+validity, path length, usages, every constraint, the public key and certificate SHA-256 fingerprints, which
+keys signed, and the AWS identity and KMS endpoint it used. The root key is only ever used through AWS's own
+endpoints: `kms-ca` ignores proxy settings (`HTTPS_PROXY` and the like) for every AWS call it makes,
+credential fetches included (a `credential_process` program is its own), and refuses to run with any `AWS_ENDPOINT_URL*` variable, an `endpoint_url` or `services`
+section in the AWS profile, a custom CA bundle (`AWS_CA_BUNDLE`, `ca_bundle`), or `SSL_CERT_FILE` /
+`SSL_CERT_DIR`. Where credentials come from (a profile, `credential_process`, the instance or container
+metadata endpoint) is left to your AWS configuration; the identity they give is printed. Run it from a
+clean environment on a machine you trust: it can't detect a CA added to the system trust store. Keep that
+output as the ceremony record. `kms-ca show <file>` prints a certificate's details again.
 
 ## Install
 
-You can install the controller using the official Helm chart from the OCI registry:
+Give the controller's service account an AWS identity (e.g. EKS Pod Identity) allowed only `kms:Sign` and
+`kms:GetPublicKey` on the issuing key, never on the root key. Recommended IAM conditions:
+`kms:SigningAlgorithm` = `RSASSA_PKCS1_V1_5_SHA_256` and `kms:MessageType` = `DIGEST`.
 
 ```console
-helm upgrade --install kms-issuer oci://ghcr.io/skyscanner/charts/kms-issuer --namespace kms-issuer-system --create-namespace
+helm upgrade --install kms-issuer oci://ghcr.io/sunsofterp/charts/kms-issuer \
+  --namespace kms-issuer-system --create-namespace \
+  --set awsRegion=us-east-1 \
+  --set-file rootCertificate=root.pem \
+  --set "args.allowedIssuerNamespaces={my-ca-namespace}" \
+  --set "args.allowedKeyIds={<issuing key ARN>}" \
+  --set "args.permittedDNSDomains={example.internal}" \
+  --set image.digest=sha256:...
 ```
 
-To install a specific version:
+`image.digest` is required: use the digest a release records. Release images and the chart are signed with
+cosign (keyless) by the release workflow; images also carry SBOM and provenance attestations. Verify (or
+enforce at admission) that exact signer identity, never a pattern over the repository:
 
 ```console
-helm upgrade --install kms-issuer oci://ghcr.io/skyscanner/charts/kms-issuer --version <version> --namespace kms-issuer-system --create-namespace
+cosign verify ghcr.io/sunsofterp/kms-issuer@sha256:... \
+  --certificate-identity "https://github.com/sunsofterp/kms-issuer/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-github-workflow-sha "${COMMIT}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-### Usage
+The controller watches and has permissions in the allowed issuer namespaces only (a Role in each); it is
+cluster-wide only for KMSKeys, when that controller is enabled. Keep the allowed namespaces to platform
+administrators: whoever can create Certificates there and get them approved can obtain any name inside the
+issuer's domains.
 
-1. Install [cert-manager](https://cert-manager.io/docs/installation/). The operator has been tested with version v1.17.2
+Metrics (authenticated; bind the `<release>-metrics-reader` ClusterRole to your scraper):
+`kms_issuer_intermediate_not_after_timestamp_seconds` and `kms_issuer_root_not_after_timestamp_seconds`
+(alert well before either expires), `kms_issuer_leaves_truncated`, `kms_issuer_certificates_issued_total`,
+`kms_issuer_requests_refused_total`.
 
-```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
-```
+Events (events.k8s.io/v1) tell what happened, but the `Ready` condition is the current state: the events API
+merges repeated events of one reason on one version of one object, keeping the first note, and notes are cut to
+1024 bytes. A KMS error appears in a condition as its operation and error code (`KMS Sign: AccessDeniedException`),
+and in the event also with the AWS message; a failure without an AWS error (network, credentials) appears as
+`KMS <operation> failed (the controller log has the details)`. The controller's log has the full error, with its
+request ID.
+A request left pending raises a warning event whose reason is the cause (`IssuerUnavailable`,
+`IssuerNotReady`, `IssuerCannotSign`, `Waiting`, `SigningFailed`); its `Ready` condition says `Pending` with
+the current message in full.
 
-2. Install and run the kms-issuer
-
-Install the kms-issuer [Kubernetes Custom Resources](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/) and start the controller.
-
-```bash
-# Install CRD
-make install
-# Run the controller (you must have have a role able to create/access KMS keys)
-make run
-```
-
-3. Create a KMS Key
-
-You need a valid KMS asymetric key that as the ability to [SIGN_VERIFY](https://docs.aws.amazon.com/kms/latest/APIReference/API_Sign.html) messages.
-Currently, Cloudformation [does not support](https://github.com/aws-cloudformation/aws-cloudformation-coverage-roadmap/issues/337) KMS SIGN_VERIFY keys.
-To simply the provisioning process, the kms-issuer operator provides a dedicated controller for provisioning a valid KMS key.
+## Create an issuer and a certificate
 
 ```yaml
-cat << EOF | kubectl apply -f -
----
-apiVersion: cert-manager.skyscanner.net/v1alpha1
-kind: KMSKey
-metadata:
-  name: kmskey-sample
-spec:
-  aliasName: alias/kms-issuer-example
-  description: a kms-issuer example kms key
-  customerMasterKeySpec: RSA_2048
-  tags:
-    project: kms-issuer
-  deletionPolicy: Delete
-  deletionPendingWindowInDays: 7
-EOF
-```
-
-4. Create a KMS issuer object
-
-```yaml
-cat << EOF | kubectl apply -f -
----
 apiVersion: cert-manager.skyscanner.net/v1alpha1
 kind: KMSIssuer
 metadata:
-  name: kms-issuer
-  namespace: default
+  name: internal-ca
+  namespace: my-ca-namespace
 spec:
-  keyId: alias/kms-issuer-example # The KMS key id or alias
-  commonName: My Root CA # The common name for the root certificate
-  duration: 87600h # 10 years
-EOF
-```
-
-At this point, the operator geneates a public root certificate signed using the provided KMS key. You can inspect it with the following command:
-
-```bash
-kubectl get kmsissuer kms-issuer -o json | jq -r ".status.certificate" |  base64 --decode  | openssl x509 -noout -text
-```
-
-6. Finally, create a Certificate request that will be signed by our KMS issuer.
-
-```yaml
-cat << EOF | kubectl apply -f -
+  keyId: <issuing key ARN>   # immutable
+  permittedDNSDomains: [example.internal]
+  maxCertificateDuration: 720h
+  intermediateCertificate: |
+    -----BEGIN CERTIFICATE-----
+    ...the contents of intermediate.pem...
+    -----END CERTIFICATE-----
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: example-com
-  namespace: default
+  name: svc
+  namespace: my-ca-namespace
 spec:
-  # Secret names are always required.
-  secretName: example-com-tls
-  duration: 8760h # 1 year
-  renewBefore: 360h # 15d
-  subject:
-    organizations:
-      - skyscanner
-  # The use of the common name field has been deprecated since 2000 and is
-  # discouraged from being used.
-  commonName: example.com
-  isCA: false
-  privateKey:
-    algorithm: RSA
-    encoding: PKCS1
-    size: 2048
-  usages:
-    - server auth
-    - client auth
-  # At least one of a DNS Name, URI, or IP address is required.
-  dnsNames:
-    - example.com
-    - www.example.com
-  uris:
-    - spiffe://cluster.local/ns/sandbox/sa/example
-  ipAddresses:
-    - 192.168.0.5
-  # Issuer references are always required.
+  secretName: svc-tls
+  dnsNames: [svc.example.internal]
   issuerRef:
-    name: kms-issuer
-    # We can reference ClusterIssuers by changing the kind here.
-    # The default value is Issuer (i.e. a locally namespaced Issuer)
+    name: internal-ca
     kind: KMSIssuer
-    # This is optional since cert-manager will default to this value however
-    # if you are using an external issuer, change this to that issuer group.
     group: cert-manager.skyscanner.net
-EOF
 ```
 
-You now have a key pair signed by KMS
+## Renewal
 
-```bash
-kubectl get secret example-com-tls
-```
+**Intermediate (by hand, every 183 days at most).** Make a new one with `kms-ca intermediate` and replace the
+issuer's `intermediateCertificate`; devices are unaffected (they trust the root). Leaves are cut short to end
+with the intermediate in its last `maxCertificateDuration`, so renew before then:
 
-## API Reference
+- the issuer raises `IntermediateExpiringSoon` warning events from twice `maxCertificateDuration` (at least
+  30 days) before expiry;
+- `kms_issuer_intermediate_not_after_timestamp_seconds` is the expiry to alert on, and
+  `kms_issuer_leaves_truncated` turns 1 once leaves are being cut short (an overdue renewal);
+- under an hour of intermediate left, requests wait (`Ready=False`, reason `Pending`, saying the intermediate
+  must be renewed) rather than get a uselessly short certificate.
 
-### KMSKey
+**Root replacement (planned, no hard cutover).**
 
-A KMSKey resource is used to create an [AWS KMS](https://aws.amazon.com/kms/) asymetric key compatible with the KMS issuer.
+1. Make the new root on a new KMS key (`kms-ca root`), and distribute it to every device that trusts the old
+   one.
+2. Pin both: set `rootCertificate` to the old and new roots concatenated. The controller accepts
+   intermediates from either; each certificate's `ca.crt` is the root its intermediate chains to.
+3. Make a new intermediate under the new root and replace each issuer's `intermediateCertificate`.
+4. Once every certificate has renewed under the new root, remove the old root from `rootCertificate` and
+   from devices, and schedule the old root key's deletion.
 
-| Field                              | Type   | Description                                                                                                                                                                  |
-| ---------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiVersion`                       | string | `cert-manager.skyscanner.net/v1alpha1`                                                                                                                                       |
-| `kind`                             | string | `KMSKey`                                                                                                                                                                     |
-| `metadata`                         | object | Refer to the Kubernetes API [documentation][kubernetes-meta] for `metadata` fields.                                                                                          |
-| `spec`                             | object | Desired state of the KMSKey resource.                                                                                                                                        |
-| `spec.aliasName`                   | string | the alias name for the kms key. This value must begin with alias/ followed by a name, such as alias/ExampleAlias.                                                            |
-| `spec.description`                 | string | Description for the key. (optional)                                                                                                                                          |
-| `spec.customerMasterKeySpec`       | string | Determines the signing algorithms that the CMK supports. Only RSA_2048 is currently supported. (optional, default=RSA_2048)                                                  |
-| `spec.policy`                      | string | The key policy to attach to the CMK. (optional)                                                                                                                              |
-| `spec.tags`                        | object | A list of tags for the key. (optional)                                                                                                                                       |
-| `spec.deletionPolicy`              | string | Policy to deletes the alias and key on object deletion. Either `Retain` or `Delete`. (optional, default=Retain).                                                             |
-| `spec.deletionPendingWindowInDays` | int    | Number of days before the KMS key gets deleted. If you include a value, it must be between 7 and 30, inclusive. If you do not include a value, it defaults to 30. (optional) |
+Intermediates may chain only to the pinned roots valid at the moment of signing: an expired root is never
+used (the controller logs `PINNED ROOT EXPIRED` at startup: remove it), and a root not valid yet is used
+from its notBefore, without a restart. The controller refuses to start only when no pinned root is valid
+now. The key of every pinned root, valid or not, is refused as an issuing key. A root that is not a root of
+this CA at all, or wider than `--permitted-dns-domains`, is always fatal.
 
-### KMSIssuer
+`rootCertificate` lives in an immutable ConfigMap named by its content, so every change is a rollout.
 
-A KMSIssuer resource configures a new [Cert-Manager external issuer](https://cert-manager.io/docs/configuration/external).
+**Revocation.** There is no CRL or OCSP. What contains a compromise is the lifetimes:
 
-| Field              | Type     | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiVersion`       | string   | `cert-manager.skyscanner.net/v1alpha1`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `kind`             | string   | `KMSIssuer`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `metadata`         | object   | Refer to the Kubernetes API [documentation][kubernetes-meta] for `metadata` fields.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `spec`             | object   | Desired state of the KMSIssuer resource.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `spec.keyId`       | string   | The unique identifier for the customer master key                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `spec.commonName`  | string   | The common name to be used on the Certificate.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `spec.duration`    | duration | Certificate default Duration. (optional, default=26280h aka 3 years)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `spec.renewBefore` | duration | The amount of time before the certificate’s notAfter time that the issuer will begin to attempt to renew the certificate. If this value is greater than the total duration of the certificate (i.e. notAfter - notBefore), it will be automatically renewed 2/3rds of the way through the certificate’s duration. <br> <br> The `NotBefore` field on the certificate is set to the current time rounded down by the renewal interval. For example, if the certificate is renewed every hour, the `NotBefore` field is set to the beggining of the hour. If the certificate is renewed every day, the `NotBefore` field is set to the beggining of the day. This allows the generation of consistent certificates regardless of when it has been generated during the renewal period, or recreate the same certificate after a backup/restore of your kubernetes cluster. For more details on the computation, check the [time.Truncate](https://golang.org/pkg/time/#Time.Truncate) function. |
+- A leaked leaf key: it stops working when the leaf expires (at most `maxCertificateDuration`). Replace the
+  certificate (delete its Secret; cert-manager issues a new one) and fix the leak.
+- Misuse of the issuing key (anything that could call `kms:Sign` on it): within the intermediate's
+  constraints, certificates it signed can last until the intermediate expires (at most 183 days), and a
+  self-issued sub-CA under the intermediate is accepted by some clients (OpenSSL) until then. Cut access
+  (IAM), rotate the issuing key: new KMS key, new intermediate, new `keyId` (a new KMSIssuer), and expect
+  the old intermediate's window to run out. If that window is unacceptable, replace the root (above).
+- Root key compromise: replace the root, removing the old one from every device first.
 
-[kubernetes-meta]: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.32/#objectmeta-v1-meta
+**Watch the issuing key.** Alert (CloudTrail) on `kms:Sign` calls for the issuing key by any identity but the
+controller's, and reconcile the controller's calls against its `issued certificate` log lines. Treat the
+controller's namespace as CA-critical: nobody else creates pods or execs there, since its service account
+can use the key.
 
-## Disable Approval Check
+A KMS error never makes an issuer stop issuing while its intermediate is still valid: the controller retries
+with backoff and stays ready.
 
-The KMS Issuer will wait for CertificateRequests to have an [approved condition
-set](https://cert-manager.io/docs/concepts/certificaterequest/#approval) before
-signing. If using an older version of cert-manager (pre v1.3), you can disable
-this check by supplying the command line flag `-enable-approved-check=false` to
-the Issuer Deployment.
+## KMSKey (optional)
+
+The KMSKey controller creates and deletes KMS keys from the cluster. It is off by default
+(`--enable-kmskey-controller`); creating keys outside the cluster is recommended, and the root key must never
+be created this way. When on, it tags each key it creates with the KMSKey's UID
+(`kms-issuer.cert-manager.skyscanner.net/kmskey-uid`), and adopts or deletes only keys carrying that tag. A
+key whose alias can't be created is scheduled for deletion again rather than left behind.
+
+## API reference
+
+The CRDs in `charts/kms-issuer/crds` document every field.
 
 ## Contributing
 
-Kms-Issuer is built using the [Kubebuilder](https://book.kubebuilder.io/) framework. See the [official documentation](https://book.kubebuilder.io/quick-start.html) to get started and check [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
+Kms-Issuer is built using the [Kubebuilder](https://book.kubebuilder.io/) framework. `make test` runs the unit
+tests and the controller tests against a local API server (envtest); `make vulncheck` checks the built binary
+for known vulnerabilities.
+
+The signing policy (`pkg/policy`) and intermediate validation (`pkg/kmsca`) have Go fuzz targets. `make test`
+runs their seed inputs as fixed cases: one accepted input, then one per rule that breaks only that rule. The
+`Fuzz` workflow fuzzes each target for 10 minutes every night, starting from the corpus the last run saved. A
+failure opens a pull request committing the failing input under `<package>/testdata/fuzz/<target>/`, where
+every `go test` runs it, so the case stays checked once fixed: push the fix to that pull request's branch
+(GitHub runs no checks on a pull request a workflow opened until something is pushed to it). To fuzz one
+target locally:
+
+```sh
+go test -run='^$' -fuzz='^FuzzTemplateNames$' -fuzztime=5m ./pkg/policy
+```
+
+A failing input is written to `<package>/testdata/fuzz/<target>/`; commit it there to keep it as a case.
+
+GitHub disables scheduled workflows in a public repository after 60 days without activity, and a stopped
+nightly fails nothing. `gh workflow list --all` shows its state; `gh workflow enable fuzz.yml` turns it back
+on.
 
 ## Security
 

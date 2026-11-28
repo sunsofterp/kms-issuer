@@ -1,11 +1,23 @@
 version: 2
+# Every ecosystem waits a week after a release before proposing it, so a
+# compromised or broken release has time to be noticed and pulled first.
 updates:
-  # Maintain dependencies for GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "daily"
+    cooldown:
+      default-days: 7
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
       interval: "daily"
+    cooldown:
+      default-days: 7
+  # The Dockerfile's base images (Go, distroless), pinned by digest
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7

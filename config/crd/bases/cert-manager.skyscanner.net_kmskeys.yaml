@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.17.0
+    controller-gen.kubebuilder.io/version: v0.23.0
   name: kmskeys.cert-manager.skyscanner.net
 spec:
   group: cert-manager.skyscanner.net
@@ -42,8 +42,15 @@ spec:
               aliasName:
                 description: |-
                   AliasName Specifies the alias name for the kms key. This value must begin with alias/ followed by a
-                  name, such as alias/ExampleAlias.
+                  name, such as alias/ExampleAlias. An alias that already points at a key this
+                  KMSKey did not create is refused, never adopted. Immutable.
+                pattern: ^alias/[a-zA-Z0-9/_-]+$
                 type: string
+                x-kubernetes-validations:
+                - message: aliases under alias/aws/ are reserved by AWS
+                  rule: '!self.startsWith(''alias/aws/'')'
+                - message: aliasName is immutable
+                  rule: self == oldSelf
               customerMasterKeySpec:
                 description: |-
                   CustomerMasterKeySpec determines the signing algorithms that the CMK supports.
@@ -53,6 +60,8 @@ spec:
                 description: |-
                   This value is optional. If you include a value, it must be between 7 and
                   30, inclusive. If you do not include a value, it defaults to 30.
+                maximum: 30
+                minimum: 7
                 type: integer
               deletionPolicy:
                 description: DeletionPolicy to deletes the alias and key on object
@@ -99,17 +108,12 @@ spec:
                         transition.
                       type: string
                     status:
-                      allOf:
-                      - enum:
-                        - "True"
-                        - "False"
-                        - Unknown
-                      - enum:
-                        - "True"
-                        - "False"
-                        - Unknown
                       description: Status of the condition, one of ('True', 'False',
                         'Unknown').
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
                       type: string
                     type:
                       description: Type of the condition, currently ('Ready').

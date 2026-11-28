@@ -24,25 +24,25 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"time"
-
-	"crypto/sha1" //nolint:gosec // Used for consistent hash
 	"math/big"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 
-	"github.com/Skyscanner/kms-issuer/v4/pkg/interfaces"
-	"github.com/Skyscanner/kms-issuer/v4/pkg/signer"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/interfaces"
+	"github.com/sunsofterp/kms-issuer/v5/pkg/signer"
 )
 
 const (
-	// DefaultCertDuration is the default CA certificate validity duration
-	DefaultCertDuration = time.Hour * 24 * 365 * 3 // 3 year
-	// DefaultCertRenewalRatio is default ratio of time before the certificate
-	// is expected to be renewed
-	DefaultCertRenewalRatio = 2.0 / 3
+	// clockSkew backdates every certificate's notBefore, for clients whose clocks
+	// run slightly behind.
+	clockSkew = 5 * time.Minute
+	// serialBits is the size of random serial numbers: 127 bits, so the DER encoding
+	// is at most 16 octets plus sign, well inside RFC 5280's 20-octet limit.
+	serialBits = 127
 )
 
 // KMSCA KMS Certificate Authority provides the API operation methods for implementation
@@ -52,37 +52,56 @@ type KMSCA struct {
 }
 
 // NewKMSCA creates a new instance of the KMSCA client with a session.
-// If additional configuration is needed for the client instance use the optional
-// aws.Config parameter to add your extra config.
 func NewKMSCA(cfg *aws.Config) *KMSCA {
 	return &KMSCA{
 		Client: kms.NewFromConfig(*cfg),
 	}
 }
 
-// CreateKey creates an asymetric KMS key used to sign certificates and a KMS Alias pointing at the key.
-// The method only creates the key if the alias hasn't yet been created.
-// Returns the KeyID string
-func (ca *KMSCA) CreateKey(ctx context.Context, input *CreateKeyInput) (string, error) {
-	// Check if the key already exists
-	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{
-		KeyId: aws.String(input.AliasName),
-	})
-	if err == nil {
-		// return existing key if one already exists
-		return aws.ToString(response.KeyMetadata.KeyId), nil
-	}
+// OwnerTag is the KMS key tag naming the KMSKey (by UID) that created the key. It is
+// the only proof of ownership: a key without it, or with another UID, is never
+// adopted or deleted.
+const OwnerTag = "kms-issuer.cert-manager.skyscanner.net/kmskey-uid"
 
-	// if the error isn't a NotFoundException then raise it
-	var nsk *kmstypes.NotFoundException
-	if !errors.As(err, &nsk) {
+// ErrAliasTaken is returned when an alias already points at a key the caller did
+// not create.
+var ErrAliasTaken = errors.New("the alias already points at a key this KMSKey did not create; refusing to adopt it")
+
+// ErrNotOwned is returned by DeleteKey when the alias points at a key this KMSKey
+// did not create: nothing is deleted.
+var ErrNotOwned = errors.New("the alias points at a key this KMSKey did not create; not deleting it")
+
+// CreateKey creates an asymmetric KMS key used to sign certificates, tagged with its
+// owner's UID, and an alias pointing at it. If the alias already exists, its key must
+// carry this owner's tag (a previous run created it); any other key is refused. If
+// the alias cannot be created, the new key is scheduled for deletion again rather
+// than left behind. Returns the key ID.
+func (ca *KMSCA) CreateKey(ctx context.Context, input *CreateKeyInput) (string, error) {
+	if err := validateAlias(input.AliasName); err != nil {
 		return "", err
 	}
+	if input.OwnerUID == "" {
+		return "", errors.New("an owner UID is required")
+	}
+	existing, found, err := ca.describeAlias(ctx, input.AliasName)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		owned, ownedErr := ca.ownedBy(ctx, existing, input.OwnerUID)
+		if ownedErr != nil {
+			return "", ownedErr
+		}
+		if !owned {
+			return "", ErrAliasTaken
+		}
+		return existing, nil
+	}
 
-	// Create the KMS key
 	keyInput := &kms.CreateKeyInput{
 		KeyUsage: kmstypes.KeyUsageTypeSignVerify,
-		KeySpec:  kmstypes.KeySpec(kmstypes.CustomerMasterKeySpecRsa2048),
+		KeySpec:  kmstypes.KeySpecRsa3072,
+		Tags:     []kmstypes.Tag{{TagKey: aws.String(OwnerTag), TagValue: aws.String(input.OwnerUID)}},
 	}
 	if input.CustomerMasterKeySpec != "" {
 		keyInput.KeySpec = kmstypes.KeySpec(input.CustomerMasterKeySpec)
@@ -93,111 +112,325 @@ func (ca *KMSCA) CreateKey(ctx context.Context, input *CreateKeyInput) (string, 
 	if input.Policy != "" {
 		keyInput.Policy = aws.String(input.Policy)
 	}
-	if len(input.Tags) > 0 {
-		for k, v := range input.Tags {
-			keyInput.Tags = append(keyInput.Tags, kmstypes.Tag{TagKey: aws.String(k), TagValue: aws.String(v)})
+	for k, v := range input.Tags {
+		if k == OwnerTag {
+			continue
 		}
+		keyInput.Tags = append(keyInput.Tags, kmstypes.Tag{TagKey: aws.String(k), TagValue: aws.String(v)})
 	}
 	key, err := ca.Client.CreateKey(ctx, keyInput)
 	if err != nil {
 		return "", err
 	}
-	// Create the KMS alias
-	_, err = ca.Client.CreateAlias(ctx, &kms.CreateAliasInput{
-		TargetKeyId: key.KeyMetadata.KeyId,
+	keyID := aws.ToString(key.KeyMetadata.KeyId)
+	if _, err = ca.Client.CreateAlias(ctx, &kms.CreateAliasInput{
+		TargetKeyId: aws.String(keyID),
 		AliasName:   aws.String(input.AliasName),
-	})
-	if err != nil {
-		return "", err
+	}); err != nil {
+		// Don't leave an unreferenced key behind; the next attempt makes a new one.
+		_, cleanupErr := ca.Client.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
+			KeyId: aws.String(keyID), PendingWindowInDays: aws.Int32(7),
+		})
+		return "", errors.Join(fmt.Errorf("creating alias %s: %w", input.AliasName, err), cleanupErr)
 	}
-	return aws.ToString(key.KeyMetadata.KeyId), nil
+	return keyID, nil
 }
 
-// DeleteKey delete a KMS key alias and the underlying target KMS Key.
+// DeleteKey schedules deletion of the key behind the alias and deletes the alias,
+// only when that key carries this owner's tag. A missing alias means there is
+// nothing left to delete. A key already pending deletion is not scheduled again,
+// so a retry after a partial failure completes.
 func (ca *KMSCA) DeleteKey(ctx context.Context, input *DeleteKeyInput) error {
-	// Check if the key already exists
-	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{
-		KeyId: aws.String(input.AliasName),
-	})
+	if err := validateAlias(input.AliasName); err != nil {
+		return err
+	}
+	if input.OwnerUID == "" {
+		return errors.New("an owner UID is required")
+	}
+	keyID, found, err := ca.describeAlias(ctx, input.AliasName)
+	if err != nil || !found {
+		return err
+	}
+	owned, err := ca.ownedBy(ctx, keyID, input.OwnerUID)
 	if err != nil {
 		return err
 	}
-	// Delete the KMS key
-	deleteInput := &kms.ScheduleKeyDeletionInput{
-		KeyId: response.KeyMetadata.KeyId,
+	if !owned {
+		return ErrNotOwned
 	}
-	if input.PendingWindowInDays > 0 {
-		deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) //nolint:gosec // G115: value is bounded to 7-30 by CRD validation
+	described, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(keyID)})
+	if err != nil {
+		return err
 	}
+	if described.KeyMetadata.KeyState != kmstypes.KeyStatePendingDeletion {
+		deleteInput := &kms.ScheduleKeyDeletionInput{KeyId: aws.String(keyID)}
+		if input.PendingWindowInDays >= 7 && input.PendingWindowInDays <= 30 {
+			deleteInput.PendingWindowInDays = aws.Int32(int32(input.PendingWindowInDays)) // #nosec G115 -- bounded to 7-30 just above
+		}
+		_, err = ca.Client.ScheduleKeyDeletion(ctx, deleteInput)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = ca.Client.DeleteAlias(ctx, &kms.DeleteAliasInput{AliasName: aws.String(input.AliasName)})
+	return err
+}
 
-	_, err = ca.Client.ScheduleKeyDeletion(ctx, deleteInput)
+// describeAlias returns the key ID an alias points at, and whether it exists.
+func (ca *KMSCA) describeAlias(ctx context.Context, alias string) (keyID string, found bool, err error) {
+	response, err := ca.Client.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(alias)})
 	if err != nil {
-		return err
+		var nsk *kmstypes.NotFoundException
+		if errors.As(err, &nsk) {
+			return "", false, nil
+		}
+		return "", false, err
 	}
-	// Delete the KMS alias
-	_, err = ca.Client.DeleteAlias(ctx, &kms.DeleteAliasInput{
-		AliasName: aws.String(input.AliasName),
-	})
-	if err != nil {
-		return err
+	return aws.ToString(response.KeyMetadata.KeyId), true, nil
+}
+
+// ownedBy reports whether keyID carries the owner tag with uid.
+func (ca *KMSCA) ownedBy(ctx context.Context, keyID, uid string) (bool, error) {
+	input := &kms.ListResourceTagsInput{KeyId: aws.String(keyID)}
+	for {
+		out, err := ca.Client.ListResourceTags(ctx, input)
+		if err != nil {
+			return false, err
+		}
+		for _, t := range out.Tags {
+			if aws.ToString(t.TagKey) == OwnerTag {
+				return aws.ToString(t.TagValue) == uid, nil
+			}
+		}
+		if !out.Truncated || out.NextMarker == nil {
+			return false, nil
+		}
+		input.Marker = out.NextMarker
+	}
+}
+
+func validateAlias(alias string) error {
+	if len(alias) <= len("alias/") || alias[:len("alias/")] != "alias/" {
+		return fmt.Errorf("%q is not an alias name (alias/...)", alias)
 	}
 	return nil
 }
 
-// GenerateCertificateAuthorityCertificate returns the Certificate Authority Certificate
-func (ca *KMSCA) GenerateCertificateAuthorityCertificate(input *GenerateCertificateAuthorityCertificateInput) *x509.Certificate {
-	// Compute the start/end validity.
-	// The rounding factor is used to ensure all the certificates issued within the same period are identical.
-	notBefore := time.Now().Truncate(input.Rounding)
-	notAfter := notBefore.Add(input.Duration)
+// RandomSerial returns a positive random serial number of serialBits bits.
+func RandomSerial() (*big.Int, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), serialBits)
+	n, err := rand.Int(rand.Reader, limit)
+	if err != nil {
+		return nil, err
+	}
+	return n.Add(n, big.NewInt(1)), nil
+}
 
-	// Compute CA certificate
+// MaxIntermediateDuration is the longest an intermediate may be valid. Whoever can
+// sign with an issuing key can, within its name constraints, mint certificates that
+// last as long as its intermediate (including a self-issued sub-CA, which path
+// length 0 does not stop): this bounds that exposure, at the cost of renewing the
+// intermediate by hand twice a year.
+const MaxIntermediateDuration = 183 * 24 * time.Hour
+
+// CAKind selects a root or an intermediate template.
+type CAKind int
+
+const (
+	// Root: path length 1, no extended key usage.
+	Root CAKind = iota
+	// Intermediate: path length 0, server auth only.
+	Intermediate
+)
+
+// CATemplate returns a CA certificate template: critical name constraints limiting
+// every name under it to input.PermittedDNSDomains (DNS names, URI hosts and email
+// domains; no IP address at all) and cert-sign and CRL-sign key usage. A root has
+// path length 1 and no extended key usage; an intermediate has path length 0 and the
+// server-auth extended key usage, so even a certificate it should never have signed
+// is good for TLS servers only.
+func CATemplate(input *CAInput, kind CAKind) (*x509.Certificate, error) {
+	if len(input.PermittedDNSDomains) == 0 {
+		return nil, errors.New("a CA certificate needs at least one permitted DNS domain")
+	}
+	for _, d := range input.PermittedDNSDomains {
+		if err := ValidConstraintDomain(d); err != nil {
+			return nil, err
+		}
+	}
+	if input.Duration%time.Second != 0 || input.Duration < 24*time.Hour {
+		return nil, fmt.Errorf("duration %s must be whole seconds and at least 24h", input.Duration)
+	}
+	if kind == Intermediate && input.Duration > MaxIntermediateDuration {
+		return nil, fmt.Errorf("duration %s is longer than an intermediate may be valid (%s)", input.Duration, MaxIntermediateDuration)
+	}
+	if input.Subject.CommonName == "" {
+		return nil, errors.New("a common name is required")
+	}
+	serial, err := RandomSerial()
+	if err != nil {
+		return nil, err
+	}
+	notBefore := input.Now.Add(-clockSkew).UTC().Truncate(time.Second)
 	cert := &x509.Certificate{
-		Subject:               input.Subject,
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		IsCA:                  true,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
+		SerialNumber:                serial,
+		Subject:                     input.Subject,
+		NotBefore:                   notBefore,
+		NotAfter:                    notBefore.Add(input.Duration),
+		IsCA:                        true,
+		BasicConstraintsValid:       true,
+		MaxPathLen:                  1,
+		KeyUsage:                    x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		PermittedDNSDomainsCritical: true,
+		PermittedDNSDomains:         input.PermittedDNSDomains,
+		PermittedURIDomains:         input.PermittedDNSDomains,
+		PermittedEmailAddresses:     input.PermittedDNSDomains,
+		ExcludedIPRanges:            allIPRanges(),
 	}
-	// Compute the serial number
-	serialNumberKey := fmt.Sprintf("%s %v", input, cert)
-	sha := sha1.Sum([]byte(serialNumberKey)) //nolint:gosec // Used for consistent hash
-	cert.SerialNumber = new(big.Int).SetBytes(sha[:])
-
-	return cert
+	if kind == Intermediate {
+		cert.MaxPathLen = 0
+		cert.MaxPathLenZero = true
+		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+	return cert, nil
 }
 
-// GenerateAndSignCertificateAuthorityCertificate returns the signed Certificate Authority Certificate
-func (ca *KMSCA) GenerateAndSignCertificateAuthorityCertificate(ctx context.Context, input *GenerateCertificateAuthorityCertificateInput) (*x509.Certificate, error) {
-	cert := ca.GenerateCertificateAuthorityCertificate(input)
-	newSigner, err := signer.New(ctx, ca.Client, input.KeyID)
+// ValidConstraintDomain refuses anything but a lower-case DNS domain of two labels or
+// more: no wildcard, no leading or trailing dot, no single label (a top-level domain
+// such as "com" or "internal").
+func ValidConstraintDomain(d string) error {
+	if d != strings.ToLower(d) || strings.HasPrefix(d, ".") || strings.HasSuffix(d, ".") || strings.Contains(d, "*") {
+		return fmt.Errorf("%q is not a lower-case domain without wildcards or leading/trailing dots", d)
+	}
+	if len(d) > 253 {
+		return fmt.Errorf("%q is longer than 253 characters", d)
+	}
+	labels := strings.Split(d, ".")
+	if len(labels) < 2 {
+		return fmt.Errorf("%q must have at least two labels", d)
+	}
+	for _, l := range labels {
+		if !validLabel(l) {
+			return fmt.Errorf("%q has an invalid label %q", d, l)
+		}
+	}
+	return nil
+}
+
+// validLabel reports whether l is a DNS label: 1 to 63 lower-case letters, digits
+// and hyphens, not starting or ending with a hyphen.
+func validLabel(l string) bool {
+	if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+		return false
+	}
+	for _, c := range l {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// MakeRoot self-signs the root CA certificate with the root KMS key: path length 1
+// (it signs intermediates, which sign leaves).
+func (ca *KMSCA) MakeRoot(ctx context.Context, rootKeyID string, input *CAInput) (*x509.Certificate, error) {
+	cert, err := CATemplate(input, Root)
 	if err != nil {
 		return nil, err
 	}
-	pub := newSigner.Public()
-	if pub == nil {
-		return nil, errors.New("could not retrieve the public key associated with the KMS private key")
-	}
-	signedBytes, err := x509.CreateCertificate(rand.Reader, cert, cert, pub, newSigner)
+	rootSigner, err := signer.New(ctx, ca.Client, rootKeyID)
 	if err != nil {
 		return nil, err
 	}
-	return x509.ParseCertificate(signedBytes)
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, rootSigner.Public(), rootSigner)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
 }
 
-// SignCertificate Signs a certificate request using KMS.
+// MakeIntermediate has the root KMS key sign an intermediate CA certificate for the
+// issuing KMS key: path length 0, server auth only, at most MaxIntermediateDuration,
+// with name constraints inside the root's and a name different from the root's. It
+// refuses (rather than shortens) an intermediate that would outlive the root. The
+// root certificate must be for the root key.
+func (ca *KMSCA) MakeIntermediate(ctx context.Context, rootKeyID string, root *x509.Certificate, keyID string, input *CAInput) (*x509.Certificate, error) {
+	if rootKeyID == keyID {
+		return nil, errors.New("the root and issuing keys must differ")
+	}
+	if err := ValidateRoot(root, input.Now); err != nil {
+		return nil, fmt.Errorf("root: %w", err)
+	}
+	if input.Subject.CommonName == root.Subject.CommonName {
+		return nil, errors.New("the intermediate's common name must differ from the root's")
+	}
+	for _, d := range input.PermittedDNSDomains {
+		if !WithinDomains(d, root.PermittedDNSDomains) {
+			return nil, fmt.Errorf("domain %q is outside the root's %v", d, root.PermittedDNSDomains)
+		}
+	}
+	rootSigner, err := signer.New(ctx, ca.Client, rootKeyID)
+	if err != nil {
+		return nil, err
+	}
+	if !publicKeysEqual(root.PublicKey, rootSigner.Public()) {
+		return nil, errors.New("the root certificate is not for the root KMS key")
+	}
+	pub, err := ca.PublicKey(ctx, keyID)
+	if err != nil {
+		return nil, err
+	}
+	if publicKeysEqual(pub, root.PublicKey) {
+		return nil, errors.New("the issuing key is the root key")
+	}
+	cert, err := CATemplate(input, Intermediate)
+	if err != nil {
+		return nil, err
+	}
+	if cert.NotAfter.After(root.NotAfter) {
+		return nil, fmt.Errorf("the intermediate would outlive the root (which expires %s); shorten the duration or replace the root",
+			root.NotAfter.Format(time.RFC3339))
+	}
+	der, err := x509.CreateCertificate(rand.Reader, cert, root, pub, rootSigner)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
+}
+
+// PublicKey returns the KMS key's public key.
+func (ca *KMSCA) PublicKey(ctx context.Context, keyID string) (crypto.PublicKey, error) {
+	kmsSigner, err := signer.New(ctx, ca.Client, keyID)
+	if err != nil {
+		return nil, err
+	}
+	return kmsSigner.Public(), nil
+}
+
+// SignCertificate signs input.Cert with the KMS key, under input.Parent. It refuses
+// when Parent is not a CA certificate for that same key (a parent read from a
+// tampered status would otherwise produce a certificate naming the wrong issuer).
 func (ca *KMSCA) SignCertificate(ctx context.Context, input *IssueCertificateInput) (*x509.Certificate, error) {
-	newSigner, err := signer.New(ctx, ca.Client, input.KeyID)
+	if !input.Parent.IsCA {
+		return nil, errors.New("the issuer certificate is not a CA certificate")
+	}
+	kmsSigner, err := signer.New(ctx, ca.Client, input.KeyID)
 	if err != nil {
 		return nil, err
 	}
-	signedBytes, err := x509.CreateCertificate(rand.Reader, input.Cert, input.Parent, input.PublicKey, newSigner)
+	if !publicKeysEqual(input.Parent.PublicKey, kmsSigner.Public()) {
+		return nil, errors.New("the issuer certificate's public key is not the KMS key's")
+	}
+	signedBytes, err := x509.CreateCertificate(rand.Reader, input.Cert, input.Parent, input.PublicKey, kmsSigner)
 	if err != nil {
 		return nil, err
 	}
 	return x509.ParseCertificate(signedBytes)
+}
+
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	ea, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+	return ok && ea.Equal(b)
 }
 
 // CreateKeyInput input for the CreateKey method
@@ -205,10 +438,11 @@ type CreateKeyInput struct {
 	// AliasName Specifies the alias name for the kms key. This value must begin with alias/ followed by a
 	// name, such as alias/ExampleAlias.
 	AliasName string
+	// OwnerUID is the creating KMSKey's UID, tagged on the key as proof of ownership.
+	OwnerUID string
 	// Description for the key
 	Description string
-	// CustomerMasterKeySpec determines the signing algorithms that the CMK supports.
-	// Only RSA_2048 is currently supported.
+	// CustomerMasterKeySpec determines the key spec (default RSA_3072).
 	CustomerMasterKeySpec string
 	// The key policy to attach to the CMK
 	Policy string
@@ -216,13 +450,13 @@ type CreateKeyInput struct {
 	Tags map[string]string
 }
 
-// DeleteKeyInput input for the CreateKey method
+// DeleteKeyInput input for the DeleteKey method
 type DeleteKeyInput struct {
-	// AliasName Specifies the alias name for the kms key. This value must begin with alias/ followed by a
-	// name, such as alias/ExampleAlias.
+	// AliasName Specifies the alias name for the kms key.
 	AliasName string
-	// PendingWindowInDays. This value is optional. If you include a value, it must be between 7 and
-	// 30, inclusive. If you do not include a value, it defaults to 30.
+	// OwnerUID is the KMSKey's UID: only a key tagged with it is deleted.
+	OwnerUID string
+	// PendingWindowInDays, 7 to 30; anything else uses KMS's default of 30.
 	PendingWindowInDays int
 }
 
@@ -230,27 +464,26 @@ type Key struct {
 	// KeyID is the KMS Key Id
 	KeyID string
 }
-type GenerateCertificateAuthorityCertificateInput struct {
-	// KeyID is the KMS Key Id
-	KeyID string
+
+// CAInput describes a root or intermediate CA certificate.
+type CAInput struct {
 	// Subject of the CA certificate
 	Subject pkix.Name
 	// Duration is certificate validity duration
 	Duration time.Duration
-	// Rounding is used to round down the certificate NotBefore time.
-	// For example, by setting the rounding period to 1h, all the certificates generated between the start
-	// and in the end of an hour will be identical
-	Rounding time.Duration
+	// PermittedDNSDomains become the certificate's name constraints.
+	PermittedDNSDomains []string
+	// Now is the issuance time.
+	Now time.Time
 }
 
 type IssueCertificateInput struct {
 	// KeyID is the KMS Key Id
 	KeyID string
-	// CSR Certificate Request
+	// Cert is the certificate template to sign
 	Cert *x509.Certificate
-	// PublicKey
+	// PublicKey is the subject's public key
 	PublicKey crypto.PublicKey
-	// Parent Signing Certificate
+	// Parent is the issuing CA certificate
 	Parent *x509.Certificate
-	// Public
 }

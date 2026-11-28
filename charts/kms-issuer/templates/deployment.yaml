@@ -1,3 +1,24 @@
+{{- $namespaces := required "args.allowedIssuerNamespaces is required" .Values.args.allowedIssuerNamespaces }}
+{{- $keys := required "args.allowedKeyIds is required" .Values.args.allowedKeyIds }}
+{{- $domains := required "args.permittedDNSDomains is required" .Values.args.permittedDNSDomains }}
+{{- $region := required "awsRegion is required" .Values.awsRegion }}
+{{- $root := required "rootCertificate is required" .Values.rootCertificate }}
+{{- $rootConfigMap := printf "%s-root-%s" (include "kms-issuer.fullname" .) ($root | sha256sum | trunc 10) }}
+---
+# The pinned root(s): every KMSIssuer's intermediate must chain to one. Immutable,
+# named by content: a new root is a new ConfigMap and a rollout, never an edit picked
+# up silently at some later restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $rootConfigMap }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kms-issuer.labels" . | nindent 4 }}
+immutable: true
+data:
+  root.pem: |
+    {{- $root | trim | nindent 4 }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -14,44 +35,55 @@ spec:
       control-plane: {{ include "kms-issuer.fullname" . }}-controller-manager
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
+        # A new root restarts the controller so it pins the new one.
+        checksum/root: {{ $root | sha256sum }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         control-plane: {{ include "kms-issuer.fullname" . }}-controller-manager
     spec:
-      containers:
-      {{- if .Values.enableMetricsRbacProxy }}
-      - args:
-        - --secure-listen-address=0.0.0.0:8443
-        - --upstream=http://127.0.0.1:8080/
-        - --logtostderr=true
-        - --v=10
-        image: gcr.io/kubebuilder/kube-rbac-proxy:v0.8.0
-        name: kube-rbac-proxy
-        ports:
-        - containerPort: 8443
-          name: https
-          protocol: TCP
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
+      containers:
       - command:
         - /manager
+        - --allowed-issuer-namespaces={{ join "," $namespaces }}
+        - --allowed-key-ids={{ join "," $keys }}
+        - --permitted-dns-domains={{ join "," $domains }}
+        - --allow-wildcards={{ .Values.args.allowWildcards }}
+        - --max-certificate-duration={{ .Values.args.maxCertificateDuration }}
+        - --max-intermediate-duration={{ .Values.args.maxIntermediateDuration }}
+        - --root-certificate=/etc/kms-issuer/root.pem
+        - --enable-kmskey-controller={{ .Values.args.enableKMSKeyController }}
         - --health-probe-bind-address={{ .Values.args.healthProbeBindAddress }}
         - --metrics-bind-address={{ .Values.args.metricsBindAddress }}
-        {{- if .Values.args.leaderElect }}
-        - --leader-elect=true
+        - --metrics-secure={{ .Values.args.metricsSecure }}
+        - --leader-elect={{ .Values.args.leaderElect }}
+        {{- with .Values.args.localAwsEndpoint }}
+        - --local-aws-endpoint={{ . }}
         {{- end }}
-        {{- if .Values.args.enableApprovedCheck }}
-        - --enable-approved-check=true
-        {{- end }}
-        - --local-aws-endpoint={{ .Values.args.localAwsEndpoit }}
+        {{- if .Values.image.digest }}
+        image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+        {{- else if .Values.image.allowTag }}
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-        {{- with .Values.env }}
-        env:
-          {{- toYaml . | nindent 10 }}
+        {{- else }}
+        {{- fail "image.digest is required (tags can move); set image.allowTag=true only for tests" }}
         {{- end }}
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+        - name: AWS_REGION
+          value: {{ $region | quote }}
+        {{- with .Values.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        ports:
+        - containerPort: {{ (split ":" .Values.args.metricsBindAddress)._1 | default 8443 }}
+          name: https
+          protocol: TCP
         livenessProbe:
           httpGet:
             path: /healthz
@@ -66,13 +98,28 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 10
         resources:
-          {{- toYaml .Values.resources | nindent 12 }}
+          {{- toYaml .Values.resources | nindent 10 }}
         securityContext:
-          allowPrivilegeEscalation: false
+          {{- toYaml .Values.securityContext | nindent 10 }}
+        volumeMounts:
+        # Writable scratch space with a read-only root filesystem (the metrics
+        # server writes its self-signed certificate here).
+        - name: tmp
+          mountPath: /tmp
+        - name: root
+          mountPath: /etc/kms-issuer
+          readOnly: true
       securityContext:
-        runAsNonRoot: true
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       serviceAccountName: {{ include "kms-issuer.serviceAccountName" . }}
       terminationGracePeriodSeconds: 10
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 16Mi
+      - name: root
+        configMap:
+          name: {{ $rootConfigMap }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

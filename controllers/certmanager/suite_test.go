@@ -18,9 +18,12 @@ package certmanager
 
 import (
 	"context"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -32,12 +35,12 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	kmsca "github.com/Skyscanner/kms-issuer/v4/pkg/kmsca"
-	mocks "github.com/Skyscanner/kms-issuer/v4/pkg/kmsmock"
+	kmsca "github.com/sunsofterp/kms-issuer/v5/pkg/kmsca"
+	mocks "github.com/sunsofterp/kms-issuer/v5/pkg/kmsmock"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
-	certmanagerv1alpha1 "github.com/Skyscanner/kms-issuer/v4/apis/certmanager/v1alpha1"
+	certmanagerv1alpha1 "github.com/sunsofterp/kms-issuer/v5/apis/certmanager/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -50,7 +53,51 @@ var (
 	ctx       context.Context
 	cancel    context.CancelFunc
 	ca        kmsca.KMSCA
+	// allowedKeyID is the only key the controllers under test may sign with, and
+	// testNamespace the only namespace; otherKeyID exists in KMS but is not allowed.
+	allowedKeyID string
+	otherKeyID   string
+	// testRoot is the pinned root (on its own key, rootKeyID); allowedIntermediate
+	// and otherIntermediate are intermediates it signed for the two issuing keys.
+	rootKeyID           string
+	testRoot            *x509.Certificate
+	allowedIntermediate string
+	otherIntermediate   string
+	// testCeilings are the operator ceilings under test: example.internal only,
+	// no wildcards, 90-day certificates.
+	testCeilings = Ceilings{
+		PermittedDNSDomains:    []string{testDomain},
+		MaxCertificateDuration: 90 * 24 * time.Hour,
+		// 183 days: less than twice the 90-day leaf maximum is refused.
+		MaxIntermediateDuration: 183 * 24 * time.Hour,
+	}
 )
+
+// intermediateFor returns the test intermediate for an issuing key.
+func intermediateFor(keyID string) string {
+	if keyID == otherKeyID {
+		return otherIntermediate
+	}
+	return allowedIntermediate
+}
+
+// makeTwoTier makes the suite's root and its intermediates in the mock.
+func makeTwoTier(ca *kmsca.KMSCA) {
+	var err error
+	rootKeyID, err = ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: rootAlias, OwnerUID: suiteOwner})
+	Expect(err).NotTo(HaveOccurred())
+	now := time.Now()
+	input := func(name string, d time.Duration) *kmsca.CAInput {
+		return &kmsca.CAInput{Subject: pkix.Name{CommonName: name}, PermittedDNSDomains: []string{testDomain}, Duration: d, Now: now}
+	}
+	testRoot, err = ca.MakeRoot(context.TODO(), rootKeyID, input("Test Root", 20*365*24*time.Hour))
+	Expect(err).NotTo(HaveOccurred())
+	for keyID, out := range map[string]*string{allowedKeyID: &allowedIntermediate, otherKeyID: &otherIntermediate} {
+		cert, err := ca.MakeIntermediate(context.TODO(), rootKeyID, testRoot, keyID, input("Test Issuing", 90*24*time.Hour))
+		Expect(err).NotTo(HaveOccurred())
+		*out = string(kmsca.EncodeCertificatePEM(cert))
+	}
+}
 
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -92,18 +139,26 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	ca.Client = mocks.New()
+	allowedKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/allowed", OwnerUID: suiteOwner})
+	Expect(err).NotTo(HaveOccurred())
+	otherKeyID, err = ca.CreateKey(ctx, &kmsca.CreateKeyInput{AliasName: "alias/other", OwnerUID: suiteOwner})
+	Expect(err).NotTo(HaveOccurred())
+	makeTwoTier(&ca)
+	access, err := NewAccess([]string{testNamespace}, []string{allowedKeyID}, testCeilings, []*x509.Certificate{testRoot}, time.Now())
+	Expect(err).NotTo(HaveOccurred())
 
 	err = (&CertificateRequestReconciler{
-		Client:                 k8sManager.GetClient(),
-		Log:                    logf.Log,
-		Recorder:               k8sManager.GetEventRecorderFor("certificaterequests-controller"),
-		KMSCA:                  &ca,
-		CheckApprovedCondition: true,
-		Clock:                  clock.RealClock{},
+		Client:    k8sManager.GetClient(),
+		APIReader: k8sManager.GetAPIReader(),
+		Log:       logf.Log,
+		Recorder:  k8sManager.GetEventRecorder("certificaterequests-controller"),
+		KMSCA:     &ca,
+		Access:    access,
+		Clock:     clock.RealClock{},
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred(), "failed to setup the CertificateRequestReconciler controller")
 
-	err = NewKMSIssuerReconciler(k8sManager, &ca).SetupWithManager(k8sManager)
+	err = NewKMSIssuerReconciler(k8sManager, &ca, access).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred(), "failed to setup the KMSIssuerReconciler controller")
 
 	err = NewKMSKeyReconciler(k8sManager, &ca).SetupWithManager(k8sManager)
