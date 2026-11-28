@@ -44,6 +44,8 @@ func (s staleCache) Get(ctx context.Context, key client.ObjectKey, obj client.Ob
 	return s.Client.Get(ctx, key, obj, opts...)
 }
 
+const staleAlias = "alias/stale"
+
 func newScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -96,7 +98,7 @@ func TestKMSKeyReadyDespiteStaleCache(t *testing.T) {
 	kmsKey := &kmsiapi.KMSKey{}
 	kmsKey.Namespace, kmsKey.Name, kmsKey.UID = testNamespace, "k", kmsKeyUID
 	kmsKey.Finalizers = []string{FinalizerName}
-	kmsKey.Spec = kmsiapi.KMSKeySpec{AliasName: "alias/stale", DeletionPolicy: retain}
+	kmsKey.Spec = kmsiapi.KMSKeySpec{AliasName: staleAlias, DeletionPolicy: retain}
 	keyID, err := ca.CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: kmsKey.Spec.AliasName, OwnerUID: string(kmsKey.UID)})
 	if err != nil {
 		t.Fatal(err)
@@ -121,5 +123,36 @@ func TestKMSKeyReadyDespiteStaleCache(t *testing.T) {
 	}
 	if !got.Status.IsReady() {
 		t.Errorf("the KMSKey was left not Ready: %+v", got.Status.Conditions)
+	}
+}
+
+// A failing KMSKey pass keeps the key ID even when the cache still holds a copy
+// from before the ID was written: the status written is the live object's.
+func TestKMSKeyFailureKeepsKeyIDDespiteStaleCache(t *testing.T) {
+	mock := mocks.New()
+	kmsKey := &kmsiapi.KMSKey{}
+	kmsKey.Namespace, kmsKey.Name, kmsKey.UID = testNamespace, "k", kmsKeyUID
+	kmsKey.Finalizers = []string{FinalizerName}
+	kmsKey.Spec = kmsiapi.KMSKeySpec{AliasName: staleAlias, DeletionPolicy: retain}
+	keyID, err := (&kmsca.KMSCA{Client: mock}).CreateKey(context.TODO(), &kmsca.CreateKeyInput{AliasName: kmsKey.Spec.AliasName, OwnerUID: string(kmsKey.UID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := kmsKey.DeepCopy()
+	kmsKey.Status.KeyID = keyID
+	api := fakeclient.NewClientBuilder().WithScheme(newScheme()).WithObjects(kmsKey).WithStatusSubresource(kmsKey).Build()
+	r := &KMSKeyReconciler{
+		Client: staleCache{Client: api, stale: stale}, APIReader: api, Log: logf.Log, Scheme: newScheme(), Recorder: events.NewFakeRecorder(10),
+		KMSCA: &kmsca.KMSCA{Client: &deniedKMS{KMSMock: mock, describe: true}},
+	}
+	if _, err := r.Reconcile(context.TODO(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(kmsKey)}); err == nil {
+		t.Fatal("a refused DescribeKey was swallowed")
+	}
+	got := &kmsiapi.KMSKey{}
+	if err := api.Get(context.TODO(), client.ObjectKeyFromObject(kmsKey), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.KeyID != keyID || got.Status.IsReady() {
+		t.Errorf("status %+v, want not Ready with key ID %q kept", got.Status, keyID)
 	}
 }

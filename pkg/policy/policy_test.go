@@ -170,6 +170,9 @@ func TestTemplateRefuses(t *testing.T) {
 		usageClientAut:             {req: &Request{CSR: csrPEM(t, key, good()), Usages: []string{usageClientAut}, DefaultDuration: time.Hour}},
 		usageCertSign:              {req: &Request{CSR: csrPEM(t, key, good()), Usages: []string{usageCertSign}, DefaultDuration: time.Hour}},
 		usageCodeSign:              {req: &Request{CSR: csrPEM(t, key, good()), Usages: []string{usageCodeSign}, DefaultDuration: time.Hour}},
+		"a bad second usage":       {req: &Request{CSR: csrPEM(t, key, good()), Usages: []string{UsageServerAuth, usageClientAut}, DefaultDuration: time.Hour}},
+		"data after the request":   {req: &Request{CSR: append(csrPEM(t, key, good()), "junk\n"...), DefaultDuration: time.Hour}},
+		"a 64-character label":     {req: &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{strings.Repeat("a", 64) + "." + testDomain}}), DefaultDuration: time.Hour}},
 		"too long":                 {req: &Request{CSR: csrPEM(t, key, good()), Duration: 91 * 24 * time.Hour}},
 		"twenty years":             {req: &Request{CSR: csrPEM(t, key, good()), Duration: 20 * 365 * 24 * time.Hour}},
 		"too short":                {req: &Request{CSR: csrPEM(t, key, good()), Duration: time.Minute}},
@@ -193,6 +196,18 @@ func TestTemplateRefuses(t *testing.T) {
 				t.Errorf("error %v does not wrap ErrDenied", err)
 			}
 		})
+	}
+}
+
+// RSA keys over the upper bound are refused (built by hand: generating one takes
+// minutes); the bound itself is accepted.
+func TestPublicKeyRSABounds(t *testing.T) {
+	for bits, ok := range map[int]bool{maxRSABits: true, maxRSABits + 1: false} {
+		n := new(big.Int).Lsh(big.NewInt(1), uint(bits-1))
+		_, err := checkPublicKey(&rsa.PublicKey{N: n.Add(n, big.NewInt(1)), E: 65537})
+		if (err == nil) != ok {
+			t.Errorf("a %d-bit RSA key: %v", bits, err)
+		}
 	}
 }
 
@@ -233,6 +248,12 @@ func TestTemplateCommonNameLimit(t *testing.T) {
 	req = &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{long}}), DefaultDuration: time.Hour}
 	if _, _, err := Template(req, issuer, parent, serial, now); err != nil {
 		t.Errorf("the same name without a common name: %v", err)
+	}
+	// The longest label allowed (TestTemplateRefuses: one longer).
+	label := strings.Repeat("a", 63) + "." + testDomain
+	req = &Request{CSR: csrPEM(t, key, &x509.CertificateRequest{DNSNames: []string{label}}), DefaultDuration: time.Hour}
+	if _, _, err := Template(req, issuer, parent, serial, now); err != nil {
+		t.Errorf("a 63-character label: %v", err)
 	}
 }
 

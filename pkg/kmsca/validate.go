@@ -143,8 +143,8 @@ type ExpectedIntermediate struct {
 // and no root's, issued and signed by a pinned root (and verifying as a chain to it),
 // a CA with path length 0, cert-sign key usage, the server-auth extended key usage
 // and no other, critical name constraints with every DNS, URI and email domain
-// inside both the allowed domains and the root's, every IP address excluded, a name
-// different from the root's, valid now, and no longer-lived than the maximum.
+// inside both the allowed domains and the root's, every IP address excluded, a
+// non-empty name different from the root's, valid now, and no longer-lived than the maximum.
 func ValidateIntermediate(cert *x509.Certificate, expected *ExpectedIntermediate) (*x509.Certificate, error) {
 	root, err := issuingRoot(cert, expected)
 	if err != nil {
@@ -210,8 +210,8 @@ func issuingRoot(cert *x509.Certificate, expected *ExpectedIntermediate) (*x509.
 	return root, nil
 }
 
-// checkIntermediateShape requires a CA with path length 0, a name different from
-// the root's, cert-sign key usage (CRL sign and digital signature also allowed),
+// checkIntermediateShape requires a CA with path length 0, a non-empty name
+// different from the root's, cert-sign key usage (CRL sign and digital signature also allowed),
 // exactly the server-auth extended key usage, and a validity no longer than
 // maxDuration (0 or more than MaxIntermediateDuration: MaxIntermediateDuration).
 func checkIntermediateShape(cert, root *x509.Certificate, maxDuration time.Duration) error {
@@ -219,6 +219,9 @@ func checkIntermediateShape(cert, root *x509.Certificate, maxDuration time.Durat
 		maxDuration = MaxIntermediateDuration
 	}
 	switch {
+	case len(cert.Subject.Names) == 0:
+		// RFC 5280 requires a CA's subject (each leaf's issuer) to be non-empty.
+		return errors.New("the intermediate has no name")
 	case bytes.Equal(cert.RawSubject, root.RawSubject) || cert.Subject.CommonName == root.Subject.CommonName:
 		return errors.New("the intermediate's name is the root's")
 	case !cert.BasicConstraintsValid || !cert.IsCA:

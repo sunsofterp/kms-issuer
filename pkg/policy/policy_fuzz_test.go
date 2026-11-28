@@ -1,14 +1,20 @@
 package policy
 
 import (
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"net"
 	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +26,8 @@ const (
 	otherDomain  = "other.internal"
 	upperDomain  = "eXAmple.internAl"
 	systemMaster = "system:masters"
+	day          = int64(24 * 3600)
+	year         = int64(365 * 24)
 )
 
 // fuzzIssuer is the issuer the fuzz targets sign for, with or without wildcards.
@@ -38,32 +46,41 @@ func within(name string, permitted []string) bool {
 	return false
 }
 
-// hostname reports whether h is LDH labels of 1-63 characters, no leading or
-// trailing hyphen, at most 253 characters.
+// hostnameRE is LDH labels of 1 to 63 characters, not starting or ending with a
+// hyphen, lower case.
+var hostnameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// hostname reports whether h is a lower-case hostname of at most 253 characters.
 func hostname(h string) bool {
-	if h == "" || len(h) > 253 {
-		return false
-	}
-	for _, l := range strings.Split(h, ".") {
-		if l == "" || len(l) > 63 || strings.HasPrefix(l, "-") || strings.HasSuffix(l, "-") {
-			return false
-		}
-		if strings.Trim(l, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
-			return false
-		}
-	}
-	return true
+	return len(h) <= 253 && hostnameRE.MatchString(h)
 }
 
 // checkIssued fails t unless an accepted template is a server certificate for
-// permitted names only, within the requested duration, the issuer's maximum and
-// the CA's own validity, as the package promises.
+// permitted names only, valid from at most a few minutes back for exactly the
+// requested duration, or less only to end with a CA that has an hour or more
+// left, and never longer than the issuer's maximum or past the CA, as the
+// package promises.
 func checkIssued(t *testing.T, cert *x509.Certificate, iss *Issuer, ca *x509.Certificate, duration time.Duration) {
 	t.Helper()
 	checkShape(t, cert)
 	checkNames(t, cert, iss)
-	if cert.NotAfter.After(ca.NotAfter) || cert.NotAfter.Sub(cert.NotBefore) > iss.MaxDuration || cert.NotAfter.Sub(cert.NotBefore) > duration {
+	life := cert.NotAfter.Sub(cert.NotBefore)
+	if cert.NotAfter.After(ca.NotAfter) || life > iss.MaxDuration || life > duration {
 		t.Fatalf("validity %s to %s (asked %s, max %s, CA until %s)", cert.NotBefore, cert.NotAfter, duration, iss.MaxDuration, ca.NotAfter)
+	}
+	if now.Before(cert.NotBefore) || cert.NotBefore.Before(now.Add(-6*time.Minute)) {
+		t.Fatalf("validity from %s, not from about now", cert.NotBefore)
+	}
+	if life < duration && (!cert.NotAfter.Equal(ca.NotAfter) || ca.NotAfter.Sub(now) < time.Hour) {
+		t.Fatalf("validity cut to %s, not to a CA with an hour or more left (CA until %s)", cert.NotAfter, ca.NotAfter)
+	}
+}
+
+// checkKey fails t unless the certificate's key is the request's.
+func checkKey(t *testing.T, got, want crypto.PublicKey) {
+	t.Helper()
+	if k, ok := want.(interface{ Equal(crypto.PublicKey) bool }); !ok || !k.Equal(got) {
+		t.Fatal("the certificate is not for the request's key")
 	}
 }
 
@@ -101,7 +118,7 @@ func checkNames(t *testing.T, cert *x509.Certificate, iss *Issuer) {
 		}
 	}
 	cn := cert.Subject.CommonName
-	if cn != "" && !contains(cert.DNSNames, cn) || len(cn) > 64 {
+	if cn != "" && !slices.Contains(cert.DNSNames, cn) || len(cn) > 64 {
 		t.Fatalf("common name %q not among %v, or too long", cn, cert.DNSNames)
 	}
 	if got := cert.Subject.String(); cn == "" && got != "" || cn != "" && got != "CN="+cn {
@@ -110,26 +127,100 @@ func checkNames(t *testing.T, cert *x509.Certificate, iss *Issuer) {
 }
 
 // checkRequestAccepted fails t if an accepted request asked for a CA, an IP
-// address or URI, or a usage other than a server certificate's.
-func checkRequestAccepted(t *testing.T, isCA bool, tmpl *x509.CertificateRequest, usage string) {
+// address or URI, a usage other than a server certificate's, or less than an hour.
+func checkRequestAccepted(t *testing.T, isCA bool, tmpl *x509.CertificateRequest, usages []string, duration time.Duration) {
 	t.Helper()
 	switch {
 	case isCA:
 		t.Fatal("a CA request was accepted")
 	case len(tmpl.IPAddresses)+len(tmpl.URIs) > 0:
 		t.Fatal("a request with an IP address or URI was accepted")
-	case usage != UsageServerAuth && usage != UsageDigitalSignature && usage != UsageKeyEncipherment:
-		t.Fatalf("usage %q was accepted", usage)
+	case duration < time.Hour:
+		t.Fatalf("a request for %s was accepted", duration)
+	}
+	for _, u := range usages {
+		if u != UsageServerAuth && u != UsageDigitalSignature && u != UsageKeyEncipherment {
+			t.Fatalf("usage %q was accepted", u)
+		}
 	}
 }
 
 // fuzzCSR is a CSR for tmpl, or nil if Go won't encode it.
-func fuzzCSR(key *ecdsa.PrivateKey, tmpl *x509.CertificateRequest) []byte {
+func fuzzCSR(key crypto.Signer, tmpl *x509.CertificateRequest) []byte {
 	der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
 	if err != nil {
 		return nil
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: csrBlock, Bytes: der})
+}
+
+// namesSeed is one input of FuzzTemplateNames.
+type namesSeed struct {
+	cn, names, ip, uri string
+	wildcards, isCA    bool
+	seconds            int64
+	usages             string
+	caHours            int64
+}
+
+// longName is a name in testDomain of exactly n characters (n of 18, or 20 or
+// more), labels of up to 63.
+func longName(n int) string {
+	d := testDomain
+	for len(d) < n {
+		d = strings.Repeat("a", min(63, n-len(d)-1)) + "." + d
+	}
+	return d
+}
+
+// namesSeeds are a good request, then one for each rule of the policy that breaks
+// only that rule (so dropping the rule lets the seed through), then other good
+// ones, near each bound.
+func namesSeeds() []namesSeed {
+	good := namesSeed{cn: testName, names: testName, seconds: 30 * day, usages: UsageServerAuth, caHours: year}
+	long := strings.Repeat("a", 48) + "." + testDomain // a 65-character name
+	seeds := []namesSeed{good}
+	for _, change := range []func(*namesSeed){
+		func(s *namesSeed) { s.isCA = true },
+		func(s *namesSeed) { s.ip = "10.0.0.1" },
+		func(s *namesSeed) { s.uri = "https://x." + testDomain },
+		func(s *namesSeed) { s.cn, s.names = "", "" },
+		func(s *namesSeed) { s.cn, s.names = "", "*."+upperDomain },
+		func(s *namesSeed) { s.cn, s.names, s.wildcards = "", "*.a_b."+testDomain, true },
+		func(s *namesSeed) { s.cn, s.names = "", "a_b."+testDomain },
+		func(s *namesSeed) { s.cn, s.names = "", testName+"." },
+		func(s *namesSeed) { s.cn, s.names = "", upperDomain+" " },
+		func(s *namesSeed) { s.cn, s.names = "", strings.Repeat("a", 64)+"."+testDomain },
+		func(s *namesSeed) { s.cn, s.names = "", longName(254) },
+		func(s *namesSeed) { s.cn, s.names = "", evilName },
+		func(s *namesSeed) { s.cn, s.names = "", "bad"+testDomain },
+		func(s *namesSeed) { s.cn, s.names = "", testDomain+".evil" },
+		func(s *namesSeed) { s.cn = evilName },
+		func(s *namesSeed) { s.cn = "0" },
+		func(s *namesSeed) { s.cn, s.names = long, long },
+		func(s *namesSeed) { s.usages = usageClientAut },
+		func(s *namesSeed) { s.usages = UsageServerAuth + "," + usageClientAut },
+		func(s *namesSeed) { s.seconds = 59 * 60 },
+		func(s *namesSeed) { s.seconds = 91 * day },
+		func(s *namesSeed) { s.caHours = 0 },
+		// Good too.
+		func(s *namesSeed) {
+			s.cn, s.names, s.usages = mixedCaseName, "SSO-Admin.Example.Internal,x."+otherDomain+","+testDomain, UsageDigitalSignature+","+UsageKeyEncipherment
+		},
+		func(s *namesSeed) {
+			s.cn, s.names, s.wildcards, s.seconds = "", testWildcard+","+upperDomain, true, 3600
+		},
+		func(s *namesSeed) { s.cn, s.names, s.seconds = "", strings.Repeat("a", 63)+"."+testDomain, 0 },
+		func(s *namesSeed) { s.cn, s.names = "", longName(253) },
+		func(s *namesSeed) { s.cn, s.names = long[1:], long[1:]+","+testName },
+		func(s *namesSeed) { s.seconds, s.caHours = 90*day, 10*24 },
+		func(s *namesSeed) { s.caHours = 2 },
+	} {
+		s := good
+		change(&s)
+		seeds = append(seeds, s)
+	}
+	return seeds
 }
 
 // FuzzTemplateNames signs CSRs whose names, common name, extra SANs, usages and
@@ -140,21 +231,10 @@ func FuzzTemplateNames(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	const day, year = int64(24 * 3600), int64(365 * 24)
-	f.Add(testName, testName+","+testDomain, "", "", false, false, 30*day, UsageServerAuth, year)
-	f.Add("", testWildcard+",x."+otherDomain, "", "", true, false, int64(3600), UsageDigitalSignature, year)
-	f.Add(mixedCaseName, "SSO-Admin.Example.Internal", "", "", false, true, 90*day, UsageKeyEncipherment, year)
-	f.Add(evilName, evilName, "", "", false, false, int64(3600), UsageServerAuth, year)
-	f.Add(testName, "badexample.internal,example.internal.evil", "10.0.0.1", "https://x.example.internal", false, false, int64(3600), "client auth", year)
-	// Each found by fuzzing against a weakened policy: a wildcard without
-	// wildcards allowed; a common name that isn't a requested name; a name with a
-	// trailing space; a URI SAN; a certificate that would outlive its CA.
-	f.Add("", "*."+upperDomain, "", "", false, false, int64(3600), UsageDigitalSignature, year)
-	f.Add("0", upperDomain, "", "", false, false, 30*day, UsageServerAuth, year)
-	f.Add("", upperDomain+" ", "", "", true, false, int64(3600), UsageDigitalSignature, year)
-	f.Add("", otherDomain, "", "0", true, false, int64(3641), UsageDigitalSignature, year)
-	f.Add(testName, testName, "", "", false, false, 30*day, UsageServerAuth, int64(10*24))
-	f.Fuzz(func(t *testing.T, cn, names, ip, uri string, wildcards, isCA bool, seconds int64, usage string, caHours int64) {
+	for _, s := range namesSeeds() {
+		f.Add(s.cn, s.names, s.ip, s.uri, s.wildcards, s.isCA, s.seconds, s.usages, s.caHours)
+	}
+	f.Fuzz(func(t *testing.T, cn, names, ip, uri string, wildcards, isCA bool, seconds int64, usages string, caHours int64) {
 		if caHours < 0 || caHours > 20*year {
 			return
 		}
@@ -174,49 +254,182 @@ func FuzzTemplateNames(f *testing.F) {
 		}
 		iss := fuzzIssuer(wildcards)
 		ca := &x509.Certificate{IsCA: true, NotAfter: now.Add(time.Duration(caHours) * time.Hour)}
-		duration := time.Duration(seconds) * time.Second
-		req := &Request{CSR: csr, IsCA: isCA, Usages: []string{usage}, Duration: duration, DefaultDuration: time.Hour}
-		cert, _, err := Template(req, iss, ca, serial, now)
+		req := &Request{CSR: csr, IsCA: isCA, Usages: strings.Split(usages, ","), Duration: time.Duration(seconds) * time.Second, DefaultDuration: time.Hour}
+		cert, pub, err := Template(req, iss, ca, serial, now)
 		if err != nil {
 			return
 		}
-		checkRequestAccepted(t, isCA, tmpl, usage)
+		duration := req.Duration
 		if duration == 0 {
 			duration = req.DefaultDuration
 		}
+		checkRequestAccepted(t, isCA, tmpl, req.Usages, duration)
 		checkIssued(t, cert, iss, ca, duration)
+		checkKey(t, pub, key.Public())
 	})
 }
 
-// FuzzTemplateCSR hands Template arbitrary request bytes: it must never panic, and
-// whatever it accepts must pass the same checks.
-func FuzzTemplateCSR(f *testing.F) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// The request keys FuzzTemplateCSR chooses from: the first four acceptable, the
+// rest not.
+const (
+	keyP256 = iota
+	keyP384
+	keyEd25519
+	keyRSA2048
+	keyP224
+	keyRSA1024
+	keyKinds
+)
+
+func fuzzKeys(f *testing.F) []crypto.Signer {
+	keys := make([]crypto.Signer, keyKinds)
+	for kind, curve := range map[int]elliptic.Curve{keyP256: elliptic.P256(), keyP384: elliptic.P384(), keyP224: elliptic.P224()} {
+		k, err := ecdsa.GenerateKey(curve, rand.Reader)
+		if err != nil {
+			f.Fatal(err)
+		}
+		keys[kind] = k
+	}
+	for kind, bits := range map[int]int{keyRSA2048: 2048, keyRSA1024: 1024} {
+		k, err := rsa.GenerateKey(rand.Reader, bits)
+		if err != nil {
+			f.Fatal(err)
+		}
+		keys[kind] = k
+	}
+	_, ed, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		f.Fatal(err)
 	}
-	for _, tmpl := range []*x509.CertificateRequest{
-		{Subject: pkix.Name{CommonName: testName}, DNSNames: []string{testName}},
-		{DNSNames: []string{testWildcard, evilName}},
-		{Subject: pkix.Name{CommonName: testName, Organization: []string{systemMaster}}, DNSNames: []string{testName}},
-	} {
-		csr := fuzzCSR(key, tmpl)
-		if csr == nil {
-			f.Fatal("seed CSR not encoded")
-		}
-		block, _ := pem.Decode(csr)
-		f.Add(csr, false)
-		f.Add(block.Bytes, true)
+	keys[keyEd25519] = ed
+	return keys
+}
+
+// sanOf is a subjectAltName extension's value holding names.
+func sanOf(f *testing.F, names ...asn1.RawValue) []byte {
+	der, err := asn1.Marshal(names)
+	if err != nil {
+		f.Fatal(err)
 	}
-	f.Fuzz(func(t *testing.T, data []byte, wrap bool) {
-		if wrap {
-			data = pem.EncodeToMemory(&pem.Block{Type: csrBlock, Bytes: data})
+	return der
+}
+
+// subjectOf is a DER subject.
+func subjectOf(f *testing.F, name *pkix.Name) []byte {
+	der, err := asn1.Marshal(name.ToRDNSequence())
+	if err != nil {
+		f.Fatal(err)
+	}
+	return der
+}
+
+// sanName is a subjectAltName entry of a context-specific tag.
+func sanName(tag int, value string) asn1.RawValue {
+	return asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: tag, Bytes: []byte(value)}
+}
+
+// csrSeed is one input of FuzzTemplateCSR.
+type csrSeed struct {
+	subject, san []byte
+	key          uint8
+	trailing     []byte
+	tamper       bool
+}
+
+// csrSeeds are a good request, then one for each rule of the policy's request
+// checks that breaks only that rule, then other good ones.
+func csrSeeds(f *testing.F) []csrSeed {
+	dns := sanName(2, testName)
+	good := csrSeed{subject: subjectOf(f, &pkix.Name{CommonName: testName}), san: sanOf(f, dns), key: keyP256}
+	seeds := []csrSeed{good}
+	for _, change := range []func(*csrSeed){
+		func(s *csrSeed) {
+			s.san = sanOf(f, dns, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true, Bytes: []byte{0x06, 0x01, 0x2a}})
+		},
+		func(s *csrSeed) {
+			s.san = sanOf(f, dns, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 4, IsCompound: true, Bytes: s.subject})
+		},
+		func(s *csrSeed) { s.san = sanOf(f, dns, sanName(1, "a@"+testDomain)) },
+		func(s *csrSeed) { s.san = sanOf(f, dns, sanName(6, "https://x."+testDomain)) },
+		func(s *csrSeed) { s.san = sanOf(f, dns, sanName(7, "\x0a\x00\x00\x01")) },
+		func(s *csrSeed) { s.san = append(sanOf(f, dns), 0) },
+		func(s *csrSeed) { s.subject, s.san = nil, nil },
+		func(s *csrSeed) { s.subject = subjectOf(f, &pkix.Name{CommonName: evilName}) },
+		func(s *csrSeed) { s.key = keyP224 },
+		func(s *csrSeed) { s.key = keyRSA1024 },
+		func(s *csrSeed) { s.trailing = []byte("junk") },
+		func(s *csrSeed) { s.tamper = true },
+		// Good too.
+		func(s *csrSeed) { s.key = keyRSA2048 },
+		func(s *csrSeed) { s.key = keyP384 },
+		func(s *csrSeed) { s.key, s.subject = keyEd25519, nil },
+		func(s *csrSeed) {
+			s.subject = subjectOf(f, &pkix.Name{CommonName: testName, Organization: []string{systemMaster}})
+			s.san, s.trailing = sanOf(f, dns, sanName(2, "x."+otherDomain)), []byte("\n\t\n")
+		},
+	} {
+		s := good
+		change(&s)
+		seeds = append(seeds, s)
+	}
+	return seeds
+}
+
+// dnsNamesOnly reports whether san is a subjectAltName value of DNS names only,
+// read with encoding/asn1 rather than the policy's parser.
+func dnsNamesOnly(san []byte) bool {
+	var names []asn1.RawValue
+	if rest, err := asn1.Unmarshal(san, &names); err != nil || len(rest) > 0 {
+		return false
+	}
+	for _, n := range names {
+		if n.Class != asn1.ClassContextSpecific || n.Tag != 2 || n.IsCompound {
+			return false
 		}
-		iss := fuzzIssuer(false)
-		cert, _, err := Template(&Request{CSR: data, DefaultDuration: 24 * time.Hour}, iss, parent, serial, now)
+	}
+	return true
+}
+
+// FuzzTemplateCSR signs requests whose subject and subjectAltName bytes, key and
+// trailing data come from the fuzzer, signed validly (or not, when tampered with)
+// so that the fuzzed structure reaches the policy's checks, and checks every
+// accepted one: DNS names only, an acceptable key, nothing after the request, a
+// valid signature, and the same certificate checks as FuzzTemplateNames.
+func FuzzTemplateCSR(f *testing.F) {
+	keys := fuzzKeys(f)
+	for _, s := range csrSeeds(f) {
+		f.Add(s.subject, s.san, s.key, s.trailing, s.tamper)
+	}
+	f.Fuzz(func(t *testing.T, subject, san []byte, key uint8, trailing []byte, tamper bool) {
+		kind := key % keyKinds
+		tmpl := &x509.CertificateRequest{RawSubject: subject}
+		if san != nil {
+			tmpl.ExtraExtensions = []pkix.Extension{{Id: oidSubjectAltName, Value: san}}
+		}
+		der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, keys[kind])
 		if err != nil {
 			return
 		}
+		if tamper {
+			der[len(der)-1] ^= 0xff
+		}
+		data := append(pem.EncodeToMemory(&pem.Block{Type: csrBlock, Bytes: der}), trailing...)
+		iss := fuzzIssuer(false)
+		cert, pub, err := Template(&Request{CSR: data, DefaultDuration: 24 * time.Hour}, iss, parent, serial, now)
+		if err != nil {
+			return
+		}
+		switch {
+		case tamper:
+			t.Fatal("a request with a broken signature was accepted")
+		case strings.TrimSpace(string(trailing)) != "":
+			t.Fatalf("a request followed by %q was accepted", trailing)
+		case kind >= keyP224:
+			t.Fatalf("a request for key kind %d was accepted", kind)
+		case !dnsNamesOnly(san):
+			t.Fatalf("a request with subjectAltName %x was accepted", san)
+		}
 		checkIssued(t, cert, iss, parent, 24*time.Hour)
+		checkKey(t, pub, keys[kind].Public())
 	})
 }

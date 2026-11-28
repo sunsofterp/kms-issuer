@@ -49,10 +49,11 @@ func NewKMSKeyReconciler(mgr manager.Manager, ca *kmsca.KMSCA) *KMSKeyReconciler
 // KMSKeyReconciler reconciles a KMSKey object
 type KMSKeyReconciler struct {
 	client.Client
-	// APIReader reads the base of the status patch uncached: a cached copy that
-	// predates the last status write and already matches the new status would make
-	// an empty patch, and the controller ignores its own status writes, so nothing
-	// would repair it.
+	// APIReader reads the KMSKey, and the base of its status patch, uncached. A
+	// cached copy that predates the last status write would be written back over
+	// it: a failing pass would blank the key ID, and a copy that already matches
+	// the new status would make an empty patch. The controller ignores its own
+	// status writes, so nothing would repair either.
 	APIReader client.Reader
 	Log       logr.Logger
 	Scheme    *runtime.Scheme
@@ -71,7 +72,7 @@ func (r *KMSKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// retrieve the KMSKey resource to reconcile.
 	kmsKey := &kmsiapi.KMSKey{}
-	if err := r.Get(ctx, req.NamespacedName, kmsKey); err != nil {
+	if err := readerOr(r.APIReader, r.Client).Get(ctx, req.NamespacedName, kmsKey); err != nil {
 		log.Error(err, "failed to retrieve KMSKey resource")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}

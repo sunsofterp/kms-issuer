@@ -302,8 +302,11 @@ func ValidConstraintDomain(d string) error {
 	if d != strings.ToLower(d) || strings.HasPrefix(d, ".") || strings.HasSuffix(d, ".") || strings.Contains(d, "*") {
 		return fmt.Errorf("%q is not a lower-case domain without wildcards or leading/trailing dots", d)
 	}
+	if len(d) > 253 {
+		return fmt.Errorf("%q is longer than 253 characters", d)
+	}
 	labels := strings.Split(d, ".")
-	if len(labels) < 2 || len(d) > 253 {
+	if len(labels) < 2 {
 		return fmt.Errorf("%q must have at least two labels", d)
 	}
 	for _, l := range labels {

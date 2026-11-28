@@ -56,7 +56,8 @@ extensions:
   lower-case names of two labels or more too: a wildcard or leading dot is refused, not left matching
   nothing.
 - **Only under a verified intermediate.** At signing time, the issuer's intermediate must be for its KMS
-  key, issued and signed by the pinned root (full path validation), path length 0, critically
+  key, issued and signed by the pinned root (full path validation), named (not empty, not the root's
+  name), path length 0, critically
   name-constrained inside the operator's domains and covering the issuer's, and valid now. A KMSIssuer
   cannot change the root: it is the controller's.
 
@@ -254,6 +255,22 @@ The CRDs in `charts/kms-issuer/crds` document every field.
 Kms-Issuer is built using the [Kubebuilder](https://book.kubebuilder.io/) framework. `make test` runs the unit
 tests and the controller tests against a local API server (envtest); `make vulncheck` checks the built binary
 for known vulnerabilities.
+
+The signing policy (`pkg/policy`) and intermediate validation (`pkg/kmsca`) have Go fuzz targets. `make test`
+runs their seed inputs as fixed cases: one accepted input, then one per rule that breaks only that rule. The
+`Fuzz` workflow fuzzes each target for 10 minutes every night, starting from the corpus the last run saved. A
+failure uploads the failing input as an artifact; add it to the target's seeds in a pull request, so every
+later pull request checks it. To fuzz one target locally:
+
+```sh
+go test -run='^$' -fuzz='^FuzzTemplateNames$' -fuzztime=5m ./pkg/policy
+```
+
+A failing input is written to `<package>/testdata/fuzz/<target>/`.
+
+GitHub disables scheduled workflows in a public repository after 60 days without activity, and a stopped
+nightly fails nothing. `gh workflow list --all` shows its state; `gh workflow enable fuzz.yml` turns it back
+on.
 
 ## Security
 

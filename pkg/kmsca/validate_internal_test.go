@@ -19,6 +19,8 @@ const (
 	vtSubDomain = "sub.example.internal"
 	vtOther     = "other.internal"
 	vtDays      = 24 * time.Hour
+	vtRootName  = "Root"
+	vtIssuing   = "Issuing"
 )
 
 var vtNow = time.Date(2026, time.November, 25, 12, 0, 0, 0, time.UTC)
@@ -46,7 +48,7 @@ func vtRoot(t testing.TB, key *ecdsa.PrivateKey, name string, domains ...string)
 // after mutate.
 func vtIntermediate(t *testing.T, root *x509.Certificate, rootKey crypto.Signer, pub crypto.PublicKey, mutate func(*x509.Certificate)) *x509.Certificate {
 	t.Helper()
-	tmpl, err := CATemplate(&CAInput{Subject: pkix.Name{CommonName: "Issuing"}, PermittedDNSDomains: []string{vtDomain}, Duration: 90 * vtDays, Now: vtNow}, Intermediate)
+	tmpl, err := CATemplate(&CAInput{Subject: pkix.Name{CommonName: vtIssuing}, PermittedDNSDomains: []string{vtDomain}, Duration: 90 * vtDays, Now: vtNow}, Intermediate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +56,16 @@ func vtIntermediate(t *testing.T, root *x509.Certificate, rootKey crypto.Signer,
 		mutate(tmpl)
 	}
 	return vtSign(t, tmpl, root, pub, rootKey)
+}
+
+// longDomain is a valid domain of exactly n characters (n of 8, or 10 or more),
+// labels of up to 63 under "internal".
+func longDomain(n int) string {
+	d := "internal"
+	for len(d) < n {
+		d = strings.Repeat("a", min(63, n-len(d)-1)) + "." + d
+	}
+	return d
 }
 
 func vtSign(t testing.TB, tmpl, parent *x509.Certificate, pub crypto.PublicKey, key crypto.Signer) *x509.Certificate {
@@ -83,7 +95,7 @@ func TestValidateIntermediateRefusals(t *testing.T) {
 		wantRootName       = "the intermediate's name is the root's"
 	)
 	rootKey, issuingKey, otherKey := vtKey(t), vtKey(t), vtKey(t)
-	root := vtRoot(t, rootKey, "Root", vtDomain)
+	root := vtRoot(t, rootKey, vtRootName, vtDomain)
 	expect := func(change func(*ExpectedIntermediate)) *ExpectedIntermediate {
 		e := &ExpectedIntermediate{Roots: []*x509.Certificate{root}, PublicKey: issuingKey.Public(), AllowedDomains: []string{vtDomain}, Now: vtNow.Add(time.Hour)}
 		if change != nil {
@@ -98,7 +110,7 @@ func TestValidateIntermediateRefusals(t *testing.T) {
 
 	// A root on another key with the same name: its intermediate claims the pinned
 	// root as issuer but is not signed by it.
-	impostor := vtRoot(t, otherKey, "Root", vtDomain)
+	impostor := vtRoot(t, otherKey, vtRootName, vtDomain)
 	// A pinned root not valid now, whose key is the intermediate's.
 	otherRoot := vtRoot(t, issuingKey, "Other Root", vtDomain)
 
@@ -118,6 +130,8 @@ func TestValidateIntermediateRefusals(t *testing.T) {
 		{"not signed by the pinned root", vtIntermediate(t, impostor, otherKey, issuingKey.Public(), nil), expect(nil), "not issued by a pinned root"},
 		{"the root's name", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.Subject = root.Subject }),
 			expect(nil), wantRootName},
+		{"no name", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.Subject = pkix.Name{} }),
+			expect(nil), "the intermediate has no name"},
 		{"not a CA", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
 			c.IsCA, c.MaxPathLen, c.MaxPathLenZero = false, -1, false
 		}), expect(nil), "not a CA certificate"},
@@ -144,7 +158,9 @@ func TestValidateIntermediateRefusals(t *testing.T) {
 			expect(nil), wantURIEmail},
 		{"emails not limited", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.PermittedEmailAddresses = nil }),
 			expect(nil), wantURIEmail},
-		{"an IP family not excluded", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.ExcludedIPRanges = c.ExcludedIPRanges[:1] }),
+		{"IPv6 not excluded", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.ExcludedIPRanges = c.ExcludedIPRanges[:1] }),
+			expect(nil), wantIPs},
+		{"IPv4 not excluded", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) { c.ExcludedIPRanges = c.ExcludedIPRanges[1:] }),
 			expect(nil), wantIPs},
 		{"an IP range permitted", vtIntermediate(t, root, rootKey, issuingKey.Public(), func(c *x509.Certificate) {
 			c.PermittedIPRanges = []*net.IPNet{{IP: net.IPv4(10, 0, 0, 0).To4(), Mask: net.CIDRMask(8, 32)}}
@@ -177,7 +193,7 @@ func TestValidateIntermediateVerifyOnly(t *testing.T) {
 	critical := pkix.Extension{Id: asn1.ObjectIdentifier{1, 2, 3, 4, 5}, Critical: true, Value: []byte{0x05, 0x00}}
 	// rootWith self-signs a root after change.
 	rootWith := func(d time.Duration, change func(*x509.Certificate)) *x509.Certificate {
-		tmpl, err := CATemplate(&CAInput{Subject: pkix.Name{CommonName: "Root"}, PermittedDNSDomains: []string{vtDomain}, Duration: d, Now: vtNow}, Root)
+		tmpl, err := CATemplate(&CAInput{Subject: pkix.Name{CommonName: vtRootName}, PermittedDNSDomains: []string{vtDomain}, Duration: d, Now: vtNow}, Root)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -221,7 +237,7 @@ func TestValidateIntermediateVerifyOnly(t *testing.T) {
 // domains are wider.
 func TestValidateIntermediateWithinTheRoot(t *testing.T) {
 	rootKey, issuingKey := vtKey(t), vtKey(t)
-	narrow := vtRoot(t, rootKey, "Root", vtSubDomain)
+	narrow := vtRoot(t, rootKey, vtRootName, vtSubDomain)
 	cert := vtIntermediate(t, narrow, rootKey, issuingKey.Public(), nil) // permits example.internal
 	_, err := ValidateIntermediate(cert, &ExpectedIntermediate{
 		Roots: []*x509.Certificate{narrow}, PublicKey: issuingKey.Public(), AllowedDomains: []string{vtDomain}, Now: vtNow.Add(time.Hour),
@@ -244,7 +260,11 @@ func TestValidConstraintDomainLabels(t *testing.T) {
 			t.Errorf("%q: %v, want an invalid label", d, err)
 		}
 	}
-	for _, d := range []string{ldhDomain, strings.Repeat("a", 63) + ".internal", "x1.internal"} {
+	// 254 characters of valid labels: refused by the length bound alone.
+	if err := ValidConstraintDomain(longDomain(254)); err == nil || !strings.Contains(err.Error(), "longer than 253") {
+		t.Errorf("a 254-character domain: %v, want refused", err)
+	}
+	for _, d := range []string{ldhDomain, strings.Repeat("a", 63) + ".internal", "x1.internal", longDomain(253)} {
 		if err := ValidConstraintDomain(d); err != nil {
 			t.Errorf("%q refused: %v", d, err)
 		}

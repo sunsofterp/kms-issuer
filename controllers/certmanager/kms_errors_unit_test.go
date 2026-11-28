@@ -160,6 +160,11 @@ func TestStableText(t *testing.T) {
 	if got := stableText(net); got != "KMS Sign failed (the controller log has the details)" || eventText(net) != got {
 		t.Errorf("network failure: %q", got)
 	}
+	// Joined with a refusal: each operation is named by its own error.
+	mixed := errors.Join(awsError("CreateAlias"), net)
+	if got, want := stableText(mixed), "KMS CreateAlias: "+accessDenied+"\nKMS Sign failed (the controller log has the details)"; got != want {
+		t.Errorf("a refusal joined with a network failure: %q, want %q", got, want)
+	}
 	if got := stableText(errKMSDown); got != errKMSDown.Error() {
 		t.Errorf("an error from elsewhere changed: %q", got)
 	}

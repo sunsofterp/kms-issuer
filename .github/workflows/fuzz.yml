@@ -53,7 +53,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GOCACHE }}/fuzz
-          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-${{ matrix.target }}-
 
       - name: Fuzz for 10 minutes
@@ -64,7 +64,8 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GOCACHE }}/fuzz
-          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          # The attempt too, so a re-run saves what it adds (a cache key is written once).
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Reproduce with: go test -run='<target>/<file name>' <package>, after
       # copying the file to <package>/testdata/fuzz/<target>/.
